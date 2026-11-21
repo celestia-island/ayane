@@ -34,11 +34,11 @@ rule-keeper who maintains the committee's ledger. Secretary → mailbox
 administration, communications officer → routing, rule-keeper → policy and
 audit, ledger → the audit trail.
 
-The emblem (source: [`res/logo.svg`](res/logo.svg), served from the org site)
-encodes the same reading: her reticle-shaped halo (the precise ledger-keeper),
-the headset with boom mic (the communications officer), the envelope (the
-mail), and one red accent for her red-framed glasses. Original vector work —
-no official character art.
+The emblem — a hand-drawn colored-pencil mark in the lacrymira house style,
+served from the org site — encodes the same reading: her reticle-shaped halo
+(the precise ledger-keeper), the headset with boom mic (the communications
+officer), the envelope (the mail), and one red accent for her red-framed
+glasses.
 
 ## Architecture
 
