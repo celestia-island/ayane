@@ -1,0 +1,26 @@
+[package]
+name = "ayane-store"
+description = "Persistent control-plane state: desired-state snapshot and account secrets on redb via lacrymira"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+ayane-proto = { workspace = true }
+lacrymira = { workspace = true }
+lacrymira-redb = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true }
+sha-crypt = { workspace = true }
+getrandom = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
+
+[lints]
+workspace = true

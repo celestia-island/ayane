@@ -21,10 +21,53 @@ allow = [
     "Unlicense",
     "Zlib",
     "MPL-2.0",
+    "LicenseRef-SySL-1.0",
 ]
 confidence-threshold = 0.8
 # Workspace crates carry SySL 1.0, which is not an SPDX expression.
 private = { ignore = true }
+
+# The family's own crates (ayane*, lacrymira*) carry the SySL 1.0 text via
+# license-file; the file hash pins it so a swapped license would fail loudly.
+[[licenses.clarify]]
+name = "ayane"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
+
+[[licenses.clarify]]
+name = "ayane-proto"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
+
+[[licenses.clarify]]
+name = "ayane-mail"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
+
+[[licenses.clarify]]
+name = "ayane-engine"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
+
+[[licenses.clarify]]
+name = "ayane-store"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
+
+[[licenses.clarify]]
+name = "lacrymira"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
+
+[[licenses.clarify]]
+name = "lacrymira-macros"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
+
+[[licenses.clarify]]
+name = "lacrymira-redb"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
 
 [[licenses.clarify]]
 name = "ring"

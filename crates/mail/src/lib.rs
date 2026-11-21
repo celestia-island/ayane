@@ -8,6 +8,7 @@
 
 use ayane_proto::{Address, DefaultAction, DesiredState};
 
+pub mod client;
 pub mod compose;
 
 /// Where a message for `recipient` should go.

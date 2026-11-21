@@ -7,7 +7,6 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license-file.workspace = true
-publish.workspace = true
 readme = "../../README.md"
 
 [dependencies]
@@ -17,10 +16,16 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+ayane-engine = { workspace = true }
+ayane-proto = { workspace = true }
+ayane-store = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
+ayane-mail = { workspace = true }
 serde_json = { workspace = true }
 tower = { workspace = true }
+reqwest = { version = "^0.12", default-features = false, features = ["json"] }
 
 [lints]
 workspace = true

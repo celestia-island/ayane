@@ -35,7 +35,7 @@ pub fn build_plain_message(
     to: &Address,
     subject: &str,
     body: &str,
-) -> Result<Vec<u8>, ComposeError> {
+) -> Result<Message, ComposeError> {
     reject_newlines("from display name", from_name)?;
     reject_newlines("subject", subject)?;
 
@@ -50,7 +50,13 @@ pub fn build_plain_message(
         .body(body.to_owned())
         .map_err(|error| ComposeError::Message(error.to_string()))?;
 
-    Ok(message.formatted())
+    Ok(message)
+}
+
+/// Serialise a built message into RFC 5322 bytes (tests, logging, spooling).
+#[must_use]
+pub fn render(message: &Message) -> Vec<u8> {
+    message.formatted()
 }
 
 fn lettre_address(address: &Address) -> Result<LettreAddress, ComposeError> {
@@ -75,7 +81,7 @@ mod tests {
 
     #[test]
     fn builds_a_submittable_message() {
-        let bytes = build_plain_message(
+        let message = build_plain_message(
             &addr("noreply@example.com"),
             "ayane",
             &addr("ops@example.com"),
@@ -84,6 +90,7 @@ mod tests {
         )
         .expect("message");
 
+        let bytes = render(&message);
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("From: ayane <noreply@example.com>"));
         assert!(text.contains("To: ops@example.com"));

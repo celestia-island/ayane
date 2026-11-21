@@ -274,7 +274,7 @@ pub enum StateError {
 }
 
 /// The full desired configuration of one instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredState {
     /// Hosted domains.
     pub domains: Vec<MailDomain>,

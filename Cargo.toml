@@ -5,6 +5,7 @@ members = [
     "crates/engine",
     "crates/mail",
     "crates/proto",
+    "crates/store",
 ]
 
 [workspace.package]
@@ -19,20 +20,34 @@ publish = false
 [workspace.dependencies]
 # internal
 ayane-proto = { path = "crates/proto", version = "^0.1" }
+ayane-engine = { path = "crates/engine", version = "^0.1" }
+ayane-mail = { path = "crates/mail", version = "^0.1" }
+ayane-store = { path = "crates/store", version = "^0.1" }
 
-# serialization
+# serialization (msgpack on the wire to the store — family line format)
 serde = { version = "^1", features = ["derive"] }
 serde_json = "^1"
+rmp-serde = "^1"
 
 # async / http
-tokio = { version = "^1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "^1", features = ["macros", "net", "rt-multi-thread", "signal", "process", "fs"] }
 axum = "^0.8"
 tower = { version = "^0.5", features = ["util"] }
 tracing = "^0.1"
 tracing-subscriber = { version = "^0.3", features = ["env-filter"] }
+futures-util = { version = "^0.3", default-features = false }
 
 # mail: client side only — the MTA stays Postfix, so nothing here listens on 25.
-lettre = { version = "^0.11", default-features = false, features = ["builder"] }
+lettre = { version = "^0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1"] }
+async-imap = { version = "^0.12", default-features = false, features = ["runtime-tokio"] }
+
+# storage
+lacrymira = "^0.1"
+lacrymira-redb = "^0.1"
+
+# passwords (Dovecot {SHA512-CRYPT})
+sha-crypt = "^0.6"
+getrandom = "^0.3"
 
 # misc
 thiserror = "^2"

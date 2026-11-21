@@ -4,7 +4,7 @@
 //! The service is the single control plane: it owns the database, renders these
 //! files deterministically, and reloads the daemons. Nothing is hand-edited on
 //! the hosts, and rendering the same state twice must produce byte-identical
-//! output — the reload loop diffs before it writes.
+//! output — the apply loop diffs before it writes.
 //!
 //! The renderers are pure so that every generated file is covered by golden
 //! tests without a running Postfix, Dovecot or rspamd.
@@ -12,6 +12,17 @@
 use std::collections::BTreeSet;
 
 use ayane_proto::{Address, DesiredState};
+
+/// The virtual-mail user that owns every mailbox (matches the engine images).
+pub const VMAIL_UID: u32 = 5000;
+/// Group id accompanying [`VMAIL_UID`].
+pub const VMAIL_GID: u32 = 5000;
+
+/// Maildir home of one account inside the engine's volume.
+#[must_use]
+pub fn maildir_home(domain: &str, local: &str) -> String {
+    format!("/var/mail/vhosts/{domain}/{local}")
+}
 
 /// Postfix `virtual_mailbox_domains` map.
 #[must_use]
@@ -45,9 +56,26 @@ pub fn postfix_virtual_mailboxes(state: &DesiredState) -> String {
 }
 
 /// Postfix `virtual_alias_maps` map: forwarding rules plus catch-all entries.
+///
+/// Real mailboxes get an **identity row** (`addr addr`). Postfix consults the
+/// alias map before the mailbox map and falls back to `@domain` when the exact
+/// address is missing — so without these rows a catch-all would rewrite every
+/// existing mailbox into the catch-all target. The identity row makes the
+/// exact lookup succeed first, and Postfix stops rewriting when the result
+/// equals the input.
 #[must_use]
 pub fn postfix_virtual_aliases(state: &DesiredState) -> String {
     let mut rows = BTreeSet::new();
+    for account in &state.accounts {
+        if hosted(state, account.address.domain()) {
+            rows.insert(format!("{} {}", account.address, account.address));
+        }
+    }
+    for shared in &state.shared {
+        if hosted(state, shared.address.domain()) {
+            rows.insert(format!("{} {}", shared.address, shared.address));
+        }
+    }
     for alias in &state.aliases {
         if !hosted(state, alias.source.domain()) || alias.targets.is_empty() {
             continue;
@@ -74,6 +102,25 @@ pub fn rspamd_local_domains(state: &DesiredState) -> String {
         .map(|domain| format!("\"{domain}\""))
         .collect();
     format!("local_domains = [{}];\n", domains.join(", "))
+}
+
+/// Dovecot passwd-file lines (`user:hash:uid:gid:gecos:home:shell`).
+///
+/// One line per account, address-sorted; shared mailboxes get no line because
+/// members reach them through ACLs on their own login.
+#[must_use]
+pub fn dovecot_passwd<'a, I>(entries: I) -> String
+where
+    I: IntoIterator<Item = (&'a Address, &'a str)>,
+{
+    let mut rows = BTreeSet::new();
+    for (address, hash) in entries {
+        let home = maildir_home(address.domain(), address.local());
+        rows.insert(format!(
+            "{address}:{hash}:{VMAIL_UID}:{VMAIL_GID}::{home}::\n"
+        ));
+    }
+    rows.into_iter().collect()
 }
 
 /// Dovecot SQL userdb/passdb configuration.
@@ -211,8 +258,27 @@ mod tests {
         assert_eq!(
             postfix_virtual_aliases(&fixture()),
             "@example.com inbox@example.com\n\
-             sales@example.com inbox@example.com, boss@elsewhere.example\n"
+             inbox@example.com inbox@example.com\n\
+             sales@example.com inbox@example.com, boss@elsewhere.example\n\
+             team@example.com team@example.com\n"
         );
+    }
+
+    #[test]
+    fn every_mailbox_has_an_identity_row_so_the_catch_all_cannot_shadow_it() {
+        let rendered = postfix_virtual_aliases(&fixture());
+        let mut rows = rendered.lines();
+        assert!(
+            rendered.contains("inbox@example.com inbox@example.com\n"),
+            "account identity row missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("team@example.com team@example.com\n"),
+            "shared identity row missing: {rendered}"
+        );
+        // The disabled domain's account must not be rendered at all.
+        assert!(!rendered.contains("stale@retired.example"));
+        let _ = rows.next();
     }
 
     #[test]
@@ -241,5 +307,27 @@ mod tests {
             sieve_forward(&target, false),
             "require [\"copy\"];\n\nredirect \"ops@example.com\";\n"
         );
+    }
+
+    #[test]
+    fn passwd_lines_are_address_sorted_and_self_contained() {
+        let rendered = dovecot_passwd([
+            (&addr("zoe@example.com"), "{SHA512-CRYPT}$6$a$z"),
+            (&addr("alice@example.com"), "{SHA512-CRYPT}$6$b$c"),
+        ]);
+        let mut lines = rendered.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "alice@example.com:{SHA512-CRYPT}$6$b$c:5000:5000::/var/mail/vhosts/example.com/alice::"
+                    .to_owned()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            lines.next(),
+            Some("zoe@example.com:{SHA512-CRYPT}$6$a$z:5000:5000::/var/mail/vhosts/example.com/zoe::")
+        );
+        assert_eq!(lines.next(), None);
     }
 }
