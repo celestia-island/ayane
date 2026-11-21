@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- ayane emblem — original work, no official character art.
+
+       Semantics (Okusora Ayane, Blue Archive — Abydos Countermeasures
+       Committee secretary & communications officer):
+         · reticle ring + ticks : her reticle-shaped halo; the principled,
+                                  precise ledger-keeper
+         · headset with boom mic: the communications officer
+         · envelope             : the mail this service delivers
+         · single red mic head  : her red-framed glasses
+
+       Palette: Abydos sand gold on deep ink, paper-sand envelope,
+       one Ayane-red accent. Source of truth for res/logos/ayane.webp. -->
+
+  <!-- reticle halo: outer ring -->
+  <circle cx="256" cy="256" r="228" fill="none" stroke="#2B3A55" stroke-width="13"/>
+
+  <!-- four reticle ticks (gold) -->
+  <g stroke="#E3B04B" stroke-width="15" stroke-linecap="round">
+    <line x1="256" y1="12" x2="256" y2="54"/>
+    <line x1="256" y1="458" x2="256" y2="500"/>
+    <line x1="12" y1="256" x2="54" y2="256"/>
+    <line x1="458" y1="256" x2="500" y2="256"/>
+  </g>
+
+  <!-- inner halo ring -->
+  <circle cx="256" cy="256" r="196" fill="none" stroke="#E3B04B" stroke-width="6" opacity="0.9"/>
+
+  <!-- headset band arcing over the envelope -->
+  <path d="M 146 234 A 110 110 0 0 1 366 234" fill="none" stroke="#2B3A55" stroke-width="22" stroke-linecap="round"/>
+
+  <!-- ear cups -->
+  <rect x="118" y="220" width="54" height="88" rx="25" fill="#2B3A55"/>
+  <rect x="340" y="220" width="54" height="88" rx="25" fill="#2B3A55"/>
+
+  <!-- envelope -->
+  <rect x="150" y="286" width="212" height="150" rx="16" fill="#F6E7C8" stroke="#2B3A55" stroke-width="12"/>
+  <path d="M 158 296 L 256 378 L 354 296" fill="none" stroke="#2B3A55" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- boom mic from the left cup, head touching the envelope -->
+  <path d="M 145 306 Q 145 386 222 392" fill="none" stroke="#2B3A55" stroke-width="16" stroke-linecap="round"/>
+  <circle cx="240" cy="393" r="18" fill="#D9483B"/>
+</svg>
