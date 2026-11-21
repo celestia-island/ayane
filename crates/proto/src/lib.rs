@@ -1,0 +1,491 @@
+//! Wire types shared by the ayane service, the routing policy layer and the
+//! configuration renderers.
+//!
+//! Everything in this crate is plain data plus its validation rules: no I/O,
+//! no clocks, no environment access. The renderers in `ayane-engine` and the
+//! policy in `ayane-mail` both consume [`DesiredState`], so a single validated
+//! snapshot drives every generated configuration file.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Why a raw string is not a usable mail address.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AddressError {
+    /// The string contains no `@`.
+    #[error("address has no `@`")]
+    MissingAt,
+    /// The string contains more than one `@`.
+    #[error("address contains more than one `@`")]
+    MultipleAt,
+    /// The local part or the domain is empty.
+    #[error("address has an empty local part or domain")]
+    EmptyPart,
+    /// A character outside the ASCII mailbox/domain alphabet was found.
+    #[error("address contains an unsupported character: {0:?}")]
+    IllegalCharacter(char),
+    /// A domain label is malformed (empty, leading/trailing dot or dash).
+    #[error("address domain is malformed")]
+    MalformedDomain,
+    /// The address exceeds the SMTP length limits (64 / 254 octets).
+    #[error("address is too long")]
+    TooLong,
+}
+
+/// A bare e-mail address, normalised to lower case.
+///
+/// The type only accepts the plain `local@domain` form. Display names, quoted
+/// local parts and non-ASCII (SMTPUTF8) addresses are rejected on purpose: the
+/// generated Postfix maps must never contain a newline or a colon, and SMTPUTF8
+/// is a separate decision that would have to be made for every map at once.
+///
+/// Construction goes through [`Address::parse`] (or serde), so any [`Address`]
+/// value is safe to interpolate into a single-line map.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Address(String);
+
+impl Address {
+    /// Parse and normalise an address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddressError`] when the input is not a bare `local@domain`
+    /// address within the SMTP length limits.
+    pub fn parse(raw: &str) -> Result<Self, AddressError> {
+        let raw = raw.trim();
+        if raw.len() > 254 {
+            return Err(AddressError::TooLong);
+        }
+        let (local, domain) = match raw.split_once('@') {
+            Some(parts) => parts,
+            None => return Err(AddressError::MissingAt),
+        };
+        if domain.contains('@') {
+            return Err(AddressError::MultipleAt);
+        }
+        if local.is_empty() || domain.is_empty() {
+            return Err(AddressError::EmptyPart);
+        }
+        if local.len() > 64 {
+            return Err(AddressError::TooLong);
+        }
+        for ch in local.chars() {
+            let allowed = ch.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~.".contains(ch);
+            if !allowed {
+                return Err(AddressError::IllegalCharacter(ch));
+            }
+        }
+        validate_domain(domain)?;
+        Ok(Self(format!(
+            "{}@{}",
+            local.to_ascii_lowercase(),
+            domain.to_ascii_lowercase()
+        )))
+    }
+
+    /// The normalised address.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The domain part, normalised to lower case.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        self.0.split_once('@').map_or("", |(_, domain)| domain)
+    }
+
+    /// The local part, normalised to lower case.
+    #[must_use]
+    pub fn local(&self) -> &str {
+        self.0.split_once('@').map_or(&self.0, |(local, _)| local)
+    }
+
+    /// The address with any `+tag` subaddress removed, if it has one.
+    ///
+    /// Postfix runs with `recipient_delimiter = +`, so `ops+alerts@example.com`
+    /// is delivered to `ops@example.com` unless the base address does not exist.
+    #[must_use]
+    pub fn without_subaddress(&self) -> Option<Self> {
+        let (local, domain) = self.0.split_once('@')?;
+        let (base, _tag) = local.split_once('+')?;
+        if base.is_empty() {
+            return None;
+        }
+        Some(Self(format!("{base}@{domain}")))
+    }
+}
+
+fn validate_domain(domain: &str) -> Result<(), AddressError> {
+    if domain.len() > 253 || domain.starts_with('.') || domain.ends_with('.') {
+        return Err(AddressError::MalformedDomain);
+    }
+    for label in domain.split('.') {
+        if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
+            return Err(AddressError::MalformedDomain);
+        }
+        for ch in label.chars() {
+            if !(ch.is_ascii_alphanumeric() || ch == '-') {
+                return Err(AddressError::IllegalCharacter(ch));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for Address {
+    type Error = AddressError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<Address> for String {
+    fn from(value: Address) -> Self {
+        value.0
+    }
+}
+
+/// A sender matched by the recipient policy.
+///
+/// Rules are either a full address (`ops@partner.example`) or a whole domain
+/// (`partner.example`, which also matches every subdomain).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SenderRule {
+    /// Exact sender address.
+    Address(Address),
+    /// Whole domain and its subdomains.
+    Domain(String),
+}
+
+impl SenderRule {
+    /// Whether this rule matches `sender`.
+    #[must_use]
+    pub fn matches(&self, sender: &Address) -> bool {
+        match self {
+            Self::Address(address) => address == sender,
+            Self::Domain(domain) => {
+                let sender_domain = sender.domain();
+                sender_domain == domain
+                    || sender_domain
+                        .strip_suffix(domain.as_str())
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+            }
+        }
+    }
+}
+
+/// What to do with a message for an unknown recipient in a domain without a
+/// catch-all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultAction {
+    /// Hold the message in the quarantine mailbox and notify the operator.
+    Quarantine,
+    /// Reject the message during the SMTP transaction (the default: fail
+    /// closed, never silently black-hole mail).
+    #[default]
+    Reject,
+}
+
+/// Recipient policy for unknown recipients.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    /// What happens when a domain has no catch-all and the recipient does not
+    /// exist.
+    pub default_action: DefaultAction,
+    /// When non-empty, catch-all delivery only accepts mail from these senders;
+    /// everything else is quarantined.
+    pub allowlist: Vec<SenderRule>,
+    /// Senders that are rejected before any other rule runs.
+    pub denylist: Vec<SenderRule>,
+}
+
+/// A hosted mail domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailDomain {
+    /// Domain name, lower case (`example.com`).
+    pub name: String,
+    /// Optional catch-all destination for unknown local parts.
+    pub catch_all: Option<Address>,
+    /// Disabled domains keep their data but stop accepting mail.
+    pub enabled: bool,
+}
+
+/// A regular mailbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    /// Stable identifier referenced by shared mailboxes.
+    pub id: Uuid,
+    /// Primary address.
+    pub address: Address,
+    /// Display name used in headers and the webmail.
+    pub display_name: String,
+    /// Mailbox quota in bytes; `0` means unlimited.
+    pub quota_bytes: u64,
+}
+
+/// A forwarding rule that does not keep a local copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Alias {
+    /// Address that receives the mail.
+    pub source: Address,
+    /// Where the mail is forwarded to. External targets are allowed.
+    pub targets: Vec<Address>,
+}
+
+/// A mailbox several people can open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMailbox {
+    /// Stable identifier.
+    pub id: Uuid,
+    /// Shared address.
+    pub address: Address,
+    /// Accounts that may open it.
+    pub members: Vec<Uuid>,
+}
+
+/// Why a [`DesiredState`] cannot be rendered.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StateError {
+    /// Two objects claim the same address.
+    #[error("address `{0}` is claimed more than once")]
+    DuplicateAddress(String),
+    /// A domain referenced by an object is not hosted.
+    #[error("domain `{0}` is not hosted by this instance")]
+    UnknownDomain(String),
+    /// A catch-all points outside its own domain.
+    #[error("catch-all `{0}` must belong to its own domain")]
+    ForeignCatchAll(String),
+    /// A shared mailbox has no members.
+    #[error("shared mailbox `{0}` has no members")]
+    EmptySharedMailbox(String),
+}
+
+/// The full desired configuration of one instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesiredState {
+    /// Hosted domains.
+    pub domains: Vec<MailDomain>,
+    /// Regular mailboxes.
+    pub accounts: Vec<Account>,
+    /// Forwarding rules.
+    pub aliases: Vec<Alias>,
+    /// Shared mailboxes.
+    pub shared: Vec<SharedMailbox>,
+    /// Recipient policy.
+    pub policy: Policy,
+}
+
+impl DesiredState {
+    /// Validate the snapshot before anything is rendered or written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] on duplicate addresses, unknown domains or an
+    /// unusable catch-all / shared mailbox.
+    pub fn validate(&self) -> Result<(), StateError> {
+        let mut seen = std::collections::HashSet::new();
+        for domain in &self.domains {
+            if !seen.insert(format!("@{}", domain.name)) {
+                return Err(StateError::DuplicateAddress(domain.name.clone()));
+            }
+        }
+        for address in self.addresses() {
+            if !seen.insert(address.to_string()) {
+                return Err(StateError::DuplicateAddress(address.to_string()));
+            }
+        }
+        for domain in &self.domains {
+            if let Some(catch_all) = &domain.catch_all {
+                if catch_all.domain() != domain.name {
+                    return Err(StateError::ForeignCatchAll(catch_all.to_string()));
+                }
+                if !seen.contains(&format!("@{}", catch_all.domain())) {
+                    return Err(StateError::UnknownDomain(catch_all.domain().to_owned()));
+                }
+            }
+        }
+        for shared in &self.shared {
+            if shared.members.is_empty() {
+                return Err(StateError::EmptySharedMailbox(shared.address.to_string()));
+            }
+            if !seen.contains(&format!("@{}", shared.address.domain())) {
+                return Err(StateError::UnknownDomain(
+                    shared.address.domain().to_owned(),
+                ));
+            }
+        }
+        for account in &self.accounts {
+            if !seen.contains(&format!("@{}", account.address.domain())) {
+                return Err(StateError::UnknownDomain(
+                    account.address.domain().to_owned(),
+                ));
+            }
+        }
+        for alias in &self.aliases {
+            if !seen.contains(&format!("@{}", alias.source.domain())) {
+                return Err(StateError::UnknownDomain(alias.source.domain().to_owned()));
+            }
+        }
+        Ok(())
+    }
+
+    fn addresses(&self) -> impl Iterator<Item = &Address> {
+        self.accounts
+            .iter()
+            .map(|account| &account.address)
+            .chain(self.shared.iter().map(|shared| &shared.address))
+            .chain(self.aliases.iter().map(|alias| &alias.source))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalises_case() {
+        let address = Address::parse("Ops.Team@Example.COM").expect("address");
+        assert_eq!(address.as_str(), "ops.team@example.com");
+        assert_eq!(address.local(), "ops.team");
+        assert_eq!(address.domain(), "example.com");
+    }
+
+    #[test]
+    fn rejects_unusable_forms() {
+        for raw in [
+            "",
+            "no-at-sign",
+            "two@at@example.com",
+            "@example.com",
+            "user@",
+            "user name@example.com",
+            "user@example..com",
+            "user@-example.com",
+            "user@example.com.",
+            "user\r\n@example.com",
+        ] {
+            assert!(
+                Address::parse(raw).is_err(),
+                "`{raw}` must be rejected as an address"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_subaddresses() {
+        let address = Address::parse("ops+alerts@example.com").expect("address");
+        assert_eq!(
+            address.without_subaddress().map(|base| base.to_string()),
+            Some("ops@example.com".to_owned())
+        );
+        let plain = Address::parse("ops@example.com").expect("address");
+        assert!(plain.without_subaddress().is_none());
+    }
+
+    #[test]
+    fn domain_rules_match_whole_labels_only() {
+        let rule = SenderRule::Domain("spam.example".to_owned());
+        assert!(rule.matches(&Address::parse("bot@spam.example").expect("addr")));
+        assert!(rule.matches(&Address::parse("bot@mail.spam.example").expect("addr")));
+        assert!(!rule.matches(&Address::parse("bot@notspam.example").expect("addr")));
+    }
+
+    #[test]
+    fn serde_rejects_the_same_inputs_as_parse() {
+        let parsed: Address = serde_json::from_str("\"ops@example.com\"").expect("address");
+        assert_eq!(parsed.as_str(), "ops@example.com");
+        assert!(serde_json::from_str::<Address>("\"ops@example.com\\r\\nBcc: x@y\"").is_err());
+    }
+
+    fn address(raw: &str) -> Address {
+        Address::parse(raw).expect("fixture address")
+    }
+
+    fn fixture() -> DesiredState {
+        DesiredState {
+            domains: vec![MailDomain {
+                name: "example.com".to_owned(),
+                catch_all: Some(address("inbox@example.com")),
+                enabled: true,
+            }],
+            accounts: vec![Account {
+                id: Uuid::nil(),
+                address: address("inbox@example.com"),
+                display_name: "Inbox".to_owned(),
+                quota_bytes: 0,
+            }],
+            aliases: vec![Alias {
+                source: address("sales@example.com"),
+                targets: vec![address("inbox@example.com")],
+            }],
+            shared: vec![SharedMailbox {
+                id: Uuid::nil(),
+                address: address("team@example.com"),
+                members: vec![Uuid::nil()],
+            }],
+            policy: Policy::default(),
+        }
+    }
+
+    #[test]
+    fn validates_a_healthy_state() {
+        fixture().validate().expect("state must validate");
+    }
+
+    #[test]
+    fn rejects_duplicate_addresses() {
+        let mut state = fixture();
+        state.accounts.push(Account {
+            id: Uuid::nil(),
+            address: address("inbox@example.com"),
+            display_name: "Dup".to_owned(),
+            quota_bytes: 0,
+        });
+        assert!(matches!(
+            state.validate(),
+            Err(StateError::DuplicateAddress(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_accounts_in_unhosted_domains() {
+        let mut state = fixture();
+        state.accounts[0].address = address("inbox@elsewhere.example");
+        assert!(matches!(
+            state.validate(),
+            Err(StateError::UnknownDomain(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_catch_all_from_another_domain() {
+        let mut state = fixture();
+        state.domains[0].catch_all = Some(address("inbox@other.example"));
+        assert!(matches!(
+            state.validate(),
+            Err(StateError::ForeignCatchAll(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_shared_mailbox_without_members() {
+        let mut state = fixture();
+        state.shared[0].members.clear();
+        assert!(matches!(
+            state.validate(),
+            Err(StateError::EmptySharedMailbox(_))
+        ));
+    }
+}

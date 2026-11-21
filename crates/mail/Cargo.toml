@@ -1,0 +1,22 @@
+[package]
+name = "ayane-mail"
+description = "Pure routing and recipient policy for the ayane mail service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+publish.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+ayane-proto = { workspace = true }
+lettre = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
+
+[lints]
+workspace = true

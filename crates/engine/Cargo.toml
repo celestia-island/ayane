@@ -1,0 +1,20 @@
+[package]
+name = "ayane-engine"
+description = "Render the desired state into Postfix, Dovecot and rspamd configuration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+publish.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+ayane-proto = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
+
+[lints]
+workspace = true

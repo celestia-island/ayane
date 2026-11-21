@@ -1,0 +1,26 @@
+[package]
+name = "ayane"
+description = "Mail service control plane: domains, mailboxes, policy, webmail and MCP over a Postfix/Dovecot stack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+publish.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+axum = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true
