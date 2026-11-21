@@ -10,8 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use ayane_engine::{
-    dovecot_passwd, postfix_virtual_aliases, postfix_virtual_domains, postfix_virtual_mailboxes,
-    rspamd_local_domains,
+    dovecot_passwd, postfix_sender_denylist, postfix_virtual_aliases, postfix_virtual_domains,
+    postfix_virtual_mailboxes, rspamd_local_domains,
 };
 use ayane_proto::DesiredState;
 use ayane_store::StoredState;
@@ -100,6 +100,11 @@ pub fn render_all(stored: &StoredState) -> Result<Vec<RenderedFile>, ApplyError>
         RenderedFile {
             rel_path: "config/postfix/virtual_aliases".to_owned(),
             contents: postfix_virtual_aliases(state),
+            mode: 0o644,
+        },
+        RenderedFile {
+            rel_path: "config/postfix/sender_denylist".to_owned(),
+            contents: postfix_sender_denylist(state),
             mode: 0o644,
         },
         RenderedFile {

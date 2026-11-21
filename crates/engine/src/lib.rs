@@ -94,6 +94,30 @@ pub fn postfix_virtual_aliases(state: &DesiredState) -> String {
     rows.into_iter().map(|row| format!("{row}\n")).collect()
 }
 
+/// Postfix `check_sender_access` map enforcing the sender deny list.
+///
+/// Postfix accepts `user@domain`, `domain` and `user` keys; a matching sender
+/// is rejected during the SMTP transaction, before any queueing happens. The
+/// allow list is deliberately *not* rendered here: it only decides where an
+/// unknown recipient's mail goes, which the catch-all rule already expresses.
+#[must_use]
+pub fn postfix_sender_denylist(state: &DesiredState) -> String {
+    let mut rows = BTreeSet::new();
+    for rule in &state.policy.denylist {
+        match rule {
+            ayane_proto::SenderRule::Address(address) => {
+                rows.insert(format!("{address} REJECT Sender denied by policy"));
+            }
+            ayane_proto::SenderRule::Domain(domain) => {
+                if !domain.is_empty() {
+                    rows.insert(format!("{domain} REJECT Sender denied by policy"));
+                }
+            }
+        }
+    }
+    rows.into_iter().map(|row| format!("{row}\n")).collect()
+}
+
 /// rspamd `local_domains` option.
 #[must_use]
 pub fn rspamd_local_domains(state: &DesiredState) -> String {
@@ -279,6 +303,26 @@ mod tests {
         // The disabled domain's account must not be rendered at all.
         assert!(!rendered.contains("stale@retired.example"));
         let _ = rows.next();
+    }
+
+    #[test]
+    fn sender_denylist_renders_address_and_domain_rules() {
+        use ayane_proto::SenderRule;
+        let mut state = fixture();
+        state.policy.denylist = vec![
+            SenderRule::Domain("spam.example".to_owned()),
+            SenderRule::Address(addr("bot@evil.example")),
+        ];
+        assert_eq!(
+            postfix_sender_denylist(&state),
+            "bot@evil.example REJECT Sender denied by policy\n\
+             spam.example REJECT Sender denied by policy\n"
+        );
+    }
+
+    #[test]
+    fn sender_denylist_is_empty_when_no_rule_is_configured() {
+        assert_eq!(postfix_sender_denylist(&fixture()), "");
     }
 
     #[test]

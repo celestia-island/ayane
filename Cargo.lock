@@ -159,6 +159,7 @@ dependencies = [
  "ayane-mail",
  "ayane-proto",
  "ayane-store",
+ "lettre",
  "reqwest",
  "serde",
  "serde_json",

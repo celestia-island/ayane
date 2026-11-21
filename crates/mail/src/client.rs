@@ -69,6 +69,26 @@ impl Submission {
     }
 }
 
+impl Submission {
+    /// Send `message` without authenticating, as a foreign MTA would on port
+    /// 25. Used to exercise inbound policy (the deny list) in tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the connection or DATA phase fails —
+    /// including policy rejections, which surface as SMTP error strings.
+    pub async fn send_unauthenticated(&self, message: Message) -> Result<(), ClientError> {
+        let mailer = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.host)
+            .port(self.port)
+            .build();
+        mailer
+            .send(message)
+            .await
+            .map(|_| ())
+            .map_err(|e| ClientError::Smtp(e.to_string()))
+    }
+}
+
 /// What an inbox overview contains.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InboxOverview {

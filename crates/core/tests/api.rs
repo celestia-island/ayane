@@ -247,7 +247,7 @@ async fn apply_writes_config_then_rewrites_nothing() {
         .iter()
         .filter(|f| f["changed"] == serde_json::Value::Bool(true))
         .collect();
-    assert_eq!(changed.len(), 5, "first apply writes every file: {report}");
+    assert_eq!(changed.len(), 6, "first apply writes every file: {report}");
 
     let passwd = fixture.state_dir.join("config/dovecot/passwd");
     let contents = std::fs::read_to_string(&passwd).expect("passwd");

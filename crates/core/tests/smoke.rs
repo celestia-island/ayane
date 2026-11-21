@@ -59,7 +59,7 @@ async fn put_state(client: &reqwest::Client) {
             {"source": format!("sales@{DOMAIN}"), "targets": [BOSS]}
         ],
         "shared": [],
-        "policy": {"default_action": "reject", "allowlist": [], "denylist": []}
+        "policy": {"default_action": "reject", "allowlist": [], "denylist": [{"domain": "spam.example"}]}
     });
 
     let response = client
@@ -161,6 +161,39 @@ async fn wait_for_login() {
     }
 }
 
+/// Send from a deny-listed sender without authentication (port 25, as a
+/// foreign MTA would) and assert Postfix rejects the transaction.
+async fn expect_rejected() {
+    let from = Address::parse("bot@spam.example").expect("from");
+    let to = Address::parse(BOSS).expect("to");
+    let message = ayane_mail::compose::build_plain_message(
+        &from,
+        "spammer",
+        &to,
+        "[ayane-smoke] t5-deny",
+        "must be rejected",
+    )
+    .expect("message");
+    let mta = Submission::new(
+        env_or("AYANE_MTA", "127.0.0.1:3025")
+            .parse::<SocketAddr>()
+            .expect("mta addr"),
+    );
+    let detail = match mta.send_unauthenticated(message).await {
+        Err(e) => e.to_string(),
+        Ok(()) => String::new(),
+    };
+    assert!(
+        !detail.is_empty(),
+        "deny-listed sender must be rejected, but delivery succeeded"
+    );
+    assert!(
+        detail.contains("denied by policy"),
+        "rejection must come from the policy map, got: {detail}"
+    );
+    println!("PASS deny list: unauthenticated spam.example sender rejected: {detail}");
+}
+
 #[tokio::test]
 #[ignore = "needs the engine rig: just engine-up && just serve"]
 async fn send_route_deliver_read_roundtrip() {
@@ -218,5 +251,8 @@ async fn send_route_deliver_read_roundtrip() {
     )
     .await;
 
-    println!("SMOKE PASS: 4/4 delivery paths verified");
+    // 5. deny list: a foreign MTA from a deny-listed domain is refused.
+    expect_rejected().await;
+
+    println!("SMOKE PASS: 5/5 policy paths verified");
 }

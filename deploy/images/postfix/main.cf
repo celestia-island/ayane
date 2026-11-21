@@ -12,6 +12,11 @@ mydestination = localhost.$mydomain, localhost
 inet_interfaces = all
 inet_protocols = ipv4
 
+# Never trust the docker bridge: an unauthenticated connection from another
+# container (or the host) must go through the policy checks below, otherwise
+# permit_mynetworks would wave it past the sender deny list.
+mynetworks = 127.0.0.0/8
+
 # Virtual mailbox domains (rendered by the control plane).
 virtual_mailbox_domains = texthash:/etc/postfix/maps/virtual_domains
 virtual_mailbox_maps = texthash:/etc/postfix/maps/virtual_mailboxes
@@ -37,7 +42,10 @@ smtpd_sasl_security_options = noanonymous
 smtpd_tls_auth_only = no
 smtpd_tls_security_level = none
 
-smtpd_recipient_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination
+# Order matters: the sender deny list (rendered by the control plane) is
+# consulted for unauthenticated inbound mail only — an authenticated user is
+# our own account and must be able to send anywhere.
+smtpd_recipient_restrictions = permit_mynetworks, check_sender_access texthash:/etc/postfix/maps/sender_denylist, permit_sasl_authenticated, reject_unauth_destination
 
 # Content filter (spam / DKIM / headers) via milter; accept mail when the
 # filter is down so a missing rspamd never blocks delivery in the dev rig.
