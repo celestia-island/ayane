@@ -291,11 +291,15 @@ async fn mail_list(app: AppState, session: Session, params: Value) -> Result<Val
         .unwrap_or(50)
         .clamp(1, 200) as usize;
     let password = session.password.as_deref().expect("checked at route");
-    let rows = imap_of(&app)?
+    let listing = imap_of(&app)?
         .list(session.address.as_str(), password, &mailbox, limit)
         .await
         .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
-    Ok(json!({ "mailbox": mailbox, "messages": rows }))
+    Ok(json!({
+        "mailbox": mailbox,
+        "total": listing.total,
+        "messages": listing.messages,
+    }))
 }
 
 async fn mail_read(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {

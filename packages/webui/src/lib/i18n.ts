@@ -9,7 +9,13 @@
  * Error localization maps the family's method-style error PATH (the
  * machine channel on `-32000` messages) to a locale key — the server's
  * English prose is the fallback, never the primary voice.
+ *
+ * The active locale is a Vue ref: every string a computed renders through
+ * `t()` tracks it, so a language switch re-renders the whole panel
+ * without a reload (the settings hint promises immediate application).
  */
+
+import { ref } from "vue";
 
 export type Locale =
   | "en"
@@ -35,28 +41,18 @@ export const LOCALES: Locale[] = [
 ];
 
 type Table = Record<string, string>;
-
 const en: Table = {
   "settings.about": "About",
-  "settings.app": "App",
   "settings.panel": "Panel",
-  "sidebar.mail": "Mail",
-  "sidebar.system": "System",
   "menu.account": "Account",
   "compose.button": "Compose",
   "folder.inbox": "Inbox",
   "folder.sent": "Sent",
   "settings.title": "Settings",
   "settings.theme": "Theme",
-  "settings.dark": "Dark",
-  "settings.light": "Light",
   "settings.language": "Language",
   "menu.logout": "Sign out",
-  "menu.signedInAs": "Signed in as",
-  "nav.inbox": "Inbox",
-  "nav.compose": "Compose",
   "nav.admin": "Admin",
-  "nav.logout": "Sign out",
   "login.title": "ayane Mail",
   "login.subtitle": "Sign in with your mailbox account",
   "inbox.loading": "Loading…",
@@ -120,6 +116,7 @@ const en: Table = {
   "account.avatarNote": "The avatar is stored in this browser only.",
   "about.devBuild": "dev",
   "admin.col.check": "Check",
+  "mail.actions": "Message actions",
   "read.att.file": "File",
   "read.att.type": "Type",
   "admin.col.status": "Status",
@@ -128,25 +125,16 @@ const en: Table = {
 
 const zhHans: Table = {
   "settings.about": "关于",
-  "settings.app": "应用",
   "settings.panel": "面板",
-  "sidebar.mail": "邮箱",
-  "sidebar.system": "系统",
   "menu.account": "账号",
   "compose.button": "撰写",
   "folder.inbox": "收件箱",
   "folder.sent": "已发送",
   "settings.title": "设置",
   "settings.theme": "主题",
-  "settings.dark": "深色",
-  "settings.light": "浅色",
   "settings.language": "语言",
   "menu.logout": "退出登录",
-  "menu.signedInAs": "当前账号",
-  "nav.inbox": "收件箱",
-  "nav.compose": "写邮件",
   "nav.admin": "管理",
-  "nav.logout": "退出登录",
   "login.title": "ayane 邮箱",
   "login.subtitle": "用邮箱账号登录",
   "inbox.loading": "加载中…",
@@ -210,6 +198,7 @@ const zhHans: Table = {
   "account.avatarNote": "头像只保存在这个浏览器里。",
   "about.devBuild": "开发",
   "admin.col.check": "检查项",
+  "mail.actions": "邮件操作",
   "read.att.file": "文件",
   "read.att.type": "类型",
   "admin.col.status": "状态",
@@ -218,25 +207,16 @@ const zhHans: Table = {
 
 const zhHant: Table = {
   "settings.about": "關於",
-  "settings.app": "應用",
   "settings.panel": "面板",
-  "sidebar.mail": "信箱",
-  "sidebar.system": "系統",
   "menu.account": "帳號",
   "compose.button": "撰寫",
   "folder.inbox": "收件匣",
   "folder.sent": "已送出",
   "settings.title": "設定",
   "settings.theme": "主題",
-  "settings.dark": "深色",
-  "settings.light": "淺色",
   "settings.language": "語言",
   "menu.logout": "登出",
-  "menu.signedInAs": "目前帳號",
-  "nav.inbox": "收件匣",
-  "nav.compose": "撰寫郵件",
   "nav.admin": "管理",
-  "nav.logout": "登出",
   "login.title": "ayane 信箱",
   "login.subtitle": "用信箱帳號登入",
   "inbox.loading": "載入中…",
@@ -300,6 +280,7 @@ const zhHant: Table = {
   "account.avatarNote": "頭像只保存在這個瀏覽器裡。",
   "about.devBuild": "開發",
   "admin.col.check": "檢查項",
+  "mail.actions": "郵件操作",
   "read.att.file": "檔案",
   "read.att.type": "類型",
   "admin.col.status": "狀態",
@@ -308,25 +289,16 @@ const zhHant: Table = {
 
 const ja: Table = {
   "settings.about": "このアプリについて",
-  "settings.app": "アプリ",
   "settings.panel": "パネル",
-  "sidebar.mail": "メール",
-  "sidebar.system": "システム",
   "menu.account": "アカウント",
   "compose.button": "作成",
   "folder.inbox": "受信トレイ",
   "folder.sent": "送信済み",
   "settings.title": "設定",
   "settings.theme": "テーマ",
-  "settings.dark": "ダーク",
-  "settings.light": "ライト",
   "settings.language": "言語",
   "menu.logout": "ログアウト",
-  "menu.signedInAs": "現在のアカウント",
-  "nav.inbox": "受信トレイ",
-  "nav.compose": "作成",
   "nav.admin": "管理",
-  "nav.logout": "ログアウト",
   "login.title": "ayane メール",
   "login.subtitle": "メールアカウントでログイン",
   "inbox.loading": "読み込み中…",
@@ -390,6 +362,7 @@ const ja: Table = {
   "account.avatarNote": "アイコンはこのブラウザーにのみ保存されます。",
   "about.devBuild": "開発",
   "admin.col.check": "チェック項目",
+  "mail.actions": "メール操作",
   "read.att.file": "ファイル",
   "read.att.type": "タイプ",
   "admin.col.status": "ステータス",
@@ -398,25 +371,16 @@ const ja: Table = {
 
 const ko: Table = {
   "settings.about": "정보",
-  "settings.app": "앱",
   "settings.panel": "패널",
-  "sidebar.mail": "메일",
-  "sidebar.system": "시스템",
   "menu.account": "계정",
   "compose.button": "작성",
   "folder.inbox": "받은 편지함",
   "folder.sent": "보냄",
   "settings.title": "설정",
   "settings.theme": "테마",
-  "settings.dark": "다크",
-  "settings.light": "라이트",
   "settings.language": "언어",
   "menu.logout": "로그아웃",
-  "menu.signedInAs": "현재 계정",
-  "nav.inbox": "받은 편지함",
-  "nav.compose": "작성",
   "nav.admin": "관리",
-  "nav.logout": "로그아웃",
   "login.title": "ayane 메일",
   "login.subtitle": "메일 계정으로 로그인",
   "inbox.loading": "불러오는 중…",
@@ -480,6 +444,7 @@ const ko: Table = {
   "account.avatarNote": "아바타는 이 브라우저에만 저장됩니다.",
   "about.devBuild": "개발",
   "admin.col.check": "검사 항목",
+  "mail.actions": "메일 작업",
   "read.att.file": "파일",
   "read.att.type": "유형",
   "admin.col.status": "상태",
@@ -488,25 +453,16 @@ const ko: Table = {
 
 const de: Table = {
   "settings.about": "Über",
-  "settings.app": "App",
   "settings.panel": "Panel",
-  "sidebar.mail": "Post",
-  "sidebar.system": "System",
   "menu.account": "Konto",
   "compose.button": "Verfassen",
   "folder.inbox": "Posteingang",
   "folder.sent": "Gesendet",
   "settings.title": "Einstellungen",
   "settings.theme": "Design",
-  "settings.dark": "Dunkel",
-  "settings.light": "Hell",
   "settings.language": "Sprache",
   "menu.logout": "Abmelden",
-  "menu.signedInAs": "Angemeldet als",
-  "nav.inbox": "Posteingang",
-  "nav.compose": "Verfassen",
   "nav.admin": "Verwaltung",
-  "nav.logout": "Abmelden",
   "login.title": "ayane Mail",
   "login.subtitle": "Mit dem Postfachkonto anmelden",
   "inbox.loading": "Lädt…",
@@ -570,6 +526,7 @@ const de: Table = {
   "account.avatarNote": "Der Avatar wird nur in diesem Browser gespeichert.",
   "about.devBuild": "Entwicklung",
   "admin.col.check": "Prüfung",
+  "mail.actions": "Nachricht-Aktionen",
   "read.att.file": "Datei",
   "read.att.type": "Typ",
   "admin.col.status": "Status",
@@ -578,25 +535,16 @@ const de: Table = {
 
 const fr: Table = {
   "settings.about": "À propos",
-  "settings.app": "Application",
   "settings.panel": "Panneau",
-  "sidebar.mail": "Messagerie",
-  "sidebar.system": "Système",
   "menu.account": "Compte",
   "compose.button": "Rédiger",
   "folder.inbox": "Boîte de réception",
   "folder.sent": "Envoyé",
   "settings.title": "Paramètres",
   "settings.theme": "Thème",
-  "settings.dark": "Sombre",
-  "settings.light": "Clair",
   "settings.language": "Langue",
   "menu.logout": "Se déconnecter",
-  "menu.signedInAs": "Connecté en tant que",
-  "nav.inbox": "Boîte de réception",
-  "nav.compose": "Rédiger",
   "nav.admin": "Administration",
-  "nav.logout": "Se déconnecter",
   "login.title": "Messagerie ayane",
   "login.subtitle": "Connectez-vous avec votre compte",
   "inbox.loading": "Chargement…",
@@ -660,6 +608,7 @@ const fr: Table = {
   "account.avatarNote": "L'avatar n'est stocké que dans ce navigateur.",
   "about.devBuild": "développement",
   "admin.col.check": "Vérification",
+  "mail.actions": "Actions du message",
   "read.att.file": "Fichier",
   "read.att.type": "Type",
   "admin.col.status": "Statut",
@@ -668,25 +617,16 @@ const fr: Table = {
 
 const es: Table = {
   "settings.about": "Acerca de",
-  "settings.app": "Aplicación",
   "settings.panel": "Panel",
-  "sidebar.mail": "Correo",
-  "sidebar.system": "Sistema",
   "menu.account": "Cuenta",
   "compose.button": "Redactar",
   "folder.inbox": "Bandeja de entrada",
   "folder.sent": "Enviado",
   "settings.title": "Ajustes",
   "settings.theme": "Tema",
-  "settings.dark": "Oscuro",
-  "settings.light": "Claro",
   "settings.language": "Idioma",
   "menu.logout": "Cerrar sesión",
-  "menu.signedInAs": "Sesión iniciada como",
-  "nav.inbox": "Bandeja de entrada",
-  "nav.compose": "Redactar",
   "nav.admin": "Administración",
-  "nav.logout": "Cerrar sesión",
   "login.title": "Correo ayane",
   "login.subtitle": "Inicia sesión con tu cuenta",
   "inbox.loading": "Cargando…",
@@ -750,6 +690,7 @@ const es: Table = {
   "account.avatarNote": "El avatar solo se guarda en este navegador.",
   "about.devBuild": "desarrollo",
   "admin.col.check": "Comprobación",
+  "mail.actions": "Acciones del mensaje",
   "read.att.file": "Archivo",
   "read.att.type": "Tipo",
   "admin.col.status": "Estado",
@@ -758,25 +699,16 @@ const es: Table = {
 
 const ru: Table = {
   "settings.about": "О приложении",
-  "settings.app": "Приложение",
   "settings.panel": "Панель",
-  "sidebar.mail": "Почта",
-  "sidebar.system": "Система",
   "menu.account": "Аккаунт",
   "compose.button": "Написать",
   "folder.inbox": "Входящие",
   "folder.sent": "Отправленные",
   "settings.title": "Настройки",
   "settings.theme": "Тема",
-  "settings.dark": "Тёмная",
-  "settings.light": "Светлая",
   "settings.language": "Язык",
   "menu.logout": "Выйти",
-  "menu.signedInAs": "Текущий аккаунт",
-  "nav.inbox": "Входящие",
-  "nav.compose": "Написать",
   "nav.admin": "Управление",
-  "nav.logout": "Выйти",
   "login.title": "Почта ayane",
   "login.subtitle": "Войдите с почтовым аккаунтом",
   "inbox.loading": "Загрузка…",
@@ -840,6 +772,7 @@ const ru: Table = {
   "account.avatarNote": "Аватар хранится только в этом браузере.",
   "about.devBuild": "разработка",
   "admin.col.check": "Проверка",
+  "mail.actions": "Действия с письмом",
   "read.att.file": "Файл",
   "read.att.type": "Тип",
   "admin.col.status": "Статус",
@@ -858,7 +791,8 @@ const TABLES: Record<Locale, Table> = {
   ru,
 };
 
-let active: Locale = detectLocale();
+/** The active locale as a ref — the reactivity root of every `t()` read. */
+const active = ref<Locale>(detectLocale());
 
 /** Chosen locales survive reloads; detection only runs on the first visit. */
 const LOCALE_STORAGE_KEY = "ayane-locale";
@@ -884,12 +818,12 @@ function detectLocale(): Locale {
 
 /** The active locale. */
 export function locale(): Locale {
-  return active;
+  return active.value;
 }
 
 /** Switch the app locale (and hikari's own strings via the boot bridge). */
 export function setAppLocale(next: Locale): void {
-  active = next;
+  active.value = next;
   localStorage.setItem(LOCALE_STORAGE_KEY, next);
   onLocaleChange.handler?.(next);
 }
@@ -901,7 +835,7 @@ export const onLocaleChange: { handler: ((l: Locale) => void) | null } = {
 
 /** Resolve one message key in the active locale (English fallback). */
 export function t(key: string, params?: Record<string, string | number>): string {
-  let text = TABLES[active][key] ?? en[key] ?? key;
+  let text = TABLES[active.value][key] ?? en[key] ?? key;
   if (params) {
     for (const [name, value] of Object.entries(params)) {
       text = text.replaceAll(`{${name}}`, String(value));

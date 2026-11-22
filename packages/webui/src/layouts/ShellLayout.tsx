@@ -16,6 +16,7 @@ import {
   HkStatusBar,
   HkThemePanelContent,
   HSidebar,
+  hkParseIdentity,
   setLocale,
   useToast,
   type HAboutCredit,
@@ -58,8 +59,16 @@ const LOCALE_LABELS: Record<Locale, string> = {
 };
 
 /** The trailing `<branch>:<hash>` token marks a development build (the
- *  family's version-line rule): the branch and commit ARE the dev marker. */
-const IDENTITY_TOKEN = /\S+::?(?:[0-9a-f]{7,40}|unknown)$/i;
+ *  family's version-line rule): the branch and commit ARE the dev marker.
+ *  Trunk stamps (master / main) carry no pill — the parse is hikari's
+ *  hkParseIdentity, the same one the status bar consumes. */
+const TRUNK_BRANCHES = new Set(["master", "main"]);
+
+function isDevelopmentStamp(versionLine: string): boolean {
+  const stamp = versionLine.trim().split(/\s+/).pop();
+  const branch = hkParseIdentity(stamp)?.branch;
+  return branch !== undefined && !TRUNK_BRANCHES.has(branch);
+}
 
 /** The credits sentence: organization first, author second — the same
  *  anatomy chest's about surface renders (accent names, localized runs). */
@@ -92,7 +101,6 @@ export default defineComponent({
     const connState = ref<ConnectionState>("connecting");
     const settingsOpen = ref(false);
     const settingsSection = ref("language");
-    const accountOpen = ref(false);
     /** The hidden file input behind the upload-avatar button. */
     const avatarInput = ref<HTMLInputElement>();
 
@@ -247,9 +255,9 @@ export default defineComponent({
       const rows: { label: string; value: string; meta?: string }[] = [
         { label: t("settings.panel"), value: __AYANE_VERSION__ },
       ];
-      // The identity token marks a development build (family version-line
-      // rule) — the pill is the environment word, not a second value.
-      if (IDENTITY_TOKEN.test(__AYANE_VERSION__)) {
+      // The branch word is the environment: a non-trunk stamp is a dev
+      // build — the pill is the environment word, not a second value.
+      if (isDevelopmentStamp(__AYANE_VERSION__)) {
         rows[0].meta = t("about.devBuild");
       }
       return rows;

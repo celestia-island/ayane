@@ -117,8 +117,8 @@ onMounted(async () => {
 .read-route { margin: 0; font-size: 0.85rem; }
 .read-body {
   white-space: pre-wrap;
-  background: var(--hk-card-bg, #161c27);
-  border: 1px solid var(--hk-card-border, #232a37);
+  background: rgb(var(--color-surface-raised, 27 34 48));
+  border: 1px solid rgb(var(--color-border, 35 42 55));
   border-radius: 12px;
   padding: 16px;
 }

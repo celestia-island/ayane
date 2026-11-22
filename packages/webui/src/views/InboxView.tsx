@@ -70,6 +70,7 @@ export default defineComponent({
   setup(props) {
     const router = useRouter();
     const rows = ref<EnvelopeRow[]>([]);
+    const total = ref(0);
     const loading = ref(true);
     const error = ref<string | undefined>(undefined);
     const rowMenuUid = ref<number | null>(null);
@@ -79,11 +80,12 @@ export default defineComponent({
       loading.value = true;
       error.value = undefined;
       try {
-        const result = await rpc.call<{ messages: EnvelopeRow[] }>("mail.list", {
+        const result = await rpc.call<{ total: number; messages: EnvelopeRow[] }>("mail.list", {
           mailbox: props.mailbox,
           limit: 50,
         });
         rows.value = result.messages;
+        total.value = result.total;
       } catch (e) {
         toastError(e);
         error.value = t("err.mailFailed");
@@ -120,7 +122,7 @@ export default defineComponent({
         class="ay-mail-row-enter"
         role="button"
         tabindex={0}
-        aria-label={t("mail.open")}
+        aria-label={`${t("mail.open")}: ${row.subject || t("mail.noSubject")}`}
         onClick={() => open(row)}
         onKeydown={(e: KeyboardEvent) => {
           if (e.key === "Enter" || e.key === " ") {
@@ -180,6 +182,7 @@ export default defineComponent({
           loading={loading.value}
           error={error.value}
           emptyTitle={t("inbox.empty")}
+          total={total.value}
         >
           {{
             body: () => (
@@ -189,7 +192,7 @@ export default defineComponent({
                   rows={rows.value}
                   sections={sections.value}
                   rowKey="uid"
-                  total={rows.value.length}
+                  total={total.value}
                   manageable={true}
                   onManage={onManage}
                 >
@@ -225,6 +228,7 @@ export default defineComponent({
           }}
           placement="bottom-end"
           anchorRef={rowMenuAnchor.value}
+          title={t("mail.actions")}
           items={rowMenuItems.value}
           onSelect={onMenuSelect}
         />

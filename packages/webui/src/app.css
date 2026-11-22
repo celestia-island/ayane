@@ -18,28 +18,21 @@ body {
   background: transparent !important;
 }
 
-/* Look-alike primitives still used by the admin JSON editor and the
-   mail body surfaces (hikari has no raw code-editor field yet). */
-.hk-card {
-  background: var(--hk-card-bg, #161c27);
-  border: 1px solid var(--hk-card-border, #232a37);
-  border-radius: 12px;
-  padding: 16px;
-}
-
+/* The raw code-editor field for the admin JSON editor (hikari has no
+   code-editor field yet); every other surface is on family components. */
 .hk-input,
 textarea.hk-input {
   width: 100%;
   padding: 9px 11px;
   border-radius: 8px;
-  border: 1px solid var(--hk-card-border, #2a3345);
-  background: var(--hk-input-bg, #0d1119);
-  color: var(--hk-text, #e6e9f0);
+  border: 1px solid rgb(var(--color-border, 35 42 55));
+  background: rgb(var(--color-surface, 13 17 25));
+  color: rgb(var(--color-text-primary, 230 233 240));
   font: inherit;
 }
 
 .hk-input:focus,
-textarea.hk-input:focus { outline: 1px solid var(--hk-accent, #3b7fc4); }
+textarea.hk-input:focus { outline: 1px solid rgb(var(--color-primary, 108 178 255)); }
 
 .muted { color: rgb(var(--color-text-secondary, 127 139 161)); }
 

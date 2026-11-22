@@ -193,6 +193,17 @@ impl Imap {
 
 // ── Webmail read path ─────────────────────────────────────────────────────
 
+/// A mailbox listing: the newest `limit` messages plus the mailbox's
+/// authoritative EXISTS count (the "共 N 条" denominator behind a paged
+/// list — the delivered page is a prefix, never the whole mailbox).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MailboxListing {
+    /// Total messages the mailbox holds (IMAP EXISTS at select time).
+    pub total: u32,
+    /// The newest messages, newest first.
+    pub messages: Vec<EnvelopeRow>,
+}
+
 /// One row of the inbox listing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EnvelopeRow {
@@ -233,7 +244,7 @@ impl Imap {
         password: &str,
         mailbox: &str,
         limit: usize,
-    ) -> Result<Vec<EnvelopeRow>, ClientError> {
+    ) -> Result<MailboxListing, ClientError> {
         let tcp = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
             .await
             .map_err(|e| ClientError::Connect(e.to_string()))?;
@@ -250,7 +261,10 @@ impl Imap {
                 .map_err(|e| ClientError::Imap(e.to_string()))?;
             let total = mailbox_data.exists;
             if total == 0 {
-                return Ok(Vec::new());
+                return Ok(MailboxListing {
+                    total: 0,
+                    messages: Vec::new(),
+                });
             }
             let start = total.saturating_sub(limit as u32).max(1);
             let mut fetches = session
@@ -292,7 +306,10 @@ impl Imap {
                 });
             }
             rows.sort_by_key(|row| std::cmp::Reverse(row.uid));
-            Ok(rows)
+            Ok(MailboxListing {
+                total,
+                messages: rows,
+            })
         }
         .await;
 

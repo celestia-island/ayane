@@ -110,11 +110,13 @@ const dnsRows = computed(() => dns.value ?? []);
 <template>
   <div class="admin">
     <HkSectionCard v-if="!adminOk" :title="t('admin.unlockTitle')" class="admin-unlock">
-      <p class="muted admin-hint">{{ t("admin.unlockHint") }}</p>
-      <HkInput v-model="adminToken" type="password" :placeholder="t('admin.token')" />
-      <HkButton :disabled="!adminToken || busy" @click="adminLogin">
-        <Save :size="14" /> {{ t("admin.unlock") }}
-      </HkButton>
+      <form @submit.prevent="adminLogin">
+        <p class="muted admin-hint">{{ t("admin.unlockHint") }}</p>
+        <HkInput v-model="adminToken" type="password" :placeholder="t('admin.token')" />
+        <HkButton type="submit" :disabled="!adminToken || busy">
+          {{ t("admin.unlock") }}
+        </HkButton>
+      </form>
     </HkSectionCard>
 
     <template v-else>
@@ -154,7 +156,7 @@ const dnsRows = computed(() => dns.value ?? []);
 
 <style scoped>
 .admin { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-.admin-unlock { display: flex; flex-direction: column; gap: 12px; }
+.admin-unlock form { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
 .admin-hint { margin: 0; }
 .admin-actions { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
 .admin-mono { font-family: ui-monospace, monospace; font-size: 12px; }
