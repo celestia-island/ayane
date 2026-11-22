@@ -203,7 +203,7 @@ async fn admin_methods_require_an_admin_session() {
     .await;
     assert_eq!(
         reply["error"]["message"].as_str().expect("m"),
-        "Admin.Forbidden: admin session required"
+        "Admin.Forbidden: admin account required"
     );
 
     // Admin login opens the gate and the state flows back.
