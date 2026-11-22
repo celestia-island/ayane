@@ -54,9 +54,15 @@ services:
       - ./postfix/main.cf:/run/ayane/main.cf:ro
       - ./postfix/master.cf:/run/ayane/master.cf:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
+      # The queue lives in a named volume so container recreation cannot
+      # silently discard deferred mail (a queued Gmail message was lost to
+      # exactly this). Empty named volumes copy the image's spool skeleton
+      # on first use, so the queue directory structure is preserved.
+      - ayane-spool:/var/spool/postfix
     depends_on:
       - dovecot
       - rspamd
 
 volumes:
   ayane-mail:
+  ayane-spool:
