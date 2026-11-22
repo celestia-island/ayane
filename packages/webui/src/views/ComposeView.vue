@@ -6,6 +6,7 @@ import { useRoute, useRouter } from "vue-router";
 import {
   HkButton,
   HkInput,
+  HkMarkdownEditor,
   HkMenu,
   HkModal,
   HkSectionCard,
@@ -44,6 +45,8 @@ const from = ref("");
 const to = ref("");
 const subject = ref("");
 const body = ref("");
+/** markdown | plain — the editor's own segmented control flips this. */
+const bodyMode = ref<"markdown" | "plain">("markdown");
 const busy = ref(false);
 const savingDraft = ref(false);
 /** The draft being edited (send retires it; a plain send passes nothing). */
@@ -111,6 +114,13 @@ function removeAttachment(index: number): void {
   attachments.value.splice(index, 1);
 }
 
+/** An image dropped/pasted in the editor: it becomes an attachment and a
+ *  reference marker lands at the cursor so the reader sees the image. */
+function onEditorImage(file: File): void {
+  addFiles([file]);
+  body.value = `${body.value}\n\n![${file.name}](attachment:${encodeURIComponent(file.name)})`;
+}
+
 function applyTemplate(id: string): void {
   const template = templates.value.find((tpl) => tpl.id === id);
   templateMenuOpen.value = false;
@@ -164,7 +174,7 @@ async function send(): Promise<void> {
       to: to.value,
       subject: subject.value,
       body: body.value,
-      format: "markdown",
+      format: bodyMode.value === "markdown" ? "markdown" : "text",
       ...(from.value ? { from: from.value } : {}),
       ...(draftUid.value ? { draftUid: draftUid.value } : {}),
     };
@@ -227,7 +237,16 @@ async function saveDraft(): Promise<void> {
         />
         <HkInput v-model="to" type="email" required :label="t('compose.to')" placeholder="someone@example.com" />
         <HkInput v-model="subject" :label="t('compose.subject')" />
-        <HkInput v-model="body" type="textarea" :rows="12" :label="t('compose.body')" />
+        <div class="compose-editor">
+          <span class="compose-editor-label">{{ t("compose.body") }}</span>
+          <HkMarkdownEditor
+            v-model="body"
+            v-model:mode="bodyMode"
+            :label="t('compose.body')"
+            view="split"
+            @image-drop="onEditorImage"
+          />
+        </div>
       </div>
 
       <div v-if="attachments.length" class="compose-attachments">
@@ -298,6 +317,8 @@ async function saveDraft(): Promise<void> {
 <style scoped>
 .compose { max-width: 760px; margin: 0 auto; }
 .compose-fields { display: flex; flex-direction: column; gap: 12px; }
+.compose-editor { display: flex; flex-direction: column; gap: 4px; }
+.compose-editor-label { font-size: 0.8125rem; opacity: 0.85; }
 .compose-attachments { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
 .compose-attachment {
   display: inline-flex; align-items: center; gap: 4px;
