@@ -29,6 +29,15 @@ pub trait EngineDriver: Send + Sync {
     /// this returns `Err` only when the reload could not even be attempted
     /// (e.g. the compose file is missing).
     fn reload(&self) -> Result<Vec<ServiceReload>, String>;
+
+    /// Recent postfix log lines (traffic statistics read these: inbound
+    /// `connect from` peers and outbound `relay=`/`status=` deliveries).
+    /// Empty when the engine exposes no logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the logs could not even be attempted.
+    fn postfix_logs(&self, since: &str) -> Result<Vec<String>, String>;
 }
 
 /// Reload recipe per service: command run inside its container.
@@ -109,6 +118,37 @@ impl EngineDriver for ComposeDriver {
         }
         Ok(out)
     }
+
+    fn postfix_logs(&self, since: &str) -> Result<Vec<String>, String> {
+        if !self.compose_file.is_file() {
+            return Err(format!(
+                "compose file not found: {} (start the engine first)",
+                self.compose_file.display()
+            ));
+        }
+        let output = Command::new("docker")
+            .arg("compose")
+            .arg("-f")
+            .arg(&self.compose_file)
+            .arg("logs")
+            .arg("--no-color")
+            .arg("--no-log-prefix")
+            .arg("--since")
+            .arg(since)
+            .arg("postfix")
+            .output()
+            .map_err(|e| format!("spawn docker: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "docker compose logs failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
 }
 
 /// Test double: records reload invocations, never shells out.
@@ -116,6 +156,8 @@ pub struct RecordingDriver {
     /// Path whose existence controls whether reloads "succeed".
     pub compose_file: std::path::PathBuf,
     calls: std::sync::Mutex<Vec<&'static str>>,
+    /// Log lines `postfix_logs` replays (empty = none recorded).
+    pub log_lines: std::sync::Mutex<Vec<String>>,
 }
 
 impl RecordingDriver {
@@ -126,6 +168,7 @@ impl RecordingDriver {
         Self {
             compose_file,
             calls: std::sync::Mutex::new(Vec::new()),
+            log_lines: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -152,5 +195,12 @@ impl EngineDriver for RecordingDriver {
                 }
             })
             .collect())
+    }
+
+    fn postfix_logs(&self, _since: &str) -> Result<Vec<String>, String> {
+        if !self.compose_file.is_file() {
+            return Err("compose file not found".to_owned());
+        }
+        Ok(self.log_lines.lock().expect("log mutex").clone())
     }
 }

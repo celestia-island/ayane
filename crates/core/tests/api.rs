@@ -39,6 +39,7 @@ fn fixture(tag: &str, token: Option<&str>) -> Fixture {
         compose_file: root.join("docker-compose.yml"),
         imap: "127.0.0.1:143".to_owned(),
         submission: "127.0.0.1:587".to_owned(),
+        cert_file: None,
     };
     let app = ayane::app(AppState {
         store: Arc::new(store),

@@ -40,6 +40,7 @@ async fn surface(tag: &str) -> (RpcSurface, PathBuf) {
                 address: ayane_proto::Address::parse("test@example.test").expect("addr"),
                 display_name: "Test".to_owned(),
                 quota_bytes: 0,
+                admin: false,
             }],
             ..Default::default()
         },
@@ -56,6 +57,7 @@ async fn surface(tag: &str) -> (RpcSurface, PathBuf) {
         // Mail.ImapFailed rather than anything catastrophic.
         imap: "127.0.0.1:1".to_owned(),
         submission: "127.0.0.1:1".to_owned(),
+        cert_file: None,
     };
     let app = AppState {
         store: Arc::new(store),

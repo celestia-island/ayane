@@ -62,6 +62,9 @@ pub struct Config {
     pub imap: String,
     /// Submission endpoint the send path talks to.
     pub submission: String,
+    /// TLS certificate chain (PEM) the cert check reads: the leaf's
+    /// validity drives the 域名与证书 page. Absent disables the check.
+    pub cert_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -89,6 +92,7 @@ impl Config {
         let imap = std::env::var("AYANE_IMAP").unwrap_or_else(|_| DEFAULT_IMAP.to_owned());
         let submission =
             std::env::var("AYANE_SUBMISSION").unwrap_or_else(|_| DEFAULT_SUBMISSION.to_owned());
+        let cert_file = std::env::var("AYANE_CERT_FILE").ok().map(PathBuf::from);
         Ok(Self {
             listen,
             log_filter,
@@ -97,6 +101,7 @@ impl Config {
             compose_file,
             imap,
             submission,
+            cert_file,
         })
     }
 

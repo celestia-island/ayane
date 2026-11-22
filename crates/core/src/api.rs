@@ -174,6 +174,8 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
         aliases: body.aliases,
         shared: Vec::with_capacity(body.shared.len()),
         policy: body.policy,
+        audit: Default::default(),
+        mcp: Default::default(),
     };
     let mut password_hashes = HashMap::with_capacity(body.accounts.len());
 
@@ -188,6 +190,7 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
             address: account.address.clone(),
             display_name: account.display_name.clone(),
             quota_bytes: account.quota_bytes,
+            admin: false,
         });
     }
 

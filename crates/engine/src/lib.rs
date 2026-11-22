@@ -240,12 +240,14 @@ mod tests {
                     address: addr("inbox@example.com"),
                     display_name: "Inbox".to_owned(),
                     quota_bytes: 1_073_741_824,
+                    admin: false,
                 },
                 Account {
                     id: Uuid::nil(),
                     address: addr("stale@retired.example"),
                     display_name: "Stale".to_owned(),
                     quota_bytes: 0,
+                    admin: false,
                 },
             ],
             aliases: vec![Alias {
@@ -261,6 +263,8 @@ mod tests {
                 default_action: DefaultAction::Reject,
                 ..Policy::default()
             },
+            audit: Default::default(),
+            mcp: Default::default(),
         }
     }
 

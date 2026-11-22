@@ -173,14 +173,20 @@ impl SessionStore {
             .ok_or(LoginError::UnknownAccount)?;
         password::verify_password(password_raw, hash)
             .map_err(|_| LoginError::InvalidCredentials)?;
-        let display_name = stored
+        let account = stored
             .desired
             .accounts
             .iter()
-            .find(|account| account.address == address)
+            .find(|account| account.address == address);
+        let display_name = account
             .map(|account| account.display_name.clone())
             .unwrap_or_default();
-        self.mint(address, display_name, false, Some(password_raw.to_owned()))
+        // Admin authority is an ACCOUNT property (the admin-token escape
+        // hatch aside): an admin account's ordinary login already carries
+        // the admin session, so the webmail never asks for a second
+        // credential.
+        let admin = account.is_some_and(|account| account.admin);
+        self.mint(address, display_name, admin, Some(password_raw.to_owned()))
     }
 
     /// Mint an admin session after the admin token matched.
@@ -310,6 +316,7 @@ mod tests {
                     address,
                     display_name: "T".to_owned(),
                     quota_bytes: 0,
+                    admin: false,
                 }
             })
             .collect();
@@ -351,6 +358,7 @@ mod tests {
             address: Address::parse(raw).expect("addr"),
             display_name: "T".to_owned(),
             quota_bytes: 0,
+            admin: false,
         };
         let stored = StoredState {
             desired: DesiredState {

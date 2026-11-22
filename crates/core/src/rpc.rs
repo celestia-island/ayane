@@ -118,6 +118,12 @@ pub async fn dispatch(
         "mail.star" => mail_route(app, sessions, ctx, &params, mail_star).await,
         "mail.trash" => mail_route(app, sessions, ctx, &params, mail_trash).await,
         "mail.purge" => mail_route(app, sessions, ctx, &params, mail_purge).await,
+        "mail.fromAddresses" => mail_route(app, sessions, ctx, &params, mail_from_addresses).await,
+        "mail.templates.list" => mail_route(app, sessions, ctx, &params, mail_templates_list).await,
+        "mail.templates.save" => mail_route(app, sessions, ctx, &params, mail_templates_save).await,
+        "mail.templates.delete" => {
+            mail_route(app, sessions, ctx, &params, mail_templates_delete).await
+        }
         "admin.state.get" => match require_admin(sessions, ctx, &params) {
             Ok(()) => RpcOutcome::Result(load_state(app)),
             Err(e) => RpcOutcome::App(e),
@@ -132,6 +138,34 @@ pub async fn dispatch(
         },
         "admin.apply" => match require_admin(sessions, ctx, &params) {
             Ok(()) => wrap_result(do_apply(app).await),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "admin.net.cert" => match require_admin(sessions, ctx, &params) {
+            Ok(()) => wrap_result(net_cert(app).await),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "admin.net.traffic" => match require_admin(sessions, ctx, &params) {
+            Ok(()) => wrap_result(net_traffic(app, params.clone()).await),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "admin.audit.run" => match require_admin(sessions, ctx, &params) {
+            Ok(()) => wrap_result(audit_run(app, sessions, ctx, params.clone()).await),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "admin.mcp.get" => match require_admin(sessions, ctx, &params) {
+            Ok(()) => wrap_result(mcp_get(app)),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "admin.mcp.put" => match require_admin(sessions, ctx, &params) {
+            Ok(()) => wrap_result(mcp_put(app, params.clone())),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "admin.policy.get" => match require_admin(sessions, ctx, &params) {
+            Ok(()) => wrap_result(policy_get(app)),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "admin.policy.put" => match require_admin(sessions, ctx, &params) {
+            Ok(()) => wrap_result(policy_put(app, params.clone())),
             Err(e) => RpcOutcome::App(e),
         },
         other => RpcOutcome::Protocol(ProtocolError {
@@ -193,6 +227,7 @@ fn login(
                 "token": token,
                 "address": session.address.as_str(),
                 "display_name": session.display_name,
+                "admin": session.admin,
             }))
         }
         Err(LoginError::UnknownAccount | LoginError::InvalidCredentials) => Err(AppError::new(
@@ -350,16 +385,77 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
     let to = ayane_proto::Address::parse(&to)
         .map_err(|e| AppError::new("Mail.BadRecipient", e.to_string()))?;
     let password = session.password.as_deref().expect("checked at route");
-    let message = ayane_mail::compose::build_plain_message(
-        &session.address,
-        &session.display_name,
-        &to,
-        &subject,
-        &body,
-    )
-    .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?;
+
+    // Send identity: the session's own address, or a shared mailbox this
+    // account belongs to (the From picker's 公共信箱 entries).
+    let stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    let (from_address, from_name) = resolve_send_identity(
+        &stored,
+        &session,
+        params.get("from").and_then(Value::as_str),
+    )?;
+
+    // Attachments arrive base64-encoded; the size cap keeps one request
+    // from carrying an unreasonable payload (the engine queue handles the
+    // real limits).
+    use base64::Engine as _;
+    let mut attachments = Vec::new();
+    if let Some(list) = params.get("attachments").and_then(Value::as_array) {
+        for item in list {
+            let filename = item
+                .get("filename")
+                .and_then(Value::as_str)
+                .unwrap_or("attachment")
+                .to_owned();
+            let content_type = item
+                .get("content_type")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_owned();
+            let data = item
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::new("Mail.MalformedParams", "attachment data required"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| {
+                    AppError::new("Mail.MalformedParams", format!("attachment base64: {e}"))
+                })?;
+            if bytes.len() > 10 * 1024 * 1024 {
+                return Err(AppError::new(
+                    "Mail.MalformedParams",
+                    "attachment exceeds 10 MiB",
+                ));
+            }
+            attachments.push(ayane_mail::compose::OutgoingAttachment {
+                filename,
+                content_type,
+                data: bytes,
+            });
+        }
+    }
+
+    let message = if attachments.is_empty()
+        && params.get("format").and_then(Value::as_str) != Some("markdown")
+    {
+        ayane_mail::compose::build_plain_message(&from_address, &from_name, &to, &subject, &body)
+            .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
+    } else {
+        ayane_mail::compose::build_composed_message(
+            &from_address,
+            &from_name,
+            &to,
+            &subject,
+            &body,
+            &attachments,
+        )
+        .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
+    };
     submission_of(&app)?
-        .send(session.address.as_str(), password, message.clone())
+        .send(from_address.as_str(), password, message.clone())
         .await
         .map_err(|e| AppError::new("Mail.SubmissionFailed", e.to_string()))?;
     // Best-effort Sent copy; a failure to append must not fail the send.
@@ -532,6 +628,434 @@ fn mailbox_of(params: &Value, fallback: &str) -> String {
         .filter(|m| !m.trim().is_empty())
         .unwrap_or(fallback)
         .to_owned()
+}
+
+// ── send identities + templates ───────────────────────────────────────────
+
+/// Every address the session may send as: the account's own address plus
+/// every shared mailbox it is a member of (公共信箱). The composer's From
+/// picker — personal vs shared identities in one list.
+async fn mail_from_addresses(
+    app: AppState,
+    session: Session,
+    _params: Value,
+) -> Result<Value, AppError> {
+    let stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    let mut identities = vec![json!({
+        "address": session.address.as_str(),
+        "display_name": session.display_name,
+        "kind": "personal",
+    })];
+    if let Some(account) = stored
+        .desired
+        .accounts
+        .iter()
+        .find(|account| account.address == session.address)
+    {
+        for shared in &stored.desired.shared {
+            if shared.members.contains(&account.id) {
+                identities.push(json!({
+                    "address": shared.address.as_str(),
+                    "display_name": shared.address.local().to_owned(),
+                    "kind": "shared",
+                }));
+            }
+        }
+    }
+    Ok(json!({ "identities": identities }))
+}
+
+/// Validate a requested send identity: the session's own address or a
+/// shared mailbox it belongs to. Returns the display name for the header.
+fn resolve_send_identity(
+    stored: &ayane_store::StoredState,
+    session: &Session,
+    requested: Option<&str>,
+) -> Result<(ayane_proto::Address, String), AppError> {
+    let own = session.address.clone();
+    let Some(requested) = requested else {
+        return Ok((own, session.display_name.clone()));
+    };
+    if requested == own.as_str() {
+        return Ok((own, session.display_name.clone()));
+    }
+    let parsed = ayane_proto::Address::parse(requested)
+        .map_err(|e| AppError::new("Mail.BadRecipient", e.to_string()))?;
+    let Some(account) = stored
+        .desired
+        .accounts
+        .iter()
+        .find(|account| account.address == session.address)
+    else {
+        return Err(AppError::new(
+            "Mail.BadRecipient",
+            "unknown sending account",
+        ));
+    };
+    let member = stored
+        .desired
+        .shared
+        .iter()
+        .any(|shared| shared.address == parsed && shared.members.contains(&account.id));
+    if !member {
+        return Err(AppError::new(
+            "Mail.BadRecipient",
+            "that shared mailbox does not belong to this account",
+        ));
+    }
+    let display = parsed.local().to_owned();
+    Ok((parsed, display))
+}
+
+async fn mail_templates_list(
+    app: AppState,
+    session: Session,
+    _params: Value,
+) -> Result<Value, AppError> {
+    let templates = app
+        .store
+        .list_templates(session.address.as_str())
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    Ok(json!({ "templates": templates }))
+}
+
+async fn mail_templates_save(
+    app: AppState,
+    session: Session,
+    params: Value,
+) -> Result<Value, AppError> {
+    let name = required(&params, "name")?;
+    let subject = params
+        .get("subject")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let body = params
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let id = params
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let template = ayane_store::Template {
+        id,
+        owner: session.address.as_str().to_owned(),
+        name,
+        subject,
+        body,
+    };
+    app.store
+        .save_template(&template)
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    Ok(json!({ "saved": true, "id": template.id }))
+}
+
+async fn mail_templates_delete(
+    app: AppState,
+    session: Session,
+    params: Value,
+) -> Result<Value, AppError> {
+    let id = required(&params, "id")?;
+    app.store
+        .delete_template(session.address.as_str(), &id)
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    Ok(json!({ "ok": true }))
+}
+
+// ── network surface ───────────────────────────────────────────────────────
+
+/// The deployed TLS certificate's status (leaf validity from the PEM chain
+/// the engine serves).
+async fn net_cert(app: &AppState) -> Result<Value, AppError> {
+    let path = app.config.cert_file.as_deref().ok_or_else(|| {
+        AppError::new("Admin.MalformedState", "AYANE_CERT_FILE is not configured")
+    })?;
+    let status = crate::net::cert_status(path)
+        .map_err(|e| AppError::new("Admin.MalformedState", e.to_string()))?;
+    Ok(serde_json::to_value(status).unwrap_or(json!({})))
+}
+
+/// Postfix traffic of the recent window (default 72h): inbound connect
+/// peers and outbound relay deliveries, aggregated from the engine logs.
+async fn net_traffic(app: &AppState, params: Value) -> Result<Value, AppError> {
+    let since = params
+        .get("since")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("72h")
+        .to_owned();
+    let lines = app
+        .driver
+        .postfix_logs(&since)
+        .map_err(|e| AppError::new("Admin.ApplyFailed", e))?;
+    let report = crate::net::traffic_from_lines(&lines);
+    Ok(serde_json::to_value(report).unwrap_or(json!({})))
+}
+
+/// The sender policy slices the 黑白名单 page edits.
+fn policy_get(app: &AppState) -> Result<Value, AppError> {
+    let stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    fn rules(list: &[ayane_proto::SenderRule]) -> Vec<String> {
+        list.iter()
+            .map(|rule| match rule {
+                ayane_proto::SenderRule::Address(a) => a.as_str().to_owned(),
+                ayane_proto::SenderRule::Domain(d) => format!("@{d}"),
+            })
+            .collect()
+    }
+    Ok(json!({
+        "allowlist": rules(&stored.desired.policy.allowlist),
+        "denylist": rules(&stored.desired.policy.denylist),
+    }))
+}
+
+fn policy_put(app: &AppState, params: Value) -> Result<Value, AppError> {
+    fn parse_rules(params: &Value, key: &str) -> Result<Vec<ayane_proto::SenderRule>, AppError> {
+        let mut rules = Vec::new();
+        let Some(raw) = params.get(key).and_then(Value::as_array) else {
+            return Err(AppError::new(
+                "Admin.MalformedState",
+                format!("{key} must be a list"),
+            ));
+        };
+        for item in raw {
+            let Some(text) = item.as_str() else {
+                return Err(AppError::new(
+                    "Admin.MalformedState",
+                    "rules must be strings",
+                ));
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if let Some(domain) = text.strip_prefix('@') {
+                rules.push(ayane_proto::SenderRule::Domain(domain.to_ascii_lowercase()));
+            } else {
+                let address = ayane_proto::Address::parse(text).map_err(|e| {
+                    AppError::new("Admin.MalformedState", format!("invalid sender rule: {e}"))
+                })?;
+                rules.push(ayane_proto::SenderRule::Address(address));
+            }
+        }
+        Ok(rules)
+    }
+    let allowlist = parse_rules(&params, "allowlist")?;
+    let denylist = parse_rules(&params, "denylist")?;
+    let mut stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    stored.desired.policy.allowlist = allowlist;
+    stored.desired.policy.denylist = denylist;
+    stored
+        .desired
+        .validate()
+        .map_err(|e| AppError::new("Admin.StateRejected", e.to_string()))?;
+    app.store
+        .save(&stored)
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    Ok(json!({ "saved": true, "note": "apply to reload the engine" }))
+}
+
+// ── audit (keyword + arona AI) ────────────────────────────────────────────
+
+/// One flagged message from an audit pass.
+#[derive(serde::Serialize)]
+struct AuditHit {
+    uid: u32,
+    subject: Option<String>,
+    from: Option<String>,
+    /// The keyword that matched (keyword leg).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keyword: Option<String>,
+    /// The AI verdict (arona leg): the model's one-line reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_verdict: Option<String>,
+}
+
+/// Scan the INBOX's recent messages against the configured keyword list,
+/// then (when enabled) ask arona to classify each hit. AI goes ONLY through
+/// the org's arona panel — no other provider is wired.
+async fn audit_run(
+    app: &AppState,
+    sessions: &SessionStore,
+    ctx: &mut WsContext,
+    params: Value,
+) -> Result<Value, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .clamp(1, 50) as usize;
+    let stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    let audit = &stored.desired.audit;
+    if !audit.enabled {
+        return Err(AppError::new(
+            "Admin.MalformedState",
+            "audit is disabled in the configuration",
+        ));
+    }
+    let keywords: Vec<String> = audit
+        .keywords
+        .iter()
+        .map(|k| k.to_ascii_lowercase())
+        .collect();
+
+    // The session reading the mail: audit runs under the admin session that
+    // called it (their INBOX is the surface being audited).
+    let session = session_of(sessions, ctx, &params)?;
+    let password = session.password.as_deref().ok_or_else(|| {
+        AppError::new(
+            "Session.Required",
+            "the admin session has no mail credentials",
+        )
+    })?;
+
+    let listing = imap_of(app)?
+        .list(session.address.as_str(), password, "INBOX", limit)
+        .await
+        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
+
+    let mut hits: Vec<AuditHit> = Vec::new();
+    for row in &listing.messages {
+        let Ok(raw) = imap_of(app)?
+            .fetch_raw(
+                session.address.as_str(),
+                password,
+                "INBOX",
+                row.uid,
+                ayane_mail::client::MarkSeen::No,
+            )
+            .await
+        else {
+            continue;
+        };
+        let Some(parsed) = ayane_mail::mime::parse(&raw) else {
+            continue;
+        };
+        let haystack = format!(
+            "{}\n{}\n{}",
+            parsed.subject.as_deref().unwrap_or(""),
+            parsed.text.as_deref().unwrap_or(""),
+            parsed.html.as_deref().unwrap_or(""),
+        )
+        .to_ascii_lowercase();
+        if let Some(keyword) = keywords
+            .iter()
+            .find(|k| !k.is_empty() && haystack.contains(k.as_str()))
+        {
+            hits.push(AuditHit {
+                uid: row.uid,
+                subject: parsed.subject.clone(),
+                from: parsed.from.clone(),
+                keyword: Some(keyword.clone()),
+                ai_verdict: None,
+            });
+        }
+    }
+
+    // The AI leg: arona classifies each keyword hit (cheaper than scanning
+    // everything, and the keyword leg already names the suspects).
+    let ai = &stored.desired.audit.ai;
+    let scanned = hits.len();
+    if ai.enabled && !hits.is_empty() && !ai.endpoint.trim().is_empty() {
+        let client = reqwest::Client::new();
+        for hit in &mut hits {
+            let prompt = format!(
+                "You are a mail security auditor. Decide whether the following message is suspicious (phishing, fraud, malware lure, policy violation) or benign. Reply with EXACTLY one line: SUSPICIOUS: <reason> or BENIGN: <reason>.\n\nSubject: {}\nBody snippet: {}",
+                hit.subject.as_deref().unwrap_or(""),
+                hit.keyword.as_deref().unwrap_or(""),
+            );
+            let reply = client
+                .post(format!(
+                    "{}/v1/chat/completions",
+                    ai.endpoint.trim_end_matches('/')
+                ))
+                .bearer_auth(&ai.api_token)
+                .json(&serde_json::json!({
+                    "model": ai.model,
+                    "messages": [{ "role": "user", "content": prompt }],
+                }))
+                .send()
+                .await;
+            let verdict = match reply {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value =
+                        resp.json().await.unwrap_or(serde_json::Value::Null);
+                    body.pointer("/choices/0/message/content")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                }
+                _ => None,
+            };
+            hit.ai_verdict = verdict;
+        }
+    }
+
+    Ok(json!({ "scanned": listing.messages.len(), "flagged": scanned, "hits": hits }))
+}
+
+// ── MCP surface configuration ─────────────────────────────────────────────
+
+/// The MCP proxy's configured surface. The token is returned to the admin
+/// surface only (the page shows it behind an explicit reveal).
+fn mcp_get(app: &AppState) -> Result<Value, AppError> {
+    let stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    Ok(json!({
+        "tools": stored.desired.mcp.tools,
+        "hasToken": !stored.desired.mcp.token.is_empty(),
+    }))
+}
+
+fn mcp_put(app: &AppState, params: Value) -> Result<Value, AppError> {
+    let tools: Vec<String> = params
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let rotate = params.get("rotateToken").and_then(Value::as_bool) == Some(true);
+    let mut stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    stored.desired.mcp.tools = tools;
+    let minted = if rotate {
+        let raw =
+            uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
+        stored.desired.mcp.token = raw.clone();
+        Some(raw)
+    } else {
+        None
+    };
+    app.store
+        .save(&stored)
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    // The token is shown once, on the rotation reply — exactly like the
+    // family's client-secret reveals.
+    Ok(json!({ "saved": true, "token": minted }))
 }
 
 async fn mail_mark_seen(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {

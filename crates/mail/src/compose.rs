@@ -8,7 +8,7 @@
 use ayane_proto::Address;
 use lettre::address::Envelope;
 use lettre::message::header::{ContentType, HeaderName, HeaderValue};
-use lettre::message::{Mailbox, Message};
+use lettre::message::{Attachment, Mailbox, Message, MultiPart};
 use lettre::Address as LettreAddress;
 
 /// Why a message could not be built.
@@ -115,6 +115,104 @@ pub fn build_draft_message(
     let message = builder
         .header(ContentType::TEXT_PLAIN)
         .body(body.to_owned())
+        .map_err(|error| ComposeError::Message(error.to_string()))?;
+
+    Ok(message)
+}
+
+/// One outgoing attachment: filename as it appears in the message,
+/// `type/subtype` content type, raw bytes (the builder handles encoding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingAttachment {
+    /// Filename in the MIME part.
+    pub filename: String,
+    /// `type/subtype` (e.g. `image/png`).
+    pub content_type: String,
+    /// Raw payload bytes.
+    pub data: Vec<u8>,
+}
+
+/// Render markdown to sanitised HTML for the alternative part.
+///
+/// The markdown is OUR OWN render of the user's input, but the input may
+/// contain raw HTML — ammonia still cleans the output (scripts and event
+/// handlers never reach a recipient's reader).
+#[must_use]
+pub fn markdown_to_html(markdown: &str) -> String {
+    use pulldown_cmark::{html, Options, Parser};
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(markdown, options);
+    let mut rendered = String::new();
+    html::push_html(&mut rendered, parser);
+    ammonia::Builder::new()
+        .rm_tags(["img", "iframe", "object", "embed", "form", "input"])
+        .url_schemes(std::collections::HashSet::from(["http", "https", "mailto"]))
+        .clean(&rendered)
+        .to_string()
+}
+
+fn parse_content_type(raw: &str) -> ContentType {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (ty, sub) = raw
+        .split_once('/')
+        .unwrap_or(("application", "octet-stream"));
+    match (ty, sub) {
+        ("text", "plain") => ContentType::TEXT_PLAIN,
+        ("text", "html") => ContentType::TEXT_HTML,
+        _ => ContentType::parse(&raw).unwrap_or(ContentType::TEXT_PLAIN),
+    }
+}
+
+/// Build a composed message: the markdown body rides a
+/// `multipart/alternative` (markdown source as the plain part, the
+/// sanitised HTML render as the rich part); attachments, when present,
+/// wrap it in `multipart/mixed`.
+///
+/// # Errors
+///
+/// Returns [`ComposeError`] when an address cannot be represented, a
+/// header value contains a newline, or the builder rejects the message.
+pub fn build_composed_message(
+    from: &Address,
+    from_name: &str,
+    to: &Address,
+    subject: &str,
+    markdown: &str,
+    attachments: &[OutgoingAttachment],
+) -> Result<Message, ComposeError> {
+    reject_newlines("from display name", from_name)?;
+    reject_newlines("subject", subject)?;
+
+    let from = Mailbox::new(Some(from_name.to_owned()), lettre_address(from)?);
+    let to = Mailbox::new(None, lettre_address(to)?);
+
+    let alternative =
+        MultiPart::alternative_plain_html(markdown.to_owned(), markdown_to_html(markdown));
+    // Attachments wrap the alternative in multipart/mixed; each one is a
+    // singlepart built through the Attachment helper.
+    let body = if attachments.is_empty() {
+        alternative
+    } else {
+        let mut mixed = MultiPart::mixed().multipart(alternative);
+        for attachment in attachments {
+            let part = Attachment::new(attachment.filename.clone()).body(
+                attachment.data.clone(),
+                parse_content_type(&attachment.content_type),
+            );
+            mixed = mixed.singlepart(part);
+        }
+        mixed
+    };
+
+    let message = Message::builder()
+        .from(from)
+        .to(to)
+        .subject(subject.to_owned())
+        .multipart(body)
         .map_err(|error| ComposeError::Message(error.to_string()))?;
 
     Ok(message)
@@ -240,5 +338,71 @@ mod tests {
         )
         .expect_err("injection must be rejected");
         assert_eq!(error, ComposeError::HeaderInjection("to"));
+    }
+
+    #[test]
+    fn markdown_renders_tables_and_strips_scripts() {
+        let html = markdown_to_html(
+            "# Hi\n\n<script>alert(1)</script>\n\n| a | b |\n| - | - |\n| 1 | 2 |",
+        );
+        assert!(html.contains("<h1>Hi</h1>"));
+        assert!(html.contains("<table>"));
+        assert!(!html.contains("<script>"));
+        // The script TEXT survives as escaped prose, the tag never does.
+        assert!(!html.contains("alert(1)</script>"));
+    }
+
+    #[test]
+    fn markdown_links_keep_http_mailto_and_drop_javascript() {
+        let html = markdown_to_html(
+            "[ok](https://example.com) [mail](mailto:a@b.c) [bad](javascript:alert(1))",
+        );
+        assert!(html.contains("https://example.com"));
+        assert!(html.contains("mailto:a@b.c"));
+        assert!(!html.contains("javascript:"));
+    }
+
+    #[test]
+    fn composed_message_carries_alternative_and_attachments() {
+        let message = build_composed_message(
+            &addr("noreply@example.com"),
+            "ayane",
+            &addr("ops@example.com"),
+            "Report",
+            "**bold** statement",
+            &[OutgoingAttachment {
+                filename: "logo.png".to_owned(),
+                content_type: "image/png".to_owned(),
+                data: vec![0x89, b'P', b'N', b'G'],
+            }],
+        )
+        .expect("message");
+
+        let bytes = render(&message);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("multipart/mixed"));
+        assert!(text.contains("multipart/alternative"));
+        // The markdown source is the plain part; the render is the HTML part.
+        assert!(text.contains("**bold** statement"));
+        assert!(text.contains("<strong>bold</strong>"));
+        assert!(text.contains("logo.png"));
+    }
+
+    #[test]
+    fn composed_message_without_attachments_is_alternative_only() {
+        let message = build_composed_message(
+            &addr("noreply@example.com"),
+            "ayane",
+            &addr("ops@example.com"),
+            "Note",
+            "plain note",
+            &[],
+        )
+        .expect("message");
+
+        let bytes = render(&message);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("multipart/alternative"));
+        assert!(!text.contains("multipart/mixed"));
     }
 }

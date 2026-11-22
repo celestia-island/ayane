@@ -143,12 +143,14 @@ mod tests {
                     address: addr("inbox@example.com"),
                     display_name: "Inbox".to_owned(),
                     quota_bytes: 0,
+                    admin: false,
                 },
                 Account {
                     id: Uuid::new_v4(),
                     address: addr("ops@example.com"),
                     display_name: "Ops".to_owned(),
                     quota_bytes: 0,
+                    admin: false,
                 },
             ],
             aliases: vec![Alias {
@@ -165,6 +167,8 @@ mod tests {
                 allowlist,
                 denylist: vec![SenderRule::Domain("spam.example".to_owned())],
             },
+            audit: Default::default(),
+            mcp: Default::default(),
         }
     }
 

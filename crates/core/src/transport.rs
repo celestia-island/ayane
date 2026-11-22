@@ -146,12 +146,32 @@ pub async fn mcp_handler(
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .map(str::to_owned)
         });
-    let expected = surface.app.config.admin_token.clone();
-    let authed = matches!(
-        (expected.as_deref(), presented.as_deref()),
-        (Some(a), Some(b)) if b.len() == a.len() && b.bytes().zip(a.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    // Two accepted credentials: the env admin token (the operator's own
+    // access) and the state-configured MCP token (the agent surface,
+    // rotatable from the admin page). The MCP token also gates the tool
+    // list: a caller holding it may only reach the enabled tools.
+    let mcp_config = surface
+        .app
+        .store
+        .load()
+        .ok()
+        .map(|stored| stored.desired.mcp)
+        .unwrap_or_default();
+    let constant_time_eq = |a: &str, b: &str| {
+        a.len() == b.len()
+            && a.bytes()
+                .zip(b.bytes())
+                .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                == 0
+    };
+    let presented = presented.as_deref();
+    let admin_authed = matches!(
+        (surface.app.config.admin_token.as_deref(), presented),
+        (Some(a), Some(b)) if constant_time_eq(a, b)
     );
-    if !authed {
+    let mcp_authed = !mcp_config.token.is_empty()
+        && presented.is_some_and(|b| constant_time_eq(&mcp_config.token, b));
+    if !admin_authed && !mcp_authed {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(json!({
@@ -161,13 +181,28 @@ pub async fn mcp_handler(
         )
             .into_response();
     }
+    // An MCP-token caller is confined to the configured tool surface; the
+    // admin token keeps the whole dispatch table.
+    let tool_gate: Option<Vec<String>> = if mcp_authed && !admin_authed {
+        Some(mcp_config.tools.clone())
+    } else {
+        None
+    };
 
     // The agent surface runs with an admin context pinned to the socket.
+    // An MCP-token caller (not the admin token) gets a session minted from
+    // the MCP token itself — the dispatch table's admin gates see a valid
+    // admin session, and the tool gate below confines what it can reach.
     let mut ctx = WsContext::new();
-    if let Ok((token, _)) = surface.sessions.admin_login(
-        expected.as_deref(),
-        presented.as_deref().unwrap_or_default(),
-    ) {
+    let credential = if admin_authed {
+        surface.app.config.admin_token.clone()
+    } else {
+        Some(mcp_config.token.clone())
+    };
+    if let Ok((token, _)) = surface
+        .sessions
+        .admin_login(credential.as_deref(), presented.unwrap_or_default())
+    {
         ctx.token = Some(token);
     }
 
@@ -194,11 +229,28 @@ pub async fn mcp_handler(
     let (method, params) = match method {
         "initialize" => ("session.ping", json!({})),
         "tools/list" => {
+            // The catalog answers the configured surface: an MCP-token
+            // caller sees only the enabled tools (the admin token sees
+            // everything).
+            let tools = match &tool_gate {
+                Some(enabled) => mcp_tools()
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|tool| {
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| enabled.contains(&name.to_owned()))
+                    })
+                    .collect::<Vec<_>>(),
+                None => mcp_tools().as_array().cloned().unwrap_or_default(),
+            };
             return Json(json!({
                 "jsonrpc": "2.0", "id": id,
-                "result": { "tools": mcp_tools() }
+                "result": { "tools": tools }
             }))
-            .into_response()
+            .into_response();
         }
         "tools/call" => {
             let args = params
@@ -209,7 +261,20 @@ pub async fn mcp_handler(
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            (mcp_native_name(tool), args)
+            let native = mcp_native_name(tool);
+            if let Some(enabled) = &tool_gate {
+                let exposed = enabled
+                    .iter()
+                    .any(|candidate| mcp_native_name(candidate) == native);
+                if !exposed {
+                    return Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32601, "message": format!("tool not enabled: {tool}") }
+                    }))
+                    .into_response();
+                }
+            }
+            (native, args)
         }
         other => (other, params),
     };

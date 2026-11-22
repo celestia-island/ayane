@@ -25,13 +25,15 @@ getrandom = { workspace = true }
 hickory-resolver = { workspace = true }
 rust-embed = { workspace = true }
 uuid = { workspace = true }
+base64 = { workspace = true }
+x509-parser = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 ayane-mail = { workspace = true }
 lettre = { workspace = true }
 serde_json = { workspace = true }
 tower = { workspace = true }
-reqwest = { version = "^0.12", default-features = false, features = ["json"] }
 
 [lints]
 workspace = true

@@ -44,6 +44,25 @@ pub struct StoredState {
     pub password_hashes: HashMap<String, String>,
 }
 
+/// One user-owned compose template.
+///
+/// Templates are personal data, not desired configuration: they live in
+/// their own KV key so a template edit never rewrites the config snapshot
+/// (and never triggers an apply diff).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Template {
+    /// Stable identifier (UUID v4, minted by the server).
+    pub id: String,
+    /// Owner account address.
+    pub owner: String,
+    /// Human name shown in the template menu.
+    pub name: String,
+    /// Prefilled subject (`{…}` placeholders are the user's own convention).
+    pub subject: String,
+    /// Prefilled body.
+    pub body: String,
+}
+
 impl StoredState {
     /// An empty state (no domains, no accounts).
     #[must_use]
@@ -75,9 +94,32 @@ pub trait StateStore: Send + Sync {
     ///
     /// Returns [`StoreError`] when the backend or the codec fails.
     fn save(&self, state: &StoredState) -> Result<(), StoreError>;
+
+    /// List the compose templates owned by `owner` (name order).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend or the codec fails.
+    fn list_templates(&self, owner: &str) -> Result<Vec<Template>, StoreError>;
+
+    /// Insert or replace one template (the id decides).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend or the codec fails, or the
+    /// id already belongs to a different owner.
+    fn save_template(&self, template: &Template) -> Result<(), StoreError>;
+
+    /// Delete one template owned by `owner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend or the codec fails.
+    fn delete_template(&self, owner: &str, id: &str) -> Result<(), StoreError>;
 }
 
 const STATE_KEY: &str = "state";
+const TEMPLATES_KEY: &str = "templates";
 
 /// redb-backed [`StateStore`] through the lacrymira KV surface.
 pub struct RedbStateStore {
@@ -119,6 +161,50 @@ impl RedbStateStore {
             ))),
         }
     }
+
+    fn load_templates(&self) -> Result<Vec<Template>, StoreError> {
+        let reply = self
+            .inner
+            .execute(&Command::Kv {
+                namespace: "ayane".to_owned(),
+                op: KvOp::Get {
+                    key: Value::Text(TEMPLATES_KEY.to_owned()),
+                },
+            })
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        match reply {
+            Reply::Value(Some(Value::Bytes(bytes))) => {
+                rmp_serde::from_slice(&bytes).map_err(|e| StoreError::Codec(e.to_string()))
+            }
+            Reply::Value(Some(other)) => Err(StoreError::Backend(format!(
+                "templates key holds a non-bytes value: {other:?}"
+            ))),
+            Reply::Value(None) => Ok(Vec::new()),
+            other => Err(StoreError::Backend(format!(
+                "unexpected reply for Get: {other:?}"
+            ))),
+        }
+    }
+
+    fn execute_set_templates(&self, templates: &[Template]) -> Result<(), StoreError> {
+        let bytes = rmp_serde::to_vec(templates).map_err(|e| StoreError::Codec(e.to_string()))?;
+        let reply = self
+            .inner
+            .execute(&Command::Kv {
+                namespace: "ayane".to_owned(),
+                op: KvOp::Set {
+                    key: Value::Text(TEMPLATES_KEY.to_owned()),
+                    value: Value::Bytes(bytes),
+                },
+            })
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        match reply {
+            Reply::Unit => Ok(()),
+            other => Err(StoreError::Backend(format!(
+                "unexpected reply for Set: {other:?}"
+            ))),
+        }
+    }
 }
 
 impl StateStore for RedbStateStore {
@@ -148,6 +234,44 @@ impl StateStore for RedbStateStore {
 
     fn save(&self, state: &StoredState) -> Result<(), StoreError> {
         self.execute_set(state)
+    }
+
+    fn list_templates(&self, owner: &str) -> Result<Vec<Template>, StoreError> {
+        let mut templates = self.load_templates()?;
+        templates.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        templates.retain(|template| template.owner == owner);
+        Ok(templates)
+    }
+
+    fn save_template(&self, template: &Template) -> Result<(), StoreError> {
+        let mut templates = self.load_templates()?;
+        // An id is single-owner: replacing another account's template would
+        // leak its body across accounts.
+        if let Some(existing) = templates
+            .iter_mut()
+            .find(|existing| existing.id == template.id)
+        {
+            if existing.owner != template.owner {
+                return Err(StoreError::Backend(format!(
+                    "template {} belongs to another account",
+                    template.id
+                )));
+            }
+            *existing = template.clone();
+        } else {
+            templates.push(template.clone());
+        }
+        self.execute_set_templates(&templates)
+    }
+
+    fn delete_template(&self, owner: &str, id: &str) -> Result<(), StoreError> {
+        let mut templates = self.load_templates()?;
+        let before = templates.len();
+        templates.retain(|template| !(template.id == id && template.owner == owner));
+        if templates.len() == before {
+            return Ok(());
+        }
+        self.execute_set_templates(&templates)
     }
 }
 
@@ -181,10 +305,13 @@ mod tests {
                     address,
                     display_name: "Alice".to_owned(),
                     quota_bytes: 0,
+                    admin: false,
                 }],
                 aliases: Vec::new(),
                 shared: Vec::new(),
                 policy: Policy::default(),
+                audit: Default::default(),
+                mcp: Default::default(),
             },
             password_hashes: hashes,
         }
@@ -220,5 +347,59 @@ mod tests {
         let state = StoredState::empty();
         let address = Address::parse("nobody@example.test").expect("address");
         assert!(state.password_hash(&address).is_none());
+    }
+
+    #[test]
+    fn templates_roundtrip_per_owner() {
+        let path = temp_path("templates").join("state.redb");
+        let store = RedbStateStore::open(&path).expect("open");
+        store
+            .save_template(&Template {
+                id: "t1".to_owned(),
+                owner: "alice@example.test".to_owned(),
+                name: "报价".to_owned(),
+                subject: "Re: quote".to_owned(),
+                body: "hello".to_owned(),
+            })
+            .expect("save");
+        store
+            .save_template(&Template {
+                id: "t2".to_owned(),
+                owner: "bob@example.test".to_owned(),
+                name: "Bob's".to_owned(),
+                subject: "s".to_owned(),
+                body: "b".to_owned(),
+            })
+            .expect("save");
+
+        let alice = store.list_templates("alice@example.test").expect("list");
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].name, "报价");
+
+        // An id never crosses owners.
+        let stolen = store.save_template(&Template {
+            id: "t2".to_owned(),
+            owner: "alice@example.test".to_owned(),
+            name: "hijack".to_owned(),
+            subject: "".to_owned(),
+            body: "".to_owned(),
+        });
+        assert!(stolen.is_err());
+
+        store
+            .delete_template("alice@example.test", "t1")
+            .expect("delete");
+        assert!(store
+            .list_templates("alice@example.test")
+            .expect("list")
+            .is_empty());
+        // Bob's template survives Alice's delete.
+        assert_eq!(
+            store
+                .list_templates("bob@example.test")
+                .expect("list")
+                .len(),
+            1
+        );
     }
 }
