@@ -2,10 +2,20 @@ import { createApp } from "vue";
 import { createRouter, createWebHistory } from "vue-router";
 
 // Full hikari stylesheet bundle (the admin chrome styles its components
-// render — status bar, auth card, glass header) and the family dark mode:
-// hikari components are mode-aware and default to light without this.
+// render — status bar, auth card, glass header).
 import "@celestia-island/hikari/styles/index.scss";
+// The theme engine: emits the --color-* token sheet every hikari component
+// reads. Without initTheme() the tokens are undefined and components fall
+// back to light defaults (the un-themed gray-card / white-band renders).
+import { initTheme, setLocale } from "@celestia-island/hikari";
+
+initTheme();
+// Dark-first: the mail surface reads best dark, matching the app chrome.
+localStorage.setItem("hikari-theme-mode", "dark");
 document.documentElement.setAttribute("data-mode", "dark");
+initTheme();
+// hikari's own strings (Sign in / Password / …) follow the locale.
+void setLocale("zh-Hans");
 
 import App from "./App.vue";
 import { rpc } from "./lib/rpc";
