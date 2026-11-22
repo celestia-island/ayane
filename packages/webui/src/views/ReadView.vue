@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { ArrowLeft, ShieldAlert, FileLock2 } from "lucide-vue-next";
+import { ArrowLeft, ShieldAlert, FileLock2, SquarePen } from "lucide-vue-next";
 
 import { HkButton, HkSectionCard } from "@celestia-island/hikari";
 
@@ -58,8 +58,15 @@ onMounted(async () => {
 <template>
   <div class="read">
     <div class="read-top">
-      <HkButton variant="ghost" size="sm" @click="router.push('/inbox')">
+      <HkButton variant="ghost" size="sm" @click="router.push(props.mailbox === 'Drafts' ? '/inbox?box=Drafts' : '/inbox')">
         <ArrowLeft :size="14" /> {{ t("read.back") }}
+      </HkButton>
+      <HkButton
+        v-if="props.mailbox === 'Drafts'"
+        size="sm"
+        @click="router.push(`/compose?draft=${props.uid}`)"
+      >
+        <SquarePen :size="14" /> {{ t("read.continueDraft") }}
       </HkButton>
     </div>
     <p v-if="loading" class="muted">{{ t("inbox.loading") }}</p>
@@ -112,7 +119,7 @@ onMounted(async () => {
 
 <style scoped>
 .read { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
-.read-top { display: flex; }
+.read-top { display: flex; gap: 8px; align-items: center; }
 .read h2 { margin: 0; font-size: 1.3rem; }
 .read-route { margin: 0; font-size: 0.85rem; }
 .read-body {

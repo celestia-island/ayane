@@ -194,12 +194,15 @@ impl Imap {
 // ── Webmail read path ─────────────────────────────────────────────────────
 
 /// A mailbox listing: the newest `limit` messages plus the mailbox's
-/// authoritative EXISTS count (the "共 N 条" denominator behind a paged
-/// list — the delivered page is a prefix, never the whole mailbox).
+/// authoritative EXISTS count and unread count (the "共 N 条" denominator
+/// and the 收件箱 badge behind a paged list — the delivered page is a
+/// prefix, never the whole mailbox).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MailboxListing {
     /// Total messages the mailbox holds (IMAP EXISTS at select time).
     pub total: u32,
+    /// Messages without `\Seen` (IMAP STATUS UNSEEN count).
+    pub unread: u32,
     /// The newest messages, newest first.
     pub messages: Vec<EnvelopeRow>,
 }
@@ -209,12 +212,16 @@ pub struct MailboxListing {
 pub struct EnvelopeRow {
     /// IMAP UID within the mailbox (stable across sessions).
     pub uid: u32,
+    /// The mailbox this row came from (the starred roster merges several).
+    pub mailbox: String,
     /// First `From` address, when the envelope carried one.
     pub from: Option<String>,
     /// Subject (decoded as delivered by the server).
     pub subject: Option<String>,
     /// `\Seen` flag state.
     pub seen: bool,
+    /// `\Flagged` (starred) flag state.
+    pub flagged: bool,
     /// RFC 5322 size in bytes.
     pub size: u32,
     /// Server INTERNALDATE rendered as RFC 3339 (offset preserved), when
@@ -230,6 +237,50 @@ pub enum MarkSeen {
     No,
     /// Fetch and mark the message seen.
     Yes,
+}
+
+/// Build one listing row from a FETCH item; `None` when the server did not
+/// name a UID (nothing to address operations against).
+fn row_from_fetch(fetch: &async_imap::types::Fetch, mailbox: &str) -> Option<EnvelopeRow> {
+    let uid = fetch.uid?;
+    let envelope = fetch.envelope();
+    let from = envelope.and_then(|env| {
+        env.from
+            .as_ref()
+            .and_then(|list| list.first())
+            .map(|mb| match (&mb.mailbox, &mb.host) {
+                (Some(m), Some(h)) => format!(
+                    "{}@{}",
+                    String::from_utf8_lossy(m),
+                    String::from_utf8_lossy(h)
+                ),
+                (Some(m), None) => String::from_utf8_lossy(m).into_owned(),
+                _ => String::new(),
+            })
+    });
+    let subject = envelope
+        .and_then(|env| env.subject.as_ref())
+        .map(|s| String::from_utf8_lossy(s).into_owned());
+    let mut seen = false;
+    let mut flagged = false;
+    for flag in fetch.flags() {
+        if flag == async_imap::types::Flag::Seen {
+            seen = true;
+        }
+        if flag == async_imap::types::Flag::Flagged {
+            flagged = true;
+        }
+    }
+    Some(EnvelopeRow {
+        uid,
+        mailbox: mailbox.to_owned(),
+        from,
+        subject,
+        seen,
+        flagged,
+        size: fetch.size.unwrap_or(0),
+        date: fetch.internal_date().map(|d| d.to_rfc3339()),
+    })
 }
 
 impl Imap {
@@ -260,9 +311,19 @@ impl Imap {
                 .await
                 .map_err(|e| ClientError::Imap(e.to_string()))?;
             let total = mailbox_data.exists;
+            // The unread count rides STATUS UNSEEN (a COUNT, not the SELECT
+            // first-unseen sequence) so the sidebar badge is honest even
+            // when the delivered page holds fewer rows than the mailbox.
+            let unread = session
+                .status(mailbox, "(UNSEEN)")
+                .await
+                .ok()
+                .and_then(|s| s.unseen)
+                .unwrap_or(0);
             if total == 0 {
                 return Ok(MailboxListing {
                     total: 0,
+                    unread,
                     messages: Vec::new(),
                 });
             }
@@ -277,37 +338,14 @@ impl Imap {
             let mut rows = Vec::new();
             while let Some(item) = fetches.next().await {
                 let fetch = item.map_err(|e| ClientError::Imap(e.to_string()))?;
-                let Some(uid) = fetch.uid else { continue };
-                let envelope = fetch.envelope();
-                let from = envelope.and_then(|env| {
-                    env.from.as_ref().and_then(|list| list.first()).map(|mb| {
-                        match (&mb.mailbox, &mb.host) {
-                            (Some(m), Some(h)) => format!(
-                                "{}@{}",
-                                String::from_utf8_lossy(m),
-                                String::from_utf8_lossy(h)
-                            ),
-                            (Some(m), None) => String::from_utf8_lossy(m).into_owned(),
-                            _ => String::new(),
-                        }
-                    })
-                });
-                let subject = envelope
-                    .and_then(|env| env.subject.as_ref())
-                    .map(|s| String::from_utf8_lossy(s).into_owned());
-                let seen = fetch.flags().any(|f| f == async_imap::types::Flag::Seen);
-                rows.push(EnvelopeRow {
-                    uid,
-                    from,
-                    subject,
-                    seen,
-                    size: fetch.size.unwrap_or(0),
-                    date: fetch.internal_date().map(|d| d.to_rfc3339()),
-                });
+                if let Some(row) = row_from_fetch(&fetch, mailbox) {
+                    rows.push(row);
+                }
             }
             rows.sort_by_key(|row| std::cmp::Reverse(row.uid));
             Ok(MailboxListing {
                 total,
+                unread,
                 messages: rows,
             })
         }
@@ -315,6 +353,164 @@ impl Imap {
 
         let _ = session.logout().await;
         rows
+    }
+
+    /// List the newest flagged (starred) messages across `mailboxes`,
+    /// merged newest first. The 已加星标 roster: a flag is per-message, so
+    /// the view is a query over the real folders, not a folder of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when connect, login or any SELECT/FETCH
+    /// fails.
+    pub async fn list_flagged(
+        &self,
+        username: &str,
+        password: &str,
+        mailboxes: &[&str],
+        limit: usize,
+    ) -> Result<Vec<EnvelopeRow>, ClientError> {
+        let tcp = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
+            .await
+            .map_err(|e| ClientError::Connect(e.to_string()))?;
+        let client = async_imap::Client::new(tcp);
+        let mut session = client
+            .login(username, password)
+            .await
+            .map_err(|(e, _): (async_imap::error::Error, _)| ClientError::Imap(e.to_string()))?;
+
+        let rows = async {
+            let mut rows = Vec::new();
+            for mailbox in mailboxes {
+                let mailbox_data = session
+                    .select(*mailbox)
+                    .await
+                    .map_err(|e| ClientError::Imap(e.to_string()))?;
+                if mailbox_data.exists == 0 {
+                    continue;
+                }
+                let mut fetches = session
+                    .fetch("1:*", "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)")
+                    .await
+                    .map_err(|e| ClientError::Imap(e.to_string()))?;
+                while let Some(item) = fetches.next().await {
+                    let fetch = item.map_err(|e| ClientError::Imap(e.to_string()))?;
+                    let Some(row) = row_from_fetch(&fetch, mailbox) else {
+                        continue;
+                    };
+                    if row.flagged {
+                        rows.push(row);
+                    }
+                }
+            }
+            rows.sort_by(|a, b| {
+                b.date
+                    .cmp(&a.date)
+                    .then(std::cmp::Reverse(b.uid).cmp(&std::cmp::Reverse(a.uid)))
+            });
+            rows.truncate(limit);
+            Ok(rows)
+        }
+        .await;
+
+        let _ = session.logout().await;
+        rows
+    }
+
+    /// Move one message to another mailbox by UID (the 删除 → 废纸篓 flow).
+    /// The target is autocreated like every folder the webmail touches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when connect, login, create, move or the
+    /// 10 s guard fails.
+    pub async fn move_to_mailbox(
+        &self,
+        username: &str,
+        password: &str,
+        from_mailbox: &str,
+        uid: u32,
+        to_mailbox: &str,
+    ) -> Result<(), ClientError> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let tcp = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
+                .await
+                .map_err(|e| ClientError::Connect(e.to_string()))?;
+            let client = async_imap::Client::new(tcp);
+            let mut session = client.login(username, password).await.map_err(
+                |(e, _): (async_imap::error::Error, _)| ClientError::Imap(e.to_string()),
+            )?;
+
+            let _ = session.create(to_mailbox).await;
+            let _ = session.select(from_mailbox).await;
+            let result = session
+                .uid_mv(uid.to_string(), to_mailbox)
+                .await
+                .map(|_| ())
+                .map_err(|e| ClientError::Imap(e.to_string()));
+            let _ = session.logout().await;
+            result
+        })
+        .await
+        .map_err(|_| ClientError::Imap("move timed out after 10s".to_owned()))?
+    }
+
+    /// Permanently delete one message by UID: mark `\Deleted` inside
+    /// `mailbox` and EXPUNGE the mailbox (only this message carries the
+    /// flag — the webmail never bulk-deletes). The 废纸篓's second step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when connect, login, select, store, expunge
+    /// or the 10 s guard fails.
+    pub async fn purge_message(
+        &self,
+        username: &str,
+        password: &str,
+        mailbox: &str,
+        uid: u32,
+    ) -> Result<(), ClientError> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let tcp = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
+                .await
+                .map_err(|e| ClientError::Connect(e.to_string()))?;
+            let client = async_imap::Client::new(tcp);
+            let mut session = client.login(username, password).await.map_err(
+                |(e, _): (async_imap::error::Error, _)| ClientError::Imap(e.to_string()),
+            )?;
+
+            let result = async {
+                session
+                    .select(mailbox)
+                    .await
+                    .map_err(|e| ClientError::Imap(e.to_string()))?;
+                // Drain the store stream fully in its own scope: it holds a
+                // &mut session, and expunge below needs that back.
+                {
+                    let mut store = session
+                        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+                        .await
+                        .map_err(|e| ClientError::Imap(e.to_string()))?;
+                    while let Some(item) = store.next().await {
+                        item.map_err(|e| ClientError::Imap(e.to_string()))?;
+                    }
+                }
+                let expunged = session
+                    .expunge()
+                    .await
+                    .map_err(|e| ClientError::Imap(e.to_string()))?;
+                tokio::pin!(expunged);
+                while let Some(item) = expunged.next().await {
+                    item.map_err(|e| ClientError::Imap(e.to_string()))?;
+                }
+                Ok(())
+            }
+            .await;
+            let _ = session.logout().await;
+            result
+        })
+        .await
+        .map_err(|_| ClientError::Imap("purge timed out after 10s".to_owned()))?
     }
 
     /// Fetch one message's raw bytes by UID.
@@ -386,6 +582,7 @@ impl Imap {
         username: &str,
         password: &str,
         mailbox: &str,
+        flags: Option<&str>,
         content: &[u8],
     ) -> Result<(), ClientError> {
         // async-imap's APPEND deadlocks when the server rejects before the
@@ -405,7 +602,7 @@ impl Imap {
             // Sent alive anyway.
             let _ = session.create(mailbox).await;
             let result = session
-                .append(mailbox, Some("\\Seen"), None, content)
+                .append(mailbox, flags, None, content)
                 .await
                 .map_err(|e| ClientError::Imap(e.to_string()));
             let _ = session.logout().await;

@@ -1,6 +1,6 @@
 import { computed, defineComponent, onMounted, ref } from "vue";
 import { RouterView, useRoute, useRouter } from "vue-router";
-import { Mail, PenLine, Send, Settings } from "lucide-vue-next";
+import { Mail, PenLine, Send, Settings, SquarePen, Star, Trash2 } from "lucide-vue-next";
 
 import {
   HkAboutBody,
@@ -35,13 +35,8 @@ import {
   t,
   type Locale,
 } from "../lib/i18n";
-import {
-  onSessionRequired,
-  rpc,
-  sessionToken,
-  setSessionToken,
-  type ConnectionState,
-} from "../lib/rpc";
+import { onSessionRequired, rpc, sessionToken, setSessionToken, type ConnectionState } from "../lib/rpc";
+import { inboxUnread } from "../lib/mailbox";
 
 /** Build identity baked by vite (package version + <branch>:<hash7>). */
 declare const __AYANE_VERSION__: string;
@@ -127,20 +122,69 @@ export default defineComponent({
       if (route.path.startsWith("/compose")) return t("compose.button");
       if (route.path.startsWith("/read")) return t("folder.inbox");
       if (route.path.startsWith("/admin")) return t("nav.admin");
-      return route.query.box === "Sent" ? t("folder.sent") : t("folder.inbox");
+      const box = typeof route.query.box === "string" ? route.query.box : "";
+      return t(FOLDER_LABEL[(box.toLowerCase() || "inbox") as keyof typeof FOLDER_LABEL]);
     });
 
+    /** Folder keys are the IMAP names the list route carries (box=…),
+     *  except the two pseudo-entries (compose, admin). */
+    const FOLDER_KEYS = ["inbox", "starred", "sent", "drafts", "trash"] as const;
+    const FOLDER_LABEL: Record<(typeof FOLDER_KEYS)[number], string> = {
+      inbox: "folder.inbox",
+      starred: "folder.starred",
+      sent: "folder.sent",
+      drafts: "folder.drafts",
+      trash: "folder.trash",
+    };
+
     const navItems = computed<HkMenuItem[]>(() => [
-      { key: "compose", label: t("compose.button"), icon: PenLine },
-      { key: "inbox", label: t("folder.inbox"), icon: Mail },
+      {
+        key: "inbox",
+        label: t("folder.inbox"),
+        icon: Mail,
+        badge: inboxUnread.value > 0 ? String(inboxUnread.value) : undefined,
+      },
+      { key: "starred", label: t("folder.starred"), icon: Star },
       { key: "sent", label: t("folder.sent"), icon: Send },
+      { key: "drafts", label: t("folder.drafts"), icon: SquarePen },
+      { key: "trash", label: t("folder.trash"), icon: Trash2 },
       { key: "admin", label: t("nav.admin"), icon: Settings },
+    ]);
+
+    /** The chest console's grouped nav: pinned compose, then themed
+     *  collapsible sections (all expanded — a table of contents). */
+    const navGroups = computed(() => [
+      {
+        id: "mail",
+        label: t("sidebar.group.mail"),
+        items: navItems.value.filter((item) => FOLDER_KEYS.includes(item.key as never)),
+      },
+      {
+        id: "system",
+        label: t("sidebar.group.system"),
+        items: [navItems.value.find((item) => item.key === "admin")!],
+      },
+    ]);
+
+    const menuItems = computed<HkMenuItem[]>(() => [
+      { key: "compose", label: t("compose.button"), icon: PenLine },
+      ...navGroups.value.map((group) => ({
+        key: `group:${group.id}`,
+        label: group.label,
+        children: group.items,
+      })),
     ]);
 
     const activeKey = computed(() => {
       if (route.path.startsWith("/compose")) return "compose";
       if (route.path.startsWith("/admin")) return "admin";
-      return route.query.box === "Sent" || route.path === "/sent" ? "sent" : "inbox";
+      // The route's box parameter IS the folder key (INBOX is the default,
+      // and the legacy ?box=Sent spelling reads as the sent folder).
+      const box = route.query.box;
+      if (typeof box === "string" && FOLDER_KEYS.includes(box as never)) {
+        return box === "INBOX" ? "inbox" : (box.toLowerCase() as string);
+      }
+      return "inbox";
     });
 
     const sections = computed<HkSettingsSection[]>(() => [
@@ -159,10 +203,22 @@ export default defineComponent({
       LOCALES.map((code) => ({ value: code, label: LOCALE_LABELS[code] })),
     );
 
+    /** Sidebar key → IMAP mailbox name carried in ?box= (exact server
+     *  spelling: INBOX / Starred / Sent / Drafts / Trash). */
+    const MAILBOX_OF_KEY: Record<string, string> = {
+      inbox: "INBOX",
+      starred: "Starred",
+      sent: "Sent",
+      drafts: "Drafts",
+      trash: "Trash",
+    };
+
     function navigate(key: string, close?: () => void): void {
-      router.push(
-        key === "sent" ? "/inbox?box=Sent" : key === "inbox" ? "/inbox" : `/${key}`,
-      );
+      if (key === "compose" || key === "admin") {
+        router.push(`/${key}`);
+      } else if (key in MAILBOX_OF_KEY) {
+        router.push(key === "inbox" ? "/inbox" : `/inbox?box=${MAILBOX_OF_KEY[key]}`);
+      }
       close?.();
     }
 
@@ -363,8 +419,9 @@ export default defineComponent({
                     <HkMenu
                       variant="sidebar"
                       open={true}
+                      defaultExpandGroups
                       title="ayane"
-                      items={navItems.value}
+                      items={menuItems.value}
                       activeKey={activeKey.value}
                       onSelect={(key: string) => navigate(key, shell.onNavigate)}
                     />

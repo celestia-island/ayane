@@ -12,9 +12,14 @@ import { locale as appLocale } from "./lib/i18n";
 import App from "./App.vue";
 
 initTheme();
-// Dark-first: the mail surface reads best dark, matching the app chrome.
-localStorage.setItem("hikari-theme-mode", "dark");
-document.documentElement.setAttribute("data-mode", "dark");
+// Dark-first SEED: the mail surface reads best dark, but the choice is the
+// user's — the theme panel (HkThemePanelContent) owns `hikari-theme-mode`
+// from its first change, and this pin must never override it again.
+if (!localStorage.getItem("hikari-theme-mode")) {
+  localStorage.setItem("hikari-theme-mode", "dark");
+}
+const bootMode = localStorage.getItem("hikari-theme-mode") ?? "dark";
+document.documentElement.setAttribute("data-mode", bootMode);
 // hikari's own strings (Sign in / Password / …) follow the locale.
 void setLocale(appLocale());
 

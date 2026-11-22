@@ -4,21 +4,37 @@ import { useRouter } from "vue-router";
 import {
   HkAdminTablePage,
   HkCard,
+  HkConfirmDialog,
   HkMenu,
   HTable,
+  useConfirm,
   type HkMenuItem,
   type HkTableSection,
 } from "@celestia-island/hikari";
 
 import { rpc } from "../lib/rpc";
+import { inboxUnread } from "../lib/mailbox";
 import { locale, t } from "../lib/i18n";
 import { toastError } from "../lib/toast";
 
+/** The exact IMAP names the route may carry (?box=…). */
+const FOLDERS = ["INBOX", "Starred", "Sent", "Drafts", "Trash"] as const;
+type Folder = (typeof FOLDERS)[number];
+
+/** The list response of mail.list AND mail.listStarred (same shape). */
+interface MailboxListing {
+  total: number;
+  unread?: number;
+  messages: EnvelopeRow[];
+}
+
 interface EnvelopeRow {
   uid: number;
+  mailbox: string;
   from: string | null;
   subject: string | null;
   seen: boolean;
+  flagged: boolean;
   size: number;
   date: string | null;
 }
@@ -63,29 +79,54 @@ function formatDate(value: string | null): string {
  *  + scroll-progress dock) over an HkTable whose swimlanes are date groups.
  *  Rows navigate on cell-click (HkTable owns no row-click — every data
  *  cell carries the enter click, the family EdgeFleet pattern); the ⋯
- *  column carries the seen-flag toggle. */
+ *  column carries read-flag, star, trash and (in Trash) permanent delete. */
 export default defineComponent({
   name: "InboxView",
   props: { mailbox: { type: String, required: true } },
   setup(props) {
     const router = useRouter();
+    const confirm = useConfirm();
     const rows = ref<EnvelopeRow[]>([]);
     const total = ref(0);
     const loading = ref(true);
     const error = ref<string | undefined>(undefined);
     const rowMenuUid = ref<number | null>(null);
     const rowMenuAnchor = ref<HTMLElement | null>(null);
+    /** The purge flow's armed row (the confirm dialog owns the rest). */
+    const purgeRow = ref<EnvelopeRow | null>(null);
+    const purging = ref(false);
+
+    /** The exact server folder the roster is on (route default INBOX). */
+    const folder = computed<Folder>(() =>
+      (FOLDERS as readonly string[]).includes(props.mailbox)
+        ? (props.mailbox as Folder)
+        : "INBOX",
+    );
+
+    const folderTitle = computed(() => {
+      const keys: Record<Folder, string> = {
+        INBOX: "folder.inbox",
+        Starred: "folder.starred",
+        Sent: "folder.sent",
+        Drafts: "folder.drafts",
+        Trash: "folder.trash",
+      };
+      return t(keys[folder.value]);
+    });
 
     async function load(): Promise<void> {
       loading.value = true;
       error.value = undefined;
       try {
-        const result = await rpc.call<{ total: number; messages: EnvelopeRow[] }>("mail.list", {
-          mailbox: props.mailbox,
-          limit: 50,
-        });
+        const result = await rpc.call<MailboxListing>(
+          folder.value === "Starred" ? "mail.listStarred" : "mail.list",
+          { mailbox: props.mailbox, limit: 50 },
+        );
         rows.value = result.messages;
         total.value = result.total;
+        if (folder.value === "INBOX" && typeof result.unread === "number") {
+          inboxUnread.value = result.unread;
+        }
       } catch (e) {
         toastError(e);
         error.value = t("err.mailFailed");
@@ -97,7 +138,8 @@ export default defineComponent({
     watch(() => props.mailbox, () => void load());
 
     function open(row: EnvelopeRow): void {
-      void router.push({ path: `/read/${row.uid}`, query: { box: props.mailbox } });
+      const box = row.mailbox || props.mailbox;
+      void router.push({ path: `/read/${row.uid}`, query: { box } });
     }
 
     const sections = computed<HkTableSection[]>(() =>
@@ -142,26 +184,62 @@ export default defineComponent({
     const rowMenuItems = computed<HkMenuItem[]>(() => {
       const row = menuRow.value;
       if (!row) return [];
-      return [
+      const items: HkMenuItem[] = [
         {
           key: "seen",
           label: row.seen ? t("mail.markUnread") : t("mail.markSeen"),
         },
+        {
+          key: "star",
+          label: row.flagged ? t("mail.unstar") : t("mail.star"),
+        },
       ];
+      if (row.mailbox !== "Trash") {
+        items.push({ key: "trash", label: t("mail.trashMove"), danger: true });
+      } else {
+        items.push({ key: "purge", label: t("mail.purge"), danger: true });
+      }
+      return items;
     });
+
+    function refreshUnreadAfterSeen(row: EnvelopeRow, nowSeen: boolean): void {
+      if ((row.mailbox || props.mailbox) !== "INBOX") return;
+      if (row.seen && !nowSeen) inboxUnread.value += 1;
+      if (!row.seen && nowSeen) inboxUnread.value = Math.max(0, inboxUnread.value - 1);
+    }
 
     async function onMenuSelect(key: string): Promise<void> {
       const row = menuRow.value;
       rowMenuUid.value = null;
-      if (key !== "seen" || !row) return;
-      const target = !row.seen;
+      if (!row) return;
       try {
-        await rpc.call("mail.markSeen", {
-          uid: row.uid,
-          mailbox: props.mailbox,
-          seen: target,
-        });
-        row.seen = target;
+        if (key === "seen") {
+          const target = !row.seen;
+          await rpc.call("mail.markSeen", {
+            uid: row.uid,
+            mailbox: row.mailbox || props.mailbox,
+            seen: target,
+          });
+          refreshUnreadAfterSeen(row, target);
+          row.seen = target;
+        } else if (key === "star") {
+          const target = !row.flagged;
+          await rpc.call("mail.star", {
+            uid: row.uid,
+            mailbox: row.mailbox || props.mailbox,
+            starred: target,
+          });
+          row.flagged = target;
+        } else if (key === "trash") {
+          await rpc.call("mail.trash", {
+            uid: row.uid,
+            mailbox: row.mailbox || props.mailbox,
+          });
+          rows.value = rows.value.filter((r) => r.uid !== row.uid);
+          total.value = Math.max(0, total.value - 1);
+        } else if (key === "purge") {
+          purgeRow.value = row;
+        }
       } catch (e) {
         toastError(e);
       }
@@ -172,16 +250,35 @@ export default defineComponent({
       rowMenuUid.value = (row as unknown as EnvelopeRow).uid;
     }
 
+    async function onPurgeConfirm(): Promise<void> {
+      const row = purgeRow.value;
+      if (!row) return;
+      purging.value = true;
+      try {
+        await rpc.call("mail.purge", {
+          uid: row.uid,
+          mailbox: row.mailbox || props.mailbox,
+        });
+        rows.value = rows.value.filter((r) => r.uid !== row.uid);
+        total.value = Math.max(0, total.value - 1);
+        purgeRow.value = null;
+      } catch (e) {
+        toastError(e);
+      } finally {
+        purging.value = false;
+      }
+    }
+
     return () => (
       <>
         <HkAdminTablePage
-          title={props.mailbox === "Sent" ? t("folder.sent") : t("folder.inbox")}
+          title={folderTitle.value}
           rows={rows.value}
           columns={columns.value}
           rowKey="uid"
           loading={loading.value}
           error={error.value}
-          emptyTitle={t("inbox.empty")}
+          emptyTitle={folder.value === "INBOX" ? t("inbox.empty") : folderTitle.value}
           total={total.value}
         >
           {{
@@ -201,6 +298,9 @@ export default defineComponent({
                       enterWrap(row, (
                         <span class="ay-mail-from">
                           <span class="ay-mail-dot" aria-hidden="true" data-unread={!row.seen || undefined} />
+                          {row.flagged && (
+                            <span class="ay-mail-star" aria-hidden="true" data-flagged="true" />
+                          )}
                           <span class="ay-mail-from-text">{row.from || t("mail.unknownSender")}</span>
                         </span>
                       )),
@@ -231,6 +331,21 @@ export default defineComponent({
           title={t("mail.actions")}
           items={rowMenuItems.value}
           onSelect={onMenuSelect}
+        />
+        {/* Permanently deleting from Trash is destructive behind a confirm
+         *  (the family principle: a destructive action is never bare). */}
+        <HkConfirmDialog
+          open={purgeRow.value !== null}
+          title={t("mail.purgeTitle")}
+          message={t("mail.purgeMessage")}
+          loading={purging.value}
+          onConfirm={onPurgeConfirm}
+          onCancel={() => {
+            purgeRow.value = null;
+          }}
+          onUpdate:open={(v: boolean) => {
+            if (!v) purgeRow.value = null;
+          }}
         />
       </>
     );

@@ -110,9 +110,14 @@ pub async fn dispatch(
             RpcOutcome::Result(json!({ "ok": true }))
         }
         "mail.list" => mail_route(app, sessions, ctx, &params, mail_list).await,
+        "mail.listStarred" => mail_route(app, sessions, ctx, &params, mail_list_starred).await,
         "mail.read" => mail_route(app, sessions, ctx, &params, mail_read).await,
         "mail.send" => mail_route(app, sessions, ctx, &params, mail_send).await,
+        "mail.saveDraft" => mail_route(app, sessions, ctx, &params, mail_save_draft).await,
         "mail.markSeen" => mail_route(app, sessions, ctx, &params, mail_mark_seen).await,
+        "mail.star" => mail_route(app, sessions, ctx, &params, mail_star).await,
+        "mail.trash" => mail_route(app, sessions, ctx, &params, mail_trash).await,
+        "mail.purge" => mail_route(app, sessions, ctx, &params, mail_purge).await,
         "admin.state.get" => match require_admin(sessions, ctx, &params) {
             Ok(()) => RpcOutcome::Result(load_state(app)),
             Err(e) => RpcOutcome::App(e),
@@ -363,11 +368,169 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
                 session.address.as_str(),
                 password,
                 "Sent",
+                Some("\\Seen"),
                 &ayane_mail::compose::render(&message),
             )
             .await;
     }
+    // Sending a DRAFT retires the draft copy (best effort, like the Sent
+    // copy — a failed cleanup must not fail an already-queued send).
+    if let Some(draft_uid) = params.get("draftUid").and_then(Value::as_u64) {
+        if let Ok(imap) = imap_of(&app) {
+            let _ = imap
+                .purge_message(
+                    session.address.as_str(),
+                    password,
+                    "Drafts",
+                    draft_uid as u32,
+                )
+                .await;
+        }
+    }
     Ok(json!({ "queued": true, "to": to.as_str() }))
+}
+
+/// Save the composer's current state as a DRAFT: build the message with
+/// draft semantics (the recipient may be half-typed) and APPEND it to the
+/// Drafts mailbox, which is autocreated like every folder the webmail
+/// touches.
+async fn mail_save_draft(
+    app: AppState,
+    session: Session,
+    params: Value,
+) -> Result<Value, AppError> {
+    let to = params
+        .get("to")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let subject = params
+        .get("subject")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let body = params
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let password = session.password.as_deref().expect("checked at route");
+    let message = ayane_mail::compose::build_draft_message(
+        &session.address,
+        &session.display_name,
+        &to,
+        &subject,
+        &body,
+    )
+    .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?;
+    let imap = imap_of(&app)?;
+    imap.append_to_mailbox(
+        session.address.as_str(),
+        password,
+        "Drafts",
+        None,
+        &ayane_mail::compose::render(&message),
+    )
+    .await
+    .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
+    Ok(json!({ "saved": true }))
+}
+
+/// The 已加星标 roster: flagged messages across the user's real folders,
+/// merged newest first. A flag is per-message — there is no Starred folder.
+async fn mail_list_starred(
+    app: AppState,
+    session: Session,
+    params: Value,
+) -> Result<Value, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 200) as usize;
+    let password = session.password.as_deref().expect("checked at route");
+    let rows = imap_of(&app)?
+        .list_flagged(
+            session.address.as_str(),
+            password,
+            &["INBOX", "Sent", "Drafts"],
+            limit,
+        )
+        .await
+        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
+    let total = rows.len() as u32;
+    Ok(json!({ "mailbox": "Starred", "total": total, "messages": rows }))
+}
+
+/// Toggle the `\Flagged` (star) flag on one message.
+async fn mail_star(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
+    let uid = uid_of(&params)?;
+    let mailbox = mailbox_of(&params, "INBOX");
+    let starred = params.get("starred").and_then(Value::as_bool) != Some(false);
+    let password = session.password.as_deref().expect("checked at route");
+    let op = if starred {
+        "+FLAGS.SILENT (\\Flagged)"
+    } else {
+        "-FLAGS.SILENT (\\Flagged)"
+    };
+    imap_of(&app)?
+        .store_flag(session.address.as_str(), password, &mailbox, uid, op)
+        .await
+        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
+    Ok(json!({ "ok": true, "starred": starred }))
+}
+
+/// Delete one message: MOVE it to the auto-created Trash mailbox. Refused
+/// for messages already in Trash — permanent deletion there is `mail.purge`
+/// behind a confirm.
+async fn mail_trash(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
+    let uid = uid_of(&params)?;
+    let mailbox = mailbox_of(&params, "INBOX");
+    if mailbox == "Trash" {
+        return Err(AppError::new(
+            "Mail.MalformedParams",
+            "already in Trash: use mail.purge",
+        ));
+    }
+    let password = session.password.as_deref().expect("checked at route");
+    imap_of(&app)?
+        .move_to_mailbox(session.address.as_str(), password, &mailbox, uid, "Trash")
+        .await
+        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
+    Ok(json!({ "ok": true }))
+}
+
+/// Permanently delete one message from Trash (STORE \Deleted + EXPUNGE —
+/// only this message carries the flag).
+async fn mail_purge(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
+    let uid = uid_of(&params)?;
+    let mailbox = mailbox_of(&params, "Trash");
+    let password = session.password.as_deref().expect("checked at route");
+    imap_of(&app)?
+        .purge_message(session.address.as_str(), password, &mailbox, uid)
+        .await
+        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
+    Ok(json!({ "ok": true }))
+}
+
+/// The `uid` param (a required positive integer) as u32.
+fn uid_of(params: &Value) -> Result<u32, AppError> {
+    params
+        .get("uid")
+        .and_then(Value::as_u64)
+        .filter(|v| *v > 0 && *v <= u32::MAX as u64)
+        .map(|v| v as u32)
+        .ok_or_else(|| AppError::new("Mail.MalformedParams", "uid is required"))
+}
+
+/// The `mailbox` param with a fallback (every folder the webmail names).
+fn mailbox_of(params: &Value, fallback: &str) -> String {
+    params
+        .get("mailbox")
+        .and_then(Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
 }
 
 async fn mail_mark_seen(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {

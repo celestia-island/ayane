@@ -37,22 +37,6 @@ body {
   opacity: 0.7;
 }
 
-/* The language select wears the footer's chrome-free look: a quiet text
-   row that washes on hover. The opened popout keeps its own surface. */
-.hk-settings .hk-select-trigger {
-  background: transparent;
-  border: none;
-  box-shadow: none;
-  min-height: var(--space-32, 2rem);
-  padding-inline: 0.5rem;
-  font-size: 0.875rem;
-}
-
-.hk-settings .hk-select-trigger:hover:not([data-disabled]) {
-  border-color: transparent;
-  background: rgb(var(--color-muted, 108 108 108) / 10%);
-}
-
 /* The theme panel body fills the settings pane (no popover max-width). */
 .ay-settings-theme {
   width: 100%;
@@ -160,6 +144,19 @@ body {
 }
 
 .ay-mail-dot[data-unread] { background: rgb(var(--color-primary)); }
+
+/* The star glyph: a filled five-point star in the primary ink (unread
+   dots and stars coexist on the same row). */
+.ay-mail-star {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  background: rgb(var(--color-primary));
+  clip-path: polygon(
+    50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%,
+    50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%
+  );
+}
 
 .ay-mail-from-text {
   overflow: hidden;

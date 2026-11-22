@@ -32,6 +32,10 @@ pub struct ParsedMessage {
     pub to: Vec<String>,
     /// `Subject` header.
     pub subject: Option<String>,
+    /// Raw `X-Ayane-Draft-To` header — the composer's recipient input as
+    /// the draft saved it (a half-typed address never becomes a real `To`).
+    /// Only drafts carry it; the composer reads it back on "continue".
+    pub draft_to: Option<String>,
     /// Plain-text body when the message has one.
     pub text: Option<String>,
     /// Ammonia-sanitised HTML body (safe to render; remote content removed).
@@ -112,6 +116,11 @@ pub fn parse(raw: &[u8]) -> Option<ParsedMessage> {
         from,
         to,
         subject: message.subject().map(str::to_owned),
+        draft_to: message
+            .headers()
+            .value("X-Ayane-Draft-To")
+            .and_then(|v| v.as_text())
+            .map(str::to_owned),
         text,
         html,
         attachments,
