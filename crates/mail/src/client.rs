@@ -206,6 +206,10 @@ pub struct EnvelopeRow {
     pub seen: bool,
     /// RFC 5322 size in bytes.
     pub size: u32,
+    /// Server INTERNALDATE rendered as RFC 3339 (offset preserved), when
+    /// the server returned one. Drives the webmail's date column and the
+    /// 今天/昨天/更早 swimlanes.
+    pub date: Option<String>,
 }
 
 /// Where a fetch should land the `\Seen` flag.
@@ -252,7 +256,7 @@ impl Imap {
             let mut fetches = session
                 .fetch(
                     format!("{start}:{total}"),
-                    "(UID FLAGS ENVELOPE RFC822.SIZE)",
+                    "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)",
                 )
                 .await
                 .map_err(|e| ClientError::Imap(e.to_string()))?;
@@ -284,6 +288,7 @@ impl Imap {
                     subject,
                     seen,
                     size: fetch.size.unwrap_or(0),
+                    date: fetch.internal_date().map(|d| d.to_rfc3339()),
                 });
             }
             rows.sort_by_key(|row| std::cmp::Reverse(row.uid));

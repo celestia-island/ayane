@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { ShieldAlert, FileLock2 } from "lucide-vue-next";
+import { ArrowLeft, ShieldAlert, FileLock2 } from "lucide-vue-next";
+
+import { HkButton, HkSectionCard } from "@celestia-island/hikari";
 
 import { rpc } from "../lib/rpc";
 import { t } from "../lib/i18n";
@@ -55,35 +57,44 @@ onMounted(async () => {
 
 <template>
   <div class="read">
-    <button class="hk-button ghost" @click="router.push('/inbox')">← {{ t("read.back") }}</button>
+    <div class="read-top">
+      <HkButton variant="ghost" size="sm" @click="router.push('/inbox')">
+        <ArrowLeft :size="14" /> {{ t("read.back") }}
+      </HkButton>
+    </div>
     <p v-if="loading" class="muted">{{ t("inbox.loading") }}</p>
     <template v-else-if="message">
-      <h2>{{ message.subject || "(无主题)" }}</h2>
-      <p class="muted">{{ message.from }} → {{ message.to.join(", ") }}</p>
+      <h2>{{ message.subject || t("mail.noSubject") }}</h2>
+      <p class="muted read-route">{{ message.from }} → {{ message.to.join(", ") }}</p>
 
-      <div v-if="suspicious.length" class="hk-card warn-card">
-        <p class="warn"><ShieldAlert :size="16" style="vertical-align: -3px" /> {{ t("read.suspicious", { n: suspicious.length }) }}</p>
-        <ul>
-          <li v-for="link in suspicious" :key="link.url" :class="link.verdict">
+      <HkSectionCard
+        v-if="suspicious.length"
+        :title="t('read.suspicious', { n: suspicious.length })"
+        :icon="ShieldAlert"
+        level="h3"
+      >
+        <ul class="read-links">
+          <li v-for="link in suspicious" :key="link.url">
             <code>{{ link.url }}</code>
             <small class="muted"> — {{ link.reasons.join("；") }}</small>
           </li>
         </ul>
-      </div>
+      </HkSectionCard>
 
       <!-- Only ammonia-sanitised HTML from the server, remote references stripped. -->
-      <div v-if="message.html" class="body html" v-html="message.html" />
-      <pre v-else-if="message.text" class="body">{{ message.text }}</pre>
-      <p v-else class="muted body">{{ t("read.noBody") }}</p>
+      <div v-if="message.html" class="read-body html" v-html="message.html" />
+      <pre v-else-if="message.text" class="read-body">{{ message.text }}</pre>
+      <p v-else class="muted read-body">{{ t("read.noBody") }}</p>
 
-      <div v-if="message.attachments.length" class="hk-card">
-        <p class="muted">
-          <FileLock2 :size="16" style="vertical-align: -3px" />
-          {{ t("read.attachments", { n: message.attachments.length }) }}
-        </p>
-        <table>
+      <HkSectionCard
+        v-if="message.attachments.length"
+        :title="t('read.attachments', { n: message.attachments.length })"
+        :icon="FileLock2"
+        level="h3"
+      >
+        <table class="read-attachments">
           <thead>
-            <tr><th>文件</th><th>类型</th><th>大小</th><th>SHA-256</th></tr>
+            <tr><th>{{ t("read.att.file") }}</th><th>{{ t("read.att.type") }}</th><th>{{ t("mail.col.size") }}</th><th>SHA-256</th></tr>
           </thead>
           <tbody>
             <tr v-for="att in message.attachments" :key="att.sha256">
@@ -94,25 +105,32 @@ onMounted(async () => {
             </tr>
           </tbody>
         </table>
-      </div>
+      </HkSectionCard>
     </template>
   </div>
 </template>
 
-<style scoped lang="scss">
+<style scoped>
 .read { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
-h2 { margin: 0; }
-.body { white-space: pre-wrap; background: #161c27; border: 1px solid #232a37; border-radius: 12px; padding: 16px; }
-.html { white-space: normal;
-  :deep(a) { color: #6cb2ff; }
-  :deep(img), :deep(video), :deep(iframe) { display: none; }
+.read-top { display: flex; }
+.read h2 { margin: 0; font-size: 1.3rem; }
+.read-route { margin: 0; font-size: 0.85rem; }
+.read-body {
+  white-space: pre-wrap;
+  background: var(--hk-card-bg, #161c27);
+  border: 1px solid var(--hk-card-border, #232a37);
+  border-radius: 12px;
+  padding: 16px;
 }
-.warn-card { border-color: #6b5a1e;
-  ul { margin: 6px 0 0; padding-left: 18px; }
-}
-table { width: 100%; border-collapse: collapse; font-size: 13px;
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #232a37; }
-  code { font-size: 11px; word-break: break-all; }
-}
-.ghost { background: transparent; color: #aab3c5; border: 1px solid #2a3345; }
+.read-body.html { white-space: normal; }
+.read-body.html :deep(a) { color: rgb(var(--color-primary, 108 178 255)); }
+.read-body.html :deep(img),
+.read-body.html :deep(video),
+.read-body.html :deep(iframe) { display: none; }
+.read-links { margin: 0; padding-left: 18px; }
+.read-links li { margin-block: 4px; }
+.read-attachments { width: 100%; border-collapse: collapse; font-size: 13px; }
+.read-attachments th,
+.read-attachments td { text-align: left; padding: 6px 8px; border-bottom: 1px solid rgb(var(--color-border, 35 42 55)); }
+.read-attachments code { font-size: 11px; word-break: break-all; }
 </style>

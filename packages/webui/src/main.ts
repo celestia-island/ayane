@@ -29,7 +29,7 @@ const router = createRouter({
         { path: "", redirect: "/inbox" },
         {
           path: "inbox",
-          component: () => import("./views/InboxView.vue"),
+          component: () => import("./views/InboxView.tsx"),
           props: (route) => ({ mailbox: String(route.query.box || "INBOX") }),
         },
         {

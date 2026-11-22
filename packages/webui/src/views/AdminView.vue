@@ -1,6 +1,15 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
-import { Globe, Save, Rocket } from "lucide-vue-next";
+import { computed, onMounted, ref } from "vue";
+import { Globe, Save } from "lucide-vue-next";
+
+import {
+  HkAdminTablePage,
+  HkBadge,
+  HkButton,
+  HkInput,
+  HkSectionCard,
+  type BadgeVariant,
+} from "@celestia-island/hikari";
 
 import { rpc } from "../lib/rpc";
 import { t } from "../lib/i18n";
@@ -16,11 +25,14 @@ const adminToken = ref("");
 const adminOk = ref(false);
 const stateText = ref("");
 const dns = ref<DnsCheck[] | null>(null);
+const dnsLoading = ref(true);
+const dnsError = ref<string | undefined>(undefined);
 const busy = ref(false);
 
 onMounted(async () => {
   adminToken.value = localStorage.getItem("ayane.admin") || "";
   if (adminToken.value) await adminLogin();
+  else dnsLoading.value = false;
 });
 
 async function adminLogin(): Promise<void> {
@@ -57,7 +69,8 @@ async function apply(): Promise<void> {
   try {
     const report = await rpc.call<{ reloaded: { service: string; ok: boolean }[] }>("admin.apply");
     const allOk = report.reloaded.every((r) => r.ok);
-    toastSuccess(allOk ? t("admin.applied") : t("admin.applyPartial"));
+    if (allOk) toastSuccess(t("admin.applied"));
+    else toastSuccess(t("admin.applyPartial"));
   } catch (e) {
     toastError(e);
   } finally {
@@ -66,63 +79,83 @@ async function apply(): Promise<void> {
 }
 
 async function runDns(): Promise<void> {
+  dnsLoading.value = true;
+  dnsError.value = undefined;
   try {
     const report = await rpc.call<{ checks: DnsCheck[] }>("dns.check");
     dns.value = report.checks;
   } catch (e) {
     toastError(e);
+    dnsError.value = t("err.adminFailed");
+  } finally {
+    dnsLoading.value = false;
   }
 }
+
+const dnsColumns = computed(() => [
+  { key: "check", title: t("admin.col.check") },
+  { key: "status", title: t("admin.col.status"), width: "120px", copyable: false },
+  { key: "detail", title: t("admin.col.detail") },
+]);
+
+function badgeOf(status: string): BadgeVariant {
+  if (status === "pass") return "success";
+  if (status === "warn") return "warning";
+  return "error";
+}
+
+const dnsRows = computed(() => dns.value ?? []);
 </script>
 
 <template>
   <div class="admin">
-    <form v-if="!adminOk" class="hk-card" @submit.prevent="adminLogin">
-      <h3>{{ t("admin.unlockTitle") }}</h3>
-      <p class="muted">{{ t("admin.unlockHint") }}</p>
-      <input v-model="adminToken" class="hk-input" type="password" :placeholder="t('admin.token')" />
-      <button class="hk-button" :disabled="!adminToken">{{ t("admin.unlock") }}</button>
-    </form>
+    <HkSectionCard v-if="!adminOk" :title="t('admin.unlockTitle')" class="admin-unlock">
+      <p class="muted admin-hint">{{ t("admin.unlockHint") }}</p>
+      <HkInput v-model="adminToken" type="password" :placeholder="t('admin.token')" />
+      <HkButton :disabled="!adminToken || busy" @click="adminLogin">
+        <Save :size="14" /> {{ t("admin.unlock") }}
+      </HkButton>
+    </HkSectionCard>
 
     <template v-else>
-      <div class="hk-card">
-        <h3><Globe :size="16" style="vertical-align: -3px" /> {{ t("admin.dns") }}</h3>
-        <ul class="dns">
-          <li v-for="c in dns || []" :key="c.check">
-            <span class="pill" :class="c.status">{{ c.status }}</span>
-            <b>{{ c.check }}</b>
-            <span class="muted">{{ c.detail }}</span>
-          </li>
-        </ul>
-        <button class="hk-button ghost" @click="runDns">{{ t("admin.rerun") }}</button>
-      </div>
+      <HkAdminTablePage
+        :title="t('admin.dns')"
+        :icon="Globe"
+        :rows="dnsRows"
+        :columns="dnsColumns"
+        row-key="check"
+        :loading="dnsLoading"
+        :error="dnsError"
+        :empty-title="t('admin.dns')"
+      >
+        <template #actions>
+          <HkButton variant="ghost" size="sm" :disabled="dnsLoading" @click="runDns">
+            {{ t("admin.rerun") }}
+          </HkButton>
+        </template>
+        <template #cell-status="{ row }">
+          <HkBadge :variant="badgeOf(String(row.status))">{{ String(row.status) }}</HkBadge>
+        </template>
+        <template #cell-detail="{ row }">
+          <span class="muted">{{ String(row.detail) }}</span>
+        </template>
+      </HkAdminTablePage>
 
-      <div class="hk-card">
-        <h3><Save :size="16" style="vertical-align: -3px" /> {{ t("admin.state") }}</h3>
-        <textarea v-model="stateText" class="hk-input mono" rows="18" spellcheck="false" />
-        <div class="hk-row">
-          <button class="hk-button" :disabled="busy" @click="saveState">{{ t("admin.save") }}</button>
-          <button class="hk-button" :disabled="busy" @click="apply">
-            <Rocket :size="14" /> {{ t("admin.apply") }}
-          </button>
+      <HkSectionCard :title="t('admin.state')" :icon="Save">
+        <textarea v-model="stateText" class="hk-input admin-mono" rows="18" spellcheck="false" />
+        <div class="admin-actions">
+          <HkButton :disabled="busy" @click="saveState">{{ t("admin.save") }}</HkButton>
+          <HkButton variant="ghost" :disabled="busy" @click="apply">{{ t("admin.apply") }}</HkButton>
         </div>
-      </div>
+      </HkSectionCard>
     </template>
   </div>
 </template>
 
-<style scoped lang="scss">
+<style scoped>
 .admin { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-form { display: flex; flex-direction: column; gap: 10px; }
-.dns { list-style: none; margin: 0 0 10px; padding: 0; display: flex; flex-direction: column; gap: 6px;
-  li { display: flex; gap: 8px; align-items: baseline; }
-}
-.pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; min-width: 44px; text-align: center;
-  &.pass { background: #1d4028; color: #7ddba0; }
-  &.warn { background: #4a3a12; color: #e2b93b; }
-  &.fail { background: #4a1d1d; color: #e08181; }
-}
-.mono { font-family: ui-monospace, monospace; font-size: 12px; }
-.ghost { background: transparent; color: #aab3c5; border: 1px solid #2a3345; }
-h3 { margin: 0 0 8px; }
+.admin-unlock { display: flex; flex-direction: column; gap: 12px; }
+.admin-hint { margin: 0; }
+.admin-actions { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+.admin-mono { font-family: ui-monospace, monospace; font-size: 12px; }
 </style>

@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { ref } from "vue";
+import { Send } from "lucide-vue-next";
 import { useRouter } from "vue-router";
+
+import { HkButton, HkInput, HkSectionCard } from "@celestia-island/hikari";
 
 import { rpc } from "../lib/rpc";
 import { t } from "../lib/i18n";
@@ -28,31 +31,28 @@ async function send(): Promise<void> {
 
 <template>
   <div class="compose">
-    <form class="hk-card" @submit.prevent="send">
-      <label>
-        <span>{{ t("compose.to") }}</span>
-        <input v-model="to" class="hk-input" type="email" required placeholder="someone@example.com" />
-      </label>
-      <label>
-        <span>{{ t("compose.subject") }}</span>
-        <input v-model="subject" class="hk-input" type="text" />
-      </label>
-      <label>
-        <span>{{ t("compose.body") }}</span>
-        <textarea v-model="body" class="hk-input" rows="10" />
-      </label>
-      <div class="hk-row">
-        <button class="hk-button" type="submit" :disabled="busy || !to">{{ t("compose.send") }}</button>
-        <button class="hk-button ghost" type="button" @click="router.push('/inbox')">{{ t("compose.cancel") }}</button>
-      </div>
+    <form @submit.prevent="send">
+      <HkSectionCard :title="t('compose.button')" class="compose-card">
+        <div class="compose-fields">
+          <HkInput v-model="to" type="email" required :label="t('compose.to')" placeholder="someone@example.com" />
+          <HkInput v-model="subject" :label="t('compose.subject')" />
+          <HkInput v-model="body" type="textarea" :rows="10" :label="t('compose.body')" />        </div>
+        <div class="compose-actions">
+          <HkButton type="submit" :disabled="busy || !to">
+            <Send :size="14" /> {{ t("compose.send") }}
+          </HkButton>
+          <HkButton variant="ghost" type="button" @click="router.push('/inbox')">
+            {{ t("compose.cancel") }}
+          </HkButton>
+        </div>
+      </HkSectionCard>
     </form>
   </div>
 </template>
 
-<style scoped lang="scss">
+<style scoped>
 .compose { max-width: 720px; margin: 0 auto; }
-form { display: flex; flex-direction: column; gap: 12px;
-  label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #aab3c5; }
-}
-.ghost { background: transparent; color: #aab3c5; border: 1px solid #2a3345; }
+.compose-card { display: flex; }
+.compose-fields { display: flex; flex-direction: column; gap: 12px; }
+.compose-actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; }
 </style>
