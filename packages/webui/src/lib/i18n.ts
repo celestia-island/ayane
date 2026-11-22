@@ -37,6 +37,9 @@ export const LOCALES: Locale[] = [
 type Table = Record<string, string>;
 
 const en: Table = {
+  "settings.about": "About",
+  "settings.app": "App",
+  "settings.panel": "Panel",
   "sidebar.mail": "Mail",
   "sidebar.system": "System",
   "menu.account": "Account",
@@ -92,6 +95,9 @@ const en: Table = {
 };
 
 const zhHans: Table = {
+  "settings.about": "关于",
+  "settings.app": "应用",
+  "settings.panel": "面板",
   "sidebar.mail": "邮箱",
   "sidebar.system": "系统",
   "menu.account": "账号",
@@ -147,6 +153,9 @@ const zhHans: Table = {
 };
 
 const zhHant: Table = {
+  "settings.about": "關於",
+  "settings.app": "應用",
+  "settings.panel": "面板",
   "sidebar.mail": "信箱",
   "sidebar.system": "系統",
   "menu.account": "帳號",
@@ -202,6 +211,9 @@ const zhHant: Table = {
 };
 
 const ja: Table = {
+  "settings.about": "このアプリについて",
+  "settings.app": "アプリ",
+  "settings.panel": "パネル",
   "sidebar.mail": "メール",
   "sidebar.system": "システム",
   "menu.account": "アカウント",
@@ -257,6 +269,9 @@ const ja: Table = {
 };
 
 const ko: Table = {
+  "settings.about": "정보",
+  "settings.app": "앱",
+  "settings.panel": "패널",
   "sidebar.mail": "메일",
   "sidebar.system": "시스템",
   "menu.account": "계정",
@@ -312,6 +327,9 @@ const ko: Table = {
 };
 
 const de: Table = {
+  "settings.about": "Über",
+  "settings.app": "App",
+  "settings.panel": "Panel",
   "sidebar.mail": "Post",
   "sidebar.system": "System",
   "menu.account": "Konto",
@@ -367,6 +385,9 @@ const de: Table = {
 };
 
 const fr: Table = {
+  "settings.about": "À propos",
+  "settings.app": "Application",
+  "settings.panel": "Panneau",
   "sidebar.mail": "Messagerie",
   "sidebar.system": "Système",
   "menu.account": "Compte",
@@ -422,6 +443,9 @@ const fr: Table = {
 };
 
 const es: Table = {
+  "settings.about": "Acerca de",
+  "settings.app": "Aplicación",
+  "settings.panel": "Panel",
   "sidebar.mail": "Correo",
   "sidebar.system": "Sistema",
   "menu.account": "Cuenta",
@@ -477,6 +501,9 @@ const es: Table = {
 };
 
 const ru: Table = {
+  "settings.about": "О приложении",
+  "settings.app": "Приложение",
+  "settings.panel": "Панель",
   "sidebar.mail": "Почта",
   "sidebar.system": "Система",
   "menu.account": "Аккаунт",

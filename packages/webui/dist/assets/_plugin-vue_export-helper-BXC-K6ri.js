@@ -1,1 +1,0 @@
-import{r as e}from"./i18n-BDV601zx.js";import{t}from"./useToast-BlqYimaC.js";var n=t();function r(t){let r=t instanceof Error?t.message:String(t);console.error(r),r.startsWith(`Session.Required:`)||n.error(e(r))}function i(e){n.success(e)}var a=(e,t)=>{let n=e.__vccOpts||e;for(let[e,r]of t)n[e]=r;return n};export{r as n,i as r,a as t};

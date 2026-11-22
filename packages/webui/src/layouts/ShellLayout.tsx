@@ -1,16 +1,18 @@
 import { computed, defineComponent, onMounted, ref } from "vue";
 import { RouterView, useRoute, useRouter } from "vue-router";
-import { LogOut, Mail, PenLine, Send, Settings } from "lucide-vue-next";
+import { Mail, PenLine, Send, Settings } from "lucide-vue-next";
 
 import {
   HkAdminHeader,
   HkAdminShell,
+  HkIconButton,
   HkMenu,
-  HkPopover,
+  HkSettingsDialog,
   HkStatusBar,
+  HkThemePanelContent,
   HSidebar,
   setLocale,
-  useTheme,
+  useToast,
   type HkConnectionInfo,
   type HkMenuItem,
 } from "@celestia-island/hikari";
@@ -25,20 +27,32 @@ import {
 } from "../lib/i18n";
 import { onSessionRequired, rpc, sessionToken, setSessionToken, type ConnectionState } from "../lib/rpc";
 
-/** The signed-in shell: HkAdminShell + family admin header (brand menu
- *  top-left with logout, settings popover top-right) + Gmail-style
- *  sidebar (compose button, then mail folders) + the full footer status
- *  bar. Session expiry anywhere in the app returns to the login page. */
+const LOCALE_LABELS: Record<Locale, string> = {
+  en: "English",
+  "zh-Hans": "简体中文",
+  "zh-Hant": "繁體中文",
+  ja: "日本語",
+  ko: "한국어",
+  de: "Deutsch",
+  fr: "Français",
+  es: "Español",
+  ru: "Русский",
+};
+
+/** The signed-in shell: HkAdminShell + family admin header (identity face:
+ *  avatar + account menu with logout) + the sidebar nav (HkMenu) + the
+ *  full footer status bar. Settings ride the family HkSettingsDialog
+ *  (theme / language / about sections) from the header gear. A stale
+ *  session anywhere returns to the login page silently. */
 export default defineComponent({
   name: "ShellLayout",
   setup() {
     const route = useRoute();
     const router = useRouter();
+    const toast = useToast();
     const connState = ref<ConnectionState>("connecting");
-    const theme = useTheme();
-
-    const settingsRef = ref<HTMLElement | null>(null);
     const settingsOpen = ref(false);
+    const settingsSection = ref("theme");
 
     const displayName = localStorage.getItem("ayane.displayName") || "";
 
@@ -59,23 +73,39 @@ export default defineComponent({
     const pageTitle = computed(() => {
       if (route.path.startsWith("/compose")) return t("compose.button");
       if (route.path.startsWith("/read")) return t("folder.inbox");
-      if (route.path.startsWith("/admin")) return t("admin.state");
+      if (route.path.startsWith("/admin")) return t("nav.admin");
       return route.query.box === "Sent" ? t("folder.sent") : t("folder.inbox");
     });
 
-    const folders = computed<HkMenuItem[]>(() => [
+    const navItems = computed<HkMenuItem[]>(() => [
+      { key: "compose", label: t("compose.button"), icon: PenLine },
       { key: "inbox", label: t("folder.inbox"), icon: Mail },
       { key: "sent", label: t("folder.sent"), icon: Send },
+      { key: "admin", label: t("nav.admin"), icon: Settings },
     ]);
 
-    const activeKey = computed(() =>
-      route.query.box === "Sent" || route.path === "/sent" ? "sent" : "inbox",
-    );
+    const activeKey = computed(() => {
+      if (route.path.startsWith("/compose")) return "compose";
+      if (route.path.startsWith("/admin")) return "admin";
+      return route.query.box === "Sent" || route.path === "/sent" ? "sent" : "inbox";
+    });
+
+    const sections = computed(() => [
+      { key: "theme", label: t("settings.theme") },
+      { key: "language", label: t("settings.language") },
+      { key: "about", label: t("settings.about") },
+    ]);
+
+    function onLocaleSelect(code: string): void {
+      setAppLocale(code as Locale);
+      void setLocale(code);
+    }
 
     function logout(): void {
       rpc.call("session.logout").catch(() => undefined);
       setSessionToken(null);
       localStorage.removeItem("ayane.displayName");
+      localStorage.removeItem("ayane.address");
       rpc.close();
       router.push("/login");
     }
@@ -83,26 +113,10 @@ export default defineComponent({
     onSessionRequired.handler = () => {
       setSessionToken(null);
       localStorage.removeItem("ayane.displayName");
+      localStorage.removeItem("ayane.address");
       rpc.close();
       router.push("/login");
     };
-
-    const localeNames: Record<Locale, string> = {
-      en: "English",
-      "zh-Hans": "简体中文",
-      "zh-Hant": "繁體中文",
-      ja: "日本語",
-      ko: "한국어",
-      de: "Deutsch",
-      fr: "Français",
-      es: "Español",
-      ru: "Русский",
-    };
-
-    function pickLocale(code: string): void {
-      setAppLocale(code as Locale);
-      void setLocale(code);
-    }
 
     onMounted(() => {
       if (!sessionToken()) {
@@ -110,7 +124,6 @@ export default defineComponent({
         return;
       }
       onLocaleChange.handler = (l) => void setLocale(l);
-      void setLocale(appLocale());
       rpc.onChange = (state) => {
         connState.value = state;
       };
@@ -118,103 +131,48 @@ export default defineComponent({
     });
 
     return () => (
+      <>
       <HkAdminShell sidebarCollapsed={false} navTitle="ayane" contentKey={route.path}>
         {{
           header: () => (
-            <>
             <HkAdminHeader
               title={pageTitle.value}
               username={displayName}
+              avatarAction="menu"
+              avatarMenuLabel={t("menu.account")}
               logoutLabel={t("menu.logout")}
               onLogout={logout}
               actions={[
-                <span key="settings" ref={settingsRef} style="display: inline-flex">
-                  <button
-                    class="s-logout-btn"
-                    title={t("settings.title")}
-                    aria-label={t("settings.title")}
-                    onClick={() => {
-                      settingsOpen.value = !settingsOpen.value;
-                    }}
-                  >
-                    <Settings size={16} />
-                  </button>
-                </span>,
+                <HkIconButton
+                  key="settings"
+                  variant="ghost"
+                  size={32}
+                  {...{ title: t("settings.title"), "aria-label": t("settings.title") }}
+                  onClick={() => {
+                    settingsOpen.value = true;
+                  }}
+                >
+                  <Settings size={16} />
+                </HkIconButton>,
               ]}
             />
-            <HkPopover
-              modelValue={settingsOpen.value}
-              onUpdate:modelValue={(v: boolean) => {
-                settingsOpen.value = v;
-              }}
-              anchorRef={settingsRef.value}
-              placement="bottom-end"
-              offset={6}
-              title={t("settings.title")}
-              padding="sm"
-            >
-              <div style="display: flex; flex-direction: column; gap: 8px; min-width: 180px">
-                <small class="s-menu-caption">{t("settings.theme")}</small>
-                <div style="display: flex; gap: 6px">
-                  <button
-                    class={["s-menu-row", theme.effectiveMode.value === "dark" ? "s-menu-row-active" : ""]}
-                    onClick={() => theme.setMode("dark")}
-                  >
-                    {t("settings.dark")}
-                  </button>
-                  <button
-                    class={["s-menu-row", theme.effectiveMode.value === "light" ? "s-menu-row-active" : ""]}
-                    onClick={() => theme.setMode("light")}
-                  >
-                    {t("settings.light")}
-                  </button>
-                </div>
-                <small class="s-menu-caption">{t("settings.language")}</small>
-                {LOCALES.map((code) => (
-                  <button
-                    class={["s-menu-row", appLocale() === code ? "s-menu-row-active" : ""]}
-                    onClick={() => pickLocale(code)}
-                  >
-                    {localeNames[code]}
-                  </button>
-                ))}
-              </div>
-            </HkPopover>
-            </>
           ),
           sidebar: () => (
             <HSidebar>
               {{
                 default: () => (
-                  <div style="display: flex; flex-direction: column; gap: 8px; padding: 8px">
-                    <button
-                      class="s-compose-btn"
-                      onClick={() => router.push("/compose")}
-                    >
-                      <PenLine size={16} />
-                      {t("compose.button")}
-                    </button>
-                    <small class="s-nav-caption">{t("sidebar.mail")}</small>
-                    <HkMenu
-                      variant="sidebar"
-                      open={true}
-                      items={folders.value}
-                      activeKey={activeKey.value}
-                      onSelect={(key: string) => {
-                        router.push(key === "sent" ? "/inbox?box=Sent" : "/inbox");
-                      }}
-                    />
-                    <small class="s-nav-caption">{t("sidebar.system")}</small>
-                    <div style="display: flex; flex-direction: column; gap: 2px; padding: 0 6px">
-                      <button
-                        class="s-manage-btn"
-                        onClick={() => router.push("/admin")}
-                      >
-                        <Settings size={15} />
-                        {t("nav.admin")}
-                      </button>
-                    </div>
-                  </div>
+                  <HkMenu
+                    variant="sidebar"
+                    open={true}
+                    title="ayane"
+                    items={navItems.value}
+                    activeKey={activeKey.value}
+                    onSelect={(key: string) => {
+                      router.push(
+                        key === "sent" ? "/inbox?box=Sent" : key === "inbox" ? "/inbox" : `/${key}`,
+                      );
+                    }}
+                  />
                 ),
               }}
             </HSidebar>
@@ -237,6 +195,56 @@ export default defineComponent({
           ),
         }}
       </HkAdminShell>
+      <HkSettingsDialog
+        modelValue={settingsOpen.value}
+        title={t("settings.title")}
+        navLabel={t("settings.title")}
+        sections={sections.value}
+        section={settingsSection.value}
+        onUpdate:section={(key: string) => {
+          settingsSection.value = key;
+        }}
+        onUpdate:modelValue={(v: boolean) => {
+          settingsOpen.value = v;
+        }}
+      >
+        {{
+          theme: () => (
+            <div>
+              <HkThemePanelContent />
+            </div>
+          ),
+          language: () => (
+            <div style="display: flex; flex-direction: column; gap: 6px">
+              {LOCALES.map((code) => (
+                <button
+                  key={code}
+                  class={{
+                    "s-language-option": true,
+                    "s-language-option-active": appLocale() === code,
+                  }}
+                  onClick={() => onLocaleSelect(code)}
+                >
+                  {LOCALE_LABELS[code]}
+                </button>
+              ))}
+            </div>
+          ),
+          about: () => (
+            <div style="display: flex; flex-direction: column; gap: 8px">
+              <div class="s-about-row">
+                <span class="s-about-label">{t("settings.app")}</span>
+                <span>ayane</span>
+              </div>
+              <div class="s-about-row">
+                <span class="s-about-label">{t("settings.panel")}</span>
+                <span>0.1.0</span>
+              </div>
+            </div>
+          ),
+        }}
+      </HkSettingsDialog>
+      </>
     );
   },
 });

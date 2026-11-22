@@ -172,3 +172,33 @@ textarea.hk-input:focus { outline: 1px solid var(--hk-accent, #3b7fc4); }
 }
 
 .s-manage-btn:hover { background: rgb(var(--color-surface-raised, 27 34 48)); }
+
+.s-language-option {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.s-language-option:hover { background: rgb(var(--color-surface-raised, 27 34 48)); }
+
+.s-language-option-active {
+  background: rgb(var(--color-primary) / 18%);
+  color: rgb(var(--color-primary));
+  font-weight: 600;
+}
+
+.s-about-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.9rem;
+}
+
+.s-about-label { color: rgb(var(--color-text-secondary, 127 139 161)); }
