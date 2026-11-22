@@ -46,7 +46,7 @@ const router = createRouter({
           }),
         },
         { path: "compose", component: () => import("./views/ComposeView.vue") },
-        { path: "admin", component: () => import("./views/AdminView.vue") },
+        { path: "admin", component: () => import("./views/UsersView.vue") },
         { path: "net-cert", component: () => import("./views/NetCertView.tsx") },
         { path: "net-traffic", component: () => import("./views/NetTrafficView.tsx") },
         { path: "net-lists", component: () => import("./views/NetListsView.vue") },

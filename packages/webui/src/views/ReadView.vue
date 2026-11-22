@@ -31,7 +31,7 @@ interface ParsedMessage {
   attachments: AttachmentMeta[];
 }
 
-const props = defineProps<{ uid: number; mailbox: string }>();
+const props = defineProps<{ uid: number; mailbox: string; embedded?: boolean }>();
 const router = useRouter();
 const message = ref<ParsedMessage | null>(null);
 const links = ref<LinkVerdict[]>([]);
@@ -56,8 +56,8 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="read">
-    <div class="read-top">
+  <div :class="{ read: true, 'read-embedded': props.embedded }">
+    <div v-if="!props.embedded" class="read-top">
       <HkButton variant="ghost" size="sm" @click="router.push(props.mailbox === 'Drafts' ? '/inbox?box=Drafts' : '/inbox')">
         <ArrowLeft :size="14" /> {{ t("read.back") }}
       </HkButton>
@@ -119,7 +119,8 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.read { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+.read { display: flex; flex-direction: column; gap: 14px; width: 100%; max-width: 860px; margin: 0 auto; }
+.read-embedded { max-width: none; }
 .read-top { display: flex; gap: 8px; align-items: center; }
 .read h2 { margin: 0; font-size: 1.3rem; }
 .read-route { margin: 0; font-size: 0.85rem; }

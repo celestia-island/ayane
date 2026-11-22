@@ -226,6 +226,26 @@ impl SessionStore {
             .ok_or(LoginError::InvalidCredentials)
     }
 
+    /// Re-resolve the session's admin authority against the CURRENT store.
+    ///
+    /// Admin is an account property, not a login-time snapshot: flipping an
+    /// account's flag must take effect for sessions already open (and
+    /// revoking it must bite immediately). Sessions minted by the admin
+    /// token override keep their grant (there is no account behind them).
+    #[must_use]
+    pub fn is_admin(&self, store: &dyn StateStore, session: &Session) -> bool {
+        if session.admin && session.password.is_none() {
+            return true;
+        }
+        store.load().is_ok_and(|stored| {
+            stored
+                .desired
+                .accounts
+                .iter()
+                .any(|account| account.address == session.address && account.admin)
+        })
+    }
+
     /// Drop a session.
     pub fn logout(&self, token: &str) {
         self.inner.lock().expect("sessions mutex").remove(token);

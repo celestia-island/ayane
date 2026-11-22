@@ -1,6 +1,6 @@
 import { computed, defineComponent, onMounted, ref } from "vue";
 import { RouterView, useRoute, useRouter } from "vue-router";
-import { Bot, Globe, Mail, PenLine, Plug, ScanSearch, Send, Settings, ShieldAlert, SquarePen, Star, Trash2 } from "lucide-vue-next";
+import { Globe, Mail, PenLine, Plug, ScanSearch, Send, Settings, ShieldAlert, SquarePen, Star, Trash2, Users } from "lucide-vue-next";
 
 import {
   HkAboutBody,
@@ -126,7 +126,7 @@ export default defineComponent({
       if (route.path.startsWith("/net-lists")) return t("sidebar.net.lists");
       if (route.path.startsWith("/net-audit")) return t("sidebar.net.audit");
       if (route.path.startsWith("/net-mcp")) return t("sidebar.net.mcp");
-      if (route.path.startsWith("/admin")) return t("nav.admin");
+      if (route.path.startsWith("/admin")) return t("sidebar.users");
       const box = typeof route.query.box === "string" ? route.query.box : "";
       return t(FOLDER_LABEL[(box.toLowerCase() || "inbox") as keyof typeof FOLDER_LABEL]);
     });
@@ -153,7 +153,6 @@ export default defineComponent({
       { key: "sent", label: t("folder.sent"), icon: Send },
       { key: "drafts", label: t("folder.drafts"), icon: SquarePen },
       { key: "trash", label: t("folder.trash"), icon: Trash2 },
-      { key: "admin", label: t("nav.admin"), icon: Settings },
     ]);
 
     /** The chest console's grouped nav: pinned compose, then themed
@@ -164,27 +163,21 @@ export default defineComponent({
         label: t("sidebar.group.mail"),
         items: navItems.value.filter((item) => FOLDER_KEYS.includes(item.key as never)),
       },
-      // The network surfaces are admin-only RPCs — the group stays
-      // hidden from plain mailbox sessions.
-      ...(admin.value
-        ? [
-            {
-              id: "net",
-              label: t("sidebar.group.net"),
-              items: [
+      {
+        id: "net",
+        label: t("sidebar.group.net"),
+        items: [
           { key: "net-cert", label: t("sidebar.net.cert"), icon: Globe },
           { key: "net-traffic", label: t("sidebar.net.traffic"), icon: Send },
           { key: "net-lists", label: t("sidebar.net.lists"), icon: ShieldAlert },
           { key: "net-audit", label: t("sidebar.net.audit"), icon: ScanSearch },
-              { key: "net-mcp", label: t("sidebar.net.mcp"), icon: Plug },
-            ],
-          },
-          ]
-        : []),
+          { key: "net-mcp", label: t("sidebar.net.mcp"), icon: Plug },
+        ],
+      },
       {
         id: "system",
         label: t("sidebar.group.system"),
-        items: [navItems.value.find((item) => item.key === "admin")!],
+        items: [{ key: "admin", label: t("sidebar.users"), icon: Users }],
       },
     ]);
 

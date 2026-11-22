@@ -1,16 +1,19 @@
 import { computed, defineComponent, onMounted, ref, watch, type VNode } from "vue";
-import { useRouter } from "vue-router";
 
 import {
   HkAdminTablePage,
+  HkButton,
   HkCard,
   HkConfirmDialog,
+  HkEmptyState,
   HkMenu,
   HTable,
   useConfirm,
   type HkMenuItem,
   type HkTableSection,
 } from "@celestia-island/hikari";
+
+import ReadView from "./ReadView.vue";
 
 import { rpc } from "../lib/rpc";
 import { inboxUnread } from "../lib/mailbox";
@@ -84,7 +87,6 @@ export default defineComponent({
   name: "InboxView",
   props: { mailbox: { type: String, required: true } },
   setup(props) {
-    const router = useRouter();
     const confirm = useConfirm();
     const rows = ref<EnvelopeRow[]>([]);
     const total = ref(0);
@@ -95,6 +97,9 @@ export default defineComponent({
     /** The purge flow's armed row (the confirm dialog owns the rest). */
     const purgeRow = ref<EnvelopeRow | null>(null);
     const purging = ref(false);
+    /** The message open in the detail pane (master-detail, not a route
+     *  jump — the roster stays on screen beside it). */
+    const selected = ref<EnvelopeRow | null>(null);
 
     /** The exact server folder the roster is on (route default INBOX). */
     const folder = computed<Folder>(() =>
@@ -138,8 +143,22 @@ export default defineComponent({
     watch(() => props.mailbox, () => void load());
 
     function open(row: EnvelopeRow): void {
-      const box = row.mailbox || props.mailbox;
-      void router.push({ path: `/read/${row.uid}`, query: { box } });
+      selected.value = row;
+      // Opening a message marks it read server-side; the row's own dot
+      // and the sidebar badge follow.
+      if (!row.seen) {
+        void rpc
+          .call("mail.markSeen", { uid: row.uid, mailbox: row.mailbox || props.mailbox, seen: true })
+          .then(() => {
+            refreshUnreadAfterSeen(row, true);
+            row.seen = true;
+          })
+          .catch(() => undefined);
+      }
+    }
+
+    function closeDetail(): void {
+      selected.value = null;
     }
 
     const sections = computed<HkTableSection[]>(() =>
@@ -271,6 +290,8 @@ export default defineComponent({
 
     return () => (
       <>
+        <div class="ay-inbox-split">
+        <div class="ay-inbox-roster">
         <HkAdminTablePage
           title={folderTitle.value}
           rows={rows.value}
@@ -319,6 +340,30 @@ export default defineComponent({
             ),
           }}
         </HkAdminTablePage>
+        </div>
+        <div class="ay-inbox-detail">
+          {selected.value ? (
+            <>
+              <div class="ay-inbox-detail-head">
+                <HkButton variant="ghost" size="sm" onClick={closeDetail}>
+                  {t("mail.closeDetail")}
+                </HkButton>
+              </div>
+              <ReadView
+                uid={selected.value.uid}
+                mailbox={selected.value.mailbox || props.mailbox}
+                embedded
+              />
+            </>
+          ) : (
+            <HkEmptyState
+              boxed
+              title={t("mail.pickOne")}
+              description={t("mail.pickOneHint")}
+            />
+          )}
+        </div>
+        </div>
         {/* The roster rows' shared ⋯ menu: one instance per view, anchored
          *  at the pressed trigger (the family useRowMenu shape). */}
         <HkMenu

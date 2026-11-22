@@ -95,11 +95,14 @@ pub async fn dispatch(
         "session.login" => wrap(login(app, sessions, ctx, &params)),
         "session.adminLogin" => wrap(admin_login(app, sessions, ctx, &params)),
         "session.whoami" => match session_of(sessions, ctx, &params) {
-            Ok(session) => RpcOutcome::Result(json!({
-                "address": session.address.as_str(),
-                "display_name": session.display_name,
-                "admin": session.admin,
-            })),
+            Ok(session) => {
+                let admin = sessions.is_admin(app.store.as_ref(), &session);
+                RpcOutcome::Result(json!({
+                    "address": session.address.as_str(),
+                    "display_name": session.display_name,
+                    "admin": admin,
+                }))
+            }
             Err(e) => RpcOutcome::App(e),
         },
         "session.logout" => {
@@ -124,47 +127,51 @@ pub async fn dispatch(
         "mail.templates.delete" => {
             mail_route(app, sessions, ctx, &params, mail_templates_delete).await
         }
-        "admin.state.get" => match require_admin(sessions, ctx, &params) {
+        "admin.state.get" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => RpcOutcome::Result(load_state(app)),
             Err(e) => RpcOutcome::App(e),
         },
-        "admin.state.put" => match require_admin(sessions, ctx, &params) {
+        "admin.state.put" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(put_state(app, &params).await),
             Err(e) => RpcOutcome::App(e),
         },
-        "dns.check" => match require_admin(sessions, ctx, &params) {
+        "dns.check" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(dns_check(app, &params).await),
             Err(e) => RpcOutcome::App(e),
         },
-        "admin.apply" => match require_admin(sessions, ctx, &params) {
+        "admin.apply" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(do_apply(app).await),
             Err(e) => RpcOutcome::App(e),
         },
-        "admin.net.cert" => match require_admin(sessions, ctx, &params) {
+        "admin.net.cert" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(net_cert(app).await),
             Err(e) => RpcOutcome::App(e),
         },
-        "admin.net.traffic" => match require_admin(sessions, ctx, &params) {
+        "admin.net.traffic" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(net_traffic(app, params.clone()).await),
             Err(e) => RpcOutcome::App(e),
         },
-        "admin.audit.run" => match require_admin(sessions, ctx, &params) {
+        "admin.audit.run" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(audit_run(app, sessions, ctx, params.clone()).await),
             Err(e) => RpcOutcome::App(e),
         },
-        "admin.mcp.get" => match require_admin(sessions, ctx, &params) {
+        "admin.mcp.get" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(mcp_get(app)),
             Err(e) => RpcOutcome::App(e),
         },
-        "admin.mcp.put" => match require_admin(sessions, ctx, &params) {
+        "admin.mcp.put" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(mcp_put(app, params.clone())),
             Err(e) => RpcOutcome::App(e),
         },
-        "admin.policy.get" => match require_admin(sessions, ctx, &params) {
+        "admin.accounts.setAdmin" => match require_admin(app, sessions, ctx, &params) {
+            Ok(()) => wrap_result(set_account_admin(app, &params)),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "admin.policy.get" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(policy_get(app)),
             Err(e) => RpcOutcome::App(e),
         },
-        "admin.policy.put" => match require_admin(sessions, ctx, &params) {
+        "admin.policy.put" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(policy_put(app, params.clone())),
             Err(e) => RpcOutcome::App(e),
         },
@@ -272,14 +279,18 @@ fn session_of(
 }
 
 fn require_admin(
+    app: &AppState,
     sessions: &SessionStore,
     ctx: &mut WsContext,
     params: &Value,
 ) -> Result<(), AppError> {
-    if session_of(sessions, ctx, params)?.admin {
+    let session = session_of(sessions, ctx, params)?;
+    // Live account lookup: an admin grant (or its withdrawal) applies to
+    // sessions already open.
+    if sessions.is_admin(app.store.as_ref(), &session) {
         Ok(())
     } else {
-        Err(AppError::new("Admin.Forbidden", "admin session required"))
+        Err(AppError::new("Admin.Forbidden", "admin account required"))
     }
 }
 
@@ -775,6 +786,41 @@ async fn mail_templates_delete(
         .delete_template(session.address.as_str(), &id)
         .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
     Ok(json!({ "ok": true }))
+}
+
+/// Flip one account's administrator grant WITHOUT touching its password
+/// (the whole-state PUT would demand every password; a role change is not
+/// a credential change).
+fn set_account_admin(app: &AppState, params: &Value) -> Result<Value, AppError> {
+    let address = required(params, "address")?;
+    let address = ayane_proto::Address::parse(&address)
+        .map_err(|e| AppError::new("Admin.MalformedState", e.to_string()))?;
+    let admin = params.get("admin").and_then(Value::as_bool) == Some(true);
+    let mut stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    let mut found = false;
+    for account in &mut stored.desired.accounts {
+        if account.address == address {
+            account.admin = admin;
+            found = true;
+        }
+    }
+    if !found {
+        return Err(AppError::new(
+            "Admin.MalformedState",
+            "no such account",
+        ));
+    }
+    stored
+        .desired
+        .validate()
+        .map_err(|e| AppError::new("Admin.StateRejected", e.to_string()))?;
+    app.store
+        .save(&stored)
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    Ok(json!({ "saved": true, "address": address.as_str(), "admin": admin }))
 }
 
 // ── network surface ───────────────────────────────────────────────────────

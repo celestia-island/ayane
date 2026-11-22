@@ -286,9 +286,6 @@ async function saveDraft(): Promise<void> {
             <Paperclip :size="14" /> {{ t("compose.attachments") }}
           </HkButton>
         </label>
-        <HkButton variant="ghost" type="button" @click="router.push('/inbox')">
-          {{ t("compose.cancel") }}
-        </HkButton>
       </div>
     </HkSectionCard>
 
@@ -321,9 +318,15 @@ async function saveDraft(): Promise<void> {
 </template>
 
 <style scoped>
-.compose { max-width: 760px; margin: 0 auto; }
-.compose-fields { display: flex; flex-direction: column; gap: 12px; }
-.compose-editor { display: flex; flex-direction: column; gap: 4px; }
+.compose { width: 100%; display: flex; flex-direction: column; }
+/* The composer owns the page: a shipped sheet fills the viewport rather
+   than floating as a centred card with dead space under it. */
+.compose :deep(.hk-section-card),
+.compose :deep(.hk-card) { flex: 1; display: flex; flex-direction: column; }
+.compose :deep(.hk-card-body), .compose :deep(.hk-section-card-body) { flex: 1; display: flex; flex-direction: column; }
+.compose-fields { display: flex; flex-direction: column; gap: 10px; flex: 1; }
+.compose-editor { display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; }
+.compose-editor :deep(.hk-md-editor) { flex: 1; min-height: 18rem; }
 .compose-editor-label { font-size: 0.8125rem; opacity: 0.85; }
 .compose-attachments { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
 .compose-attachment {
@@ -333,7 +336,7 @@ async function saveDraft(): Promise<void> {
 }
 .compose-attachment-x { border: 0; background: none; cursor: pointer; display: inline-flex; padding: 0; color: inherit; opacity: 0.6; }
 .compose-attachment-x:hover { opacity: 1; }
-.compose-actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+.compose-actions { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
 .compose-attach input { display: none; }
 .compose-tpl-form { display: flex; flex-direction: column; gap: 12px; }
 .compose-tpl-actions { display: flex; justify-content: flex-end; }
