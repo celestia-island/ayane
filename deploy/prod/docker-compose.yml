@@ -49,6 +49,8 @@ services:
       - "25:25"
       - "587:587"
       - "465:465"
+      # Internal submission for the control plane (loopback only).
+      - "127.0.0.1:10587:10587"
     volumes:
       - ../../state/config/postfix:/etc/postfix/maps:ro
       - ./postfix/main.cf:/run/ayane/main.cf:ro

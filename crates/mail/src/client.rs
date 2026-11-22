@@ -9,8 +9,6 @@ use std::net::SocketAddr;
 
 use futures_util::StreamExt;
 use lettre::message::Message;
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
 /// Why a client operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -57,15 +55,21 @@ impl Submission {
         password: &str,
         message: Message,
     ) -> Result<(), ClientError> {
-        let mailer = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.host)
-            .port(self.port)
-            .credentials(Credentials::new(username.to_owned(), password.to_owned()))
-            .build();
-        mailer
-            .send(message)
-            .await
-            .map(|_| ())
-            .map_err(|e| ClientError::Smtp(e.to_string()))
+        let raw = crate::compose::render(&message);
+        let envelope = message.envelope().clone();
+        let from = envelope.from().map(|a| a.to_string()).unwrap_or_default();
+        let recipients: Vec<String> = envelope.to().iter().map(|a| a.to_string()).collect();
+        let rcpt_refs: Vec<&str> = recipients.iter().map(String::as_str).collect();
+        crate::smtp::submit_plain(
+            &format!("{}:{}", self.host, self.port),
+            username,
+            password,
+            &from,
+            &rcpt_refs,
+            &raw,
+        )
+        .await
+        .map_err(|e| ClientError::Smtp(e.to_string()))
     }
 }
 
@@ -78,14 +82,21 @@ impl Submission {
     /// Returns [`ClientError`] when the connection or DATA phase fails —
     /// including policy rejections, which surface as SMTP error strings.
     pub async fn send_unauthenticated(&self, message: Message) -> Result<(), ClientError> {
-        let mailer = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.host)
-            .port(self.port)
-            .build();
-        mailer
-            .send(message)
-            .await
-            .map(|_| ())
-            .map_err(|e| ClientError::Smtp(e.to_string()))
+        let raw = crate::compose::render(&message);
+        let envelope = message.envelope().clone();
+        let from = envelope.from().map(|a| a.to_string()).unwrap_or_default();
+        let recipients: Vec<String> = envelope.to().iter().map(|a| a.to_string()).collect();
+        let rcpt_refs: Vec<&str> = recipients.iter().map(String::as_str).collect();
+        crate::smtp::submit_plain(
+            &format!("{}:{}", self.host, self.port),
+            "",
+            "",
+            &from,
+            &rcpt_refs,
+            &raw,
+        )
+        .await
+        .map_err(|e| ClientError::Smtp(e.to_string()))
     }
 }
 
@@ -355,21 +366,31 @@ impl Imap {
         mailbox: &str,
         content: &[u8],
     ) -> Result<(), ClientError> {
-        let tcp = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .map_err(|e| ClientError::Connect(e.to_string()))?;
-        let client = async_imap::Client::new(tcp);
-        let mut session = client
-            .login(username, password)
-            .await
-            .map_err(|(e, _): (async_imap::error::Error, _)| ClientError::Imap(e.to_string()))?;
+        // async-imap's APPEND deadlocks when the server rejects before the
+        // literal continuation (Dovecot's "NO [TRYCREATE]"): a timeout keeps
+        // any library misbehaviour from hanging a webmail request forever.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let tcp = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
+                .await
+                .map_err(|e| ClientError::Connect(e.to_string()))?;
+            let client = async_imap::Client::new(tcp);
+            let mut session = client.login(username, password).await.map_err(
+                |(e, _): (async_imap::error::Error, _)| ClientError::Imap(e.to_string()),
+            )?;
 
-        let result = session
-            .append(mailbox, Some("\\Seen"), None, content)
-            .await
-            .map_err(|e| ClientError::Imap(e.to_string()));
-        let _ = session.logout().await;
-        result
+            // Autocreate the target mailbox: appending to a missing folder
+            // is the deadlock trigger above, and a mail service should keep
+            // Sent alive anyway.
+            let _ = session.create(mailbox).await;
+            let result = session
+                .append(mailbox, Some("\\Seen"), None, content)
+                .await
+                .map_err(|e| ClientError::Imap(e.to_string()));
+            let _ = session.logout().await;
+            result
+        })
+        .await
+        .map_err(|_| ClientError::Imap("append timed out after 10s".to_owned()))?
     }
 }
 

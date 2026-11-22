@@ -204,6 +204,7 @@ dependencies = [
  "ammonia",
  "async-imap",
  "ayane-proto",
+ "base64 0.22.1",
  "futures-util",
  "lettre",
  "mail-parser",

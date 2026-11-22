@@ -12,6 +12,7 @@ pub mod client;
 pub mod compose;
 pub mod mime;
 pub mod phishing;
+pub mod smtp;
 
 /// Where a message for `recipient` should go.
 #[derive(Debug, Clone, PartialEq, Eq)]

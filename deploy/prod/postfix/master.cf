@@ -11,6 +11,14 @@ submission inet n       -       n       -       -       smtpd
   -o smtpd_tls_auth_only=yes
   -o smtpd_sasl_auth_enable=yes
   -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+# Internal plaintext submission for the control plane (webmail send leg).
+# Loopback-only publication in compose; human clients use 587/465 with TLS.
+10587     inet  n       -       n       -       -       smtpd
+  -o syslog_name=postfix/internal
+  -o smtpd_tls_security_level=none
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_tls_auth_only=no
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
 smtps     inet  n       -       n       -       -       smtpd
   -o syslog_name=postfix/smtps
   -o smtpd_tls_wrappermode=yes
