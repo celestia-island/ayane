@@ -2,11 +2,10 @@ import { computed, defineComponent, onMounted, ref, watch, type VNode } from "vu
 
 import {
   HkAdminTablePage,
-  HkButton,
   HkCard,
   HkConfirmDialog,
   HkDateTag,
-  HkEmptyState,
+  HkMasterDetail,
   HkMenu,
   HTable,
   useConfirm,
@@ -279,8 +278,17 @@ export default defineComponent({
 
     return () => (
       <>
-        <div class="ay-inbox-split">
-        <div class="ay-inbox-roster">
+        <HkMasterDetail
+          detailOpen={selected.value !== null}
+          detailTitle={selected.value?.subject || t("mail.noSubject")}
+          emptyTitle={t("mail.pickOne")}
+          emptyDescription={t("mail.pickOneHint")}
+          closeLabel={t("mail.closeDetail")}
+          onClose={closeDetail}
+        >
+        {{
+          list: () => (
+            <>
         <HkAdminTablePage
           title={folderTitle.value}
           rows={rows.value}
@@ -336,30 +344,18 @@ export default defineComponent({
             ),
           }}
         </HkAdminTablePage>
-        </div>
-        <div class="ay-inbox-detail">
-          {selected.value ? (
-            <>
-              <div class="ay-inbox-detail-head">
-                <HkButton variant="ghost" size="sm" onClick={closeDetail}>
-                  {t("mail.closeDetail")}
-                </HkButton>
-              </div>
+            </>
+          ),
+          detail: () =>
+            selected.value ? (
               <ReadView
                 uid={selected.value.uid}
                 mailbox={selected.value.mailbox || props.mailbox}
                 embedded
               />
-            </>
-          ) : (
-            <HkEmptyState
-              boxed
-              title={t("mail.pickOne")}
-              description={t("mail.pickOneHint")}
-            />
-          )}
-        </div>
-        </div>
+            ) : null,
+        }}
+        </HkMasterDetail>
         {/* The roster rows' shared ⋯ menu: one instance per view, anchored
          *  at the pressed trigger (the family useRowMenu shape). */}
         <HkMenu

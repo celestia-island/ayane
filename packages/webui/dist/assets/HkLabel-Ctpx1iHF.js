@@ -1,1 +1,0 @@
-import{C as e,x as t}from"./context-5NTpcy5t.js";var n=e({name:`HkLabel`,props:{text:{type:String,default:void 0},size:{type:String,default:`md`}},setup(e,{slots:n}){return()=>{let r=!!e.text,i=!!n.default;return!r&&!i?null:t(`span`,{class:[`hk-label`,`hk-label-${e.size}`]},[i?n.default():e.text])}}});export{n as t};
