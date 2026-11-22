@@ -12,6 +12,7 @@
 pub mod api;
 pub mod apply;
 pub mod config;
+pub mod dns;
 pub mod driver;
 pub mod rpc;
 pub mod session;

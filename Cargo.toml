@@ -42,6 +42,7 @@ lettre = { version = "^0.11", default-features = false, features = ["builder", "
 # message parsing + safe html + hashing + dns
 mail-parser = "^1"
 ammonia = "^4"
+hickory-resolver = { version = "^0.26", features = ["tokio", "system-config"] }
 sha2 = "^0.10"
 async-imap = { version = "^0.12", default-features = false, features = ["runtime-tokio"] }
 

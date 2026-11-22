@@ -121,6 +121,10 @@ pub async fn dispatch(
             Ok(()) => wrap_result(put_state(app, &params).await),
             Err(e) => RpcOutcome::App(e),
         },
+        "dns.check" => match require_admin(sessions, ctx, &params) {
+            Ok(()) => wrap_result(dns_check(app, &params).await),
+            Err(e) => RpcOutcome::App(e),
+        },
         "admin.apply" => match require_admin(sessions, ctx, &params) {
             Ok(()) => wrap_result(do_apply(app).await),
             Err(e) => RpcOutcome::App(e),
@@ -429,4 +433,32 @@ async fn do_apply(app: &AppState) -> Result<Value, AppError> {
         .await
         .map_err(|e| AppError::new("Admin.ApplyFailed", e.to_string()))?;
     serde_json::to_value(report).map_err(|e| AppError::new("Admin.ApplyFailed", e.to_string()))
+}
+
+/// `dns.check {domain?}` — live DNS wizard for one hosted domain (or the
+/// first one when omitted).
+async fn dns_check(app: &AppState, params: &Value) -> Result<Value, AppError> {
+    let stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    let domain = params
+        .get("domain")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| stored.desired.domains.first().map(|d| d.name.clone()))
+        .ok_or_else(|| AppError::new("Dns.NoDomain", "no hosted domain to check"))?;
+    let mail_host = format!("mail.{domain}");
+    let selector = "ayane";
+    let snapshot = crate::dns::snapshot(&domain, &mail_host, selector)
+        .await
+        .map_err(|e| AppError::new("Dns.ResolverFailed", e))?;
+    let checks = crate::dns::verdicts(&snapshot, &domain, &mail_host, selector);
+    serde_json::to_value(serde_json::json!({
+        "domain": domain,
+        "mail_host": mail_host,
+        "selector": selector,
+        "checks": checks,
+    }))
+    .map_err(|e| AppError::new("Dns.ResolverFailed", e.to_string()))
 }
