@@ -1131,18 +1131,22 @@ fn load_state(app: &AppState) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// The placeholder a state read writes where a secret lived. Not a
+/// credential — the marker a write-back recognises to keep the stored one.
+pub const REDACTED_SENTINEL: &str = "__redacted__";
+
 /// Strip the state's embedded secrets before any read leaves the process:
 /// the MCP token (revealed only once, at rotation) and the arona bearer
 /// token never ride an API reply. Absent-slice round-trip keeps PUTs safe.
 fn redact_state(mut value: Value) -> Value {
     if let Some(Value::String(token)) = value.pointer_mut("/mcp/token") {
         if !token.is_empty() {
-            *token = "__redacted__".to_owned();
+            *token = REDACTED_SENTINEL.to_owned();
         }
     }
     if let Some(Value::String(token)) = value.pointer_mut("/audit/ai/api_token") {
         if !token.is_empty() {
-            *token = "__redacted__".to_owned();
+            *token = REDACTED_SENTINEL.to_owned();
         }
     }
     value

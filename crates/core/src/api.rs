@@ -146,10 +146,10 @@ async fn get_state(State(app): State<AppState>) -> Result<Json<DesiredState>, Ap
     // never leave the process on a state read.
     let mut redacted = stored.desired.clone();
     if !redacted.mcp.token.is_empty() {
-        redacted.mcp.token = "__redacted__".to_owned();
+        redacted.mcp.token = crate::rpc::REDACTED_SENTINEL.to_owned();
     }
     if !redacted.audit.ai.api_token.is_empty() {
-        redacted.audit.ai.api_token = "__redacted__".to_owned();
+        redacted.audit.ai.api_token = crate::rpc::REDACTED_SENTINEL.to_owned();
     }
     Ok(Json(redacted))
 }
@@ -197,10 +197,10 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
     let mut mcp = body.mcp.unwrap_or(keep.mcp);
     // A read state carries the __redacted__ sentinel where secrets lived;
     // writing it back must keep the stored secret, not store the sentinel.
-    if audit.ai.api_token == "__redacted__" {
+    if audit.ai.api_token == crate::rpc::REDACTED_SENTINEL {
         audit.ai.api_token = keep_audit_token;
     }
-    if mcp.token == "__redacted__" {
+    if mcp.token == crate::rpc::REDACTED_SENTINEL {
         mcp.token = keep_mcp_token;
     }
     let mut desired = DesiredState {
