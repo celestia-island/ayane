@@ -5,6 +5,7 @@ import {
   HkButton,
   HkCard,
   HkConfirmDialog,
+  HkDateTag,
   HkEmptyState,
   HkMenu,
   HTable,
@@ -17,7 +18,7 @@ import ReadView from "./ReadView.vue";
 
 import { rpc } from "../lib/rpc";
 import { inboxUnread } from "../lib/mailbox";
-import { locale, t } from "../lib/i18n";
+import { t } from "../lib/i18n";
 import { toastError } from "../lib/toast";
 
 /** The exact IMAP names the route may carry (?box=…). */
@@ -59,23 +60,12 @@ function laneOf(row: EnvelopeRow): LaneKey {
   return "earlier";
 }
 
-/** Short date column: time on today's messages, date otherwise (the year
- *  only when it differs from the current one). */
-function formatDate(value: string | null): string {
-  if (!value) return "—";
+/** Today's messages carry the locale time beside the date (the family
+ *  date tag's `time` flag) — older rows keep the calendar segments only. */
+function isToday(value: string | null): boolean {
+  if (!value) return false;
   const at = new Date(value);
-  if (Number.isNaN(at.getTime())) return "—";
-  const now = new Date();
-  const sameYear = at.getFullYear() === now.getFullYear();
-  const sameDay = at.toDateString() === now.toDateString();
-  const localeTag = locale();
-  if (sameDay) {
-    return new Intl.DateTimeFormat(localeTag, { hour: "2-digit", minute: "2-digit" }).format(at);
-  }
-  return new Intl.DateTimeFormat(
-    localeTag,
-    sameYear ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" },
-  ).format(at);
+  return !Number.isNaN(at.getTime()) && at.toDateString() === new Date().toDateString();
 }
 
 /** The standard mail roster: HkAdminTablePage (page header + count readout
@@ -172,8 +162,7 @@ export default defineComponent({
     const columns = computed(() => [
       { key: "from", title: t("mail.col.from") },
       { key: "subject", title: t("mail.col.subject") },
-      { key: "date", title: t("mail.col.date"), width: "170px", align: "right" as const, copyable: false },
-      { key: "size", title: t("mail.col.size"), width: "76px", align: "right" as const, copyable: false },
+      { key: "date", title: t("mail.col.date"), width: "9.5rem", align: "right" as const, copyable: false },
     ]);
 
     /** Every data cell's content carries the enter click — the whole row
@@ -331,9 +320,16 @@ export default defineComponent({
                           {row.subject || t("mail.noSubject")}
                         </span>
                       )),
-                    "cell-date": ({ row }: { row: EnvelopeRow }) => enterWrap(row, formatDate(row.date)),
-                    "cell-size": ({ row }: { row: EnvelopeRow }) =>
-                      enterWrap(row, `${Math.max(1, Math.round(row.size / 1024))}K`),
+                    "cell-date": ({ row }: { row: EnvelopeRow }) =>
+                      enterWrap(
+                        row,
+                        <span class="ay-mail-date">
+                          <HkDateTag
+                            value={row.date ?? ""}
+                            time={isToday(row.date)}
+                          />
+                        </span>,
+                      ),
                   }}
                 </HTable>
               </HkCard>

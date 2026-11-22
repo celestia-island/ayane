@@ -63,6 +63,7 @@ async function apply(): Promise<void> {
 
 <template>
   <div class="ay-net">
+    <h2 class="ay-lists-title">{{ t("net.lists.title") }}</h2>
     <p class="muted ay-lists-hint">{{ t("net.lists.hint") }}</p>
     <HkSectionCard :title="t('net.lists.deny')" :icon="ShieldAlert" :loading="loading" padded>
       <p class="muted ay-lists-note">{{ t("net.lists.denyNote") }}</p>
@@ -83,6 +84,7 @@ async function apply(): Promise<void> {
 
 <style scoped>
 .ay-net { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+.ay-lists-title { margin: 0; font-size: 1.15rem; }
 .ay-lists-hint { margin: 0; }
 .ay-lists-note { margin: 0 0 10px; font-size: 0.85rem; }
 .ay-lists-actions { display: flex; gap: 10px; align-items: center; }

@@ -131,9 +131,21 @@ export default defineComponent({
       return t(FOLDER_LABEL[(box.toLowerCase() || "inbox") as keyof typeof FOLDER_LABEL]);
     });
 
+    /** Sidebar key → IMAP mailbox name carried in ?box= (exact server
+     *  spelling: INBOX / Starred / Sent / Drafts / Trash). */
+    const MAILBOX_OF_KEY: Record<string, string> = {
+      inbox: "INBOX",
+      starred: "Starred",
+      sent: "Sent",
+      drafts: "Drafts",
+      trash: "Trash",
+    };
+
     /** Folder keys are the IMAP names the list route carries (box=…),
      *  except the two pseudo-entries (compose, admin). */
     const FOLDER_KEYS = ["inbox", "starred", "sent", "drafts", "trash"] as const;
+    /** Exact IMAP names the roster route carries. */
+    const FOLDERS = ["INBOX", "Starred", "Sent", "Drafts", "Trash"] as const;
     const FOLDER_LABEL: Record<(typeof FOLDER_KEYS)[number], string> = {
       inbox: "folder.inbox",
       starred: "folder.starred",
@@ -216,21 +228,25 @@ export default defineComponent({
       LOCALES.map((code) => ({ code, label: LOCALE_LABELS[code] })),
     );
 
+    /** The mailbox switcher lives in the header's centre zone (the chest
+     *  console's page-owned centre group): it appears exactly on the mail
+     *  roster route and drives the same ?box= the sidebar does. */
+    const mailboxOptions = computed(() =>
+      FOLDER_KEYS.map((key) => ({ value: MAILBOX_OF_KEY[key], label: t(FOLDER_LABEL[key]) })),
+    );
+    const onMailRoster = computed(
+      () => route.path === "/inbox" || route.path.startsWith("/inbox") || route.path === "/sent",
+    );
+    const currentMailbox = computed(() => {
+      const box = typeof route.query.box === "string" ? route.query.box : "INBOX";
+      return (FOLDERS as readonly string[]).includes(box) ? box : "INBOX";
+    });
+
     /** HkSelect's option model ({value,label}) — the header cascade takes
      *  the {code,label} shape, so each surface gets its own mapping. */
     const selectOptions = computed(() =>
       LOCALES.map((code) => ({ value: code, label: LOCALE_LABELS[code] })),
     );
-
-    /** Sidebar key → IMAP mailbox name carried in ?box= (exact server
-     *  spelling: INBOX / Starred / Sent / Drafts / Trash). */
-    const MAILBOX_OF_KEY: Record<string, string> = {
-      inbox: "INBOX",
-      starred: "Starred",
-      sent: "Sent",
-      drafts: "Drafts",
-      trash: "Trash",
-    };
 
     function navigate(key: string, close?: () => void): void {
       if (key.startsWith("net-")) {
@@ -371,6 +387,22 @@ export default defineComponent({
                   </HkIconButton>,
                 ]}
                 v-slots={{
+                  // The page-owned header centre zone: the mailbox
+                  // switcher sits on the true viewport centre, like the
+                  // console's filter groups do in the chest admin.
+                  center: () =>
+                    onMailRoster.value ? (
+                      <div class="ay-header-mailbox">
+                        <HkSelect
+                          modelValue={currentMailbox.value}
+                          onUpdate:modelValue={(box: string) => {
+                            router.push(box === "INBOX" ? "/inbox" : `/inbox?box=${box}`);
+                          }}
+                          options={mailboxOptions.value}
+                          panelTitle={t("mailbox.switcher")}
+                        />
+                      </div>
+                    ) : null,
                   "avatar-modal": ({
                     open,
                     onUpdateOpen,

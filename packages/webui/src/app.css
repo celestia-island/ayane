@@ -203,3 +203,12 @@ body {
   .ay-inbox-split { grid-template-columns: minmax(0, 1fr); }
   .ay-inbox-detail { position: static; max-height: none; }
 }
+
+/* The header's centre zone: the mailbox switcher sits on the viewport
+   centre and stays compact (a quiet field, not a form block). */
+.ay-header-mailbox { width: min(22rem, 42vw); }
+.ay-header-mailbox .hk-select-trigger {
+  min-height: var(--space-32, 2rem);
+  padding-block: var(--space-4, 0.25rem);
+  font-size: 0.875rem;
+}
