@@ -18,8 +18,6 @@ const CATALOG = [
   { name: "state.get", desc: "Read the desired mail state" },
   { name: "state.put", desc: "Replace the desired state" },
   { name: "apply", desc: "Render and reload the engine" },
-  { name: "mail.list", desc: "List a mailbox" },
-  { name: "mail.read", desc: "Read one message" },
   { name: "dns.check", desc: "Run the DNS wizard" },
 ] as const;
 

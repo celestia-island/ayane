@@ -139,7 +139,9 @@ pub fn traffic_from_lines(lines: &[String]) -> TrafficReport {
                     .unwrap_or("")
                     .trim()
                     .to_owned();
-                if relay.is_empty() {
+                // `relay=none` (local delivery) and `relay=local` are not
+                // remote peers — they would forge aggregate rows.
+                if relay.is_empty() || relay == "none" || relay == "local" {
                     continue;
                 }
                 let status = if line.contains("status=sent") {

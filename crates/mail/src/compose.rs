@@ -184,14 +184,43 @@ pub fn build_composed_message(
     markdown: &str,
     attachments: &[OutgoingAttachment],
 ) -> Result<Message, ComposeError> {
+    build_composed_message_mode(from, from_name, to, subject, markdown, attachments, true)
+}
+
+/// [`build_composed_message`] with an explicit plain/markdown mode: a plain
+/// body keeps its HTML part a faithful escaped render of the typed text.
+///
+/// # Errors
+///
+/// Returns [`ComposeError`] on the same conditions as the mode-less twin.
+pub fn build_composed_message_mode(
+    from: &Address,
+    from_name: &str,
+    to: &Address,
+    subject: &str,
+    body: &str,
+    attachments: &[OutgoingAttachment],
+    markdown: bool,
+) -> Result<Message, ComposeError> {
     reject_newlines("from display name", from_name)?;
     reject_newlines("subject", subject)?;
 
     let from = Mailbox::new(Some(from_name.to_owned()), lettre_address(from)?);
     let to = Mailbox::new(None, lettre_address(to)?);
 
-    let alternative =
-        MultiPart::alternative_plain_html(markdown.to_owned(), markdown_to_html(markdown));
+    let alternative = if markdown {
+        MultiPart::alternative_plain_html(body.to_owned(), markdown_to_html(body))
+    } else {
+        // Escaped paragraph render: what the user typed is exactly what
+        // an HTML reader sees.
+        let html = format!(
+            "<p>{}</p>",
+            ammonia::clean_text(body)
+                .replace("\r\n", "<br/>")
+                .replace('\n', "<br/>")
+        );
+        MultiPart::alternative_plain_html(body.to_owned(), html)
+    };
     // Attachments wrap the alternative in multipart/mixed; each one is a
     // singlepart built through the Attachment helper.
     let body = if attachments.is_empty() {

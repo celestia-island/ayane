@@ -119,6 +119,18 @@ impl Address {
     }
 }
 
+/// Validate a standalone domain name (policy rules, hosted domains).
+///
+/// # Errors
+///
+/// Returns [`AddressError::MalformedDomain`] on empty/oversized/mislabelled
+/// input and [`AddressError::IllegalCharacter`] on anything outside ASCII
+/// alphanumerics, hyphens and dots — the exact character set the postfix
+/// access-map renderer interpolates, so a rule can never inject a line.
+pub fn check_domain(domain: &str) -> Result<(), AddressError> {
+    validate_domain(domain)
+}
+
 fn validate_domain(domain: &str) -> Result<(), AddressError> {
     if domain.len() > 253 || domain.starts_with('.') || domain.ends_with('.') {
         return Err(AddressError::MalformedDomain);
@@ -356,6 +368,23 @@ impl DesiredState {
     /// unusable catch-all / shared mailbox.
     pub fn validate(&self) -> Result<(), StateError> {
         let mut seen = std::collections::HashSet::new();
+        // Policy rule domains reach the postfix access-map renderer raw;
+        // validate() is the REST path's only guard, so it enforces the
+        // same DNS character law the ws policy editor does.
+        for rule in self
+            .policy
+            .allowlist
+            .iter()
+            .chain(self.policy.denylist.iter())
+        {
+            if let SenderRule::Domain(domain) = rule {
+                if let Err(error) = check_domain(domain) {
+                    return Err(StateError::DuplicateAddress(format!(
+                        "policy domain rule rejected: {error}"
+                    )));
+                }
+            }
+        }
         for domain in &self.domains {
             if !seen.insert(format!("@{}", domain.name)) {
                 return Err(StateError::DuplicateAddress(domain.name.clone()));

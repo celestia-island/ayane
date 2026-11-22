@@ -118,7 +118,10 @@ function removeAttachment(index: number): void {
  *  reference marker lands at the cursor so the reader sees the image. */
 function onEditorImage(file: File): void {
   addFiles([file]);
-  body.value = `${body.value}\n\n![${file.name}](attachment:${encodeURIComponent(file.name)})`;
+  // Parentheses/brackets would terminate the markdown link early — the
+  // marker uses a slug-safe stand-in while the attachment keeps the name.
+  const safeName = file.name.replace(/[()\[\]]/g, "_");
+  body.value = `${body.value}\n\n![${safeName}](attachment:${encodeURIComponent(file.name)})`;
 }
 
 function applyTemplate(id: string): void {
@@ -273,6 +276,9 @@ async function saveDraft(): Promise<void> {
           @click="templateMenuOpen = !templateMenuOpen"
         >
           <Files :size="14" /> {{ t("compose.templates") }}
+        </HkButton>
+        <HkButton variant="ghost" @click="saveTemplateOpen = true">
+          {{ t("compose.saveAsTemplate") }}
         </HkButton>
         <label class="compose-attach">
           <input type="file" multiple @change="onAttachPick" />

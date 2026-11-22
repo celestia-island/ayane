@@ -403,6 +403,7 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
     // real limits).
     use base64::Engine as _;
     let mut attachments = Vec::new();
+    let mut total_attachment_bytes = 0usize;
     if let Some(list) = params.get("attachments").and_then(Value::as_array) {
         for item in list {
             let filename = item
@@ -428,6 +429,13 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
                 return Err(AppError::new(
                     "Mail.MalformedParams",
                     "attachment exceeds 10 MiB",
+                ));
+            }
+            total_attachment_bytes += bytes.len();
+            if total_attachment_bytes > 25 * 1024 * 1024 {
+                return Err(AppError::new(
+                    "Mail.MalformedParams",
+                    "attachments exceed 25 MiB in total",
                 ));
             }
             attachments.push(ayane_mail::compose::OutgoingAttachment {
@@ -840,6 +848,12 @@ fn policy_put(app: &AppState, params: Value) -> Result<Value, AppError> {
                 continue;
             }
             if let Some(domain) = text.strip_prefix('@') {
+                // The renderer interpolates the domain into a postfix
+                // access map — anything but DNS characters would be a
+                // line injection.
+                ayane_proto::check_domain(domain).map_err(|e| {
+                    AppError::new("Admin.MalformedState", format!("invalid domain rule: {e}"))
+                })?;
                 rules.push(ayane_proto::SenderRule::Domain(domain.to_ascii_lowercase()));
             } else {
                 let address = ayane_proto::Address::parse(text).map_err(|e| {
@@ -879,6 +893,9 @@ struct AuditHit {
     /// The keyword that matched (keyword leg).
     #[serde(skip_serializing_if = "Option::is_none")]
     keyword: Option<String>,
+    /// Truncated body text for the AI leg (never serialized to clients).
+    #[serde(skip_serializing)]
+    snippet: String,
     /// The AI verdict (arona leg): the model's one-line reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     ai_verdict: Option<String>,
@@ -963,6 +980,13 @@ async fn audit_run(
                 subject: parsed.subject.clone(),
                 from: parsed.from.clone(),
                 keyword: Some(keyword.clone()),
+                snippet: parsed
+                    .text
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(800)
+                    .collect(),
                 ai_verdict: None,
             });
         }
@@ -978,7 +1002,7 @@ async fn audit_run(
             let prompt = format!(
                 "You are a mail security auditor. Decide whether the following message is suspicious (phishing, fraud, malware lure, policy violation) or benign. Reply with EXACTLY one line: SUSPICIOUS: <reason> or BENIGN: <reason>.\n\nSubject: {}\nBody snippet: {}",
                 hit.subject.as_deref().unwrap_or(""),
-                hit.keyword.as_deref().unwrap_or(""),
+                hit.snippet,
             );
             let reply = client
                 .post(format!(
@@ -1103,8 +1127,25 @@ async fn mail_mark_seen(app: AppState, session: Session, params: Value) -> Resul
 fn load_state(app: &AppState) -> Value {
     app.store
         .load()
-        .map(|stored| serde_json::to_value(stored.desired).unwrap_or(Value::Null))
+        .map(|stored| redact_state(serde_json::to_value(stored.desired).unwrap_or(Value::Null)))
         .unwrap_or(Value::Null)
+}
+
+/// Strip the state's embedded secrets before any read leaves the process:
+/// the MCP token (revealed only once, at rotation) and the arona bearer
+/// token never ride an API reply. Absent-slice round-trip keeps PUTs safe.
+fn redact_state(mut value: Value) -> Value {
+    if let Some(Value::String(token)) = value.pointer_mut("/mcp/token") {
+        if !token.is_empty() {
+            *token = "__redacted__".to_owned();
+        }
+    }
+    if let Some(Value::String(token)) = value.pointer_mut("/audit/ai/api_token") {
+        if !token.is_empty() {
+            *token = "__redacted__".to_owned();
+        }
+    }
+    value
 }
 
 async fn put_state(app: &AppState, params: &Value) -> Result<Value, AppError> {

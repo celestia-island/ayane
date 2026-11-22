@@ -124,6 +124,10 @@ const TEMPLATES_KEY: &str = "templates";
 /// redb-backed [`StateStore`] through the lacrymira KV surface.
 pub struct RedbStateStore {
     inner: RedbStore,
+    /// The templates key is read-modify-write; this lock makes concurrent
+    /// owner saves atomic against each other (last-write-drops-the-other
+    /// was a real race with two owners saving at once).
+    templates_lock: std::sync::Mutex<()>,
 }
 
 impl RedbStateStore {
@@ -139,6 +143,7 @@ impl RedbStateStore {
         }
         Ok(Self {
             inner: RedbStore::open(path).map_err(|e| StoreError::Backend(e.to_string()))?,
+            templates_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -244,6 +249,17 @@ impl StateStore for RedbStateStore {
     }
 
     fn save_template(&self, template: &Template) -> Result<(), StoreError> {
+        // The whole list rides one KV key: cap the payload so a single
+        // template cannot grow the snapshot unboundedly.
+        if template.name.len() > 200
+            || template.subject.len() > 998
+            || template.body.len() > 64 * 1024
+        {
+            return Err(StoreError::Backend(
+                "template exceeds size limits".to_owned(),
+            ));
+        }
+        let _guard = self.templates_lock.lock().expect("templates mutex");
         let mut templates = self.load_templates()?;
         // An id is single-owner: replacing another account's template would
         // leak its body across accounts.
@@ -265,6 +281,7 @@ impl StateStore for RedbStateStore {
     }
 
     fn delete_template(&self, owner: &str, id: &str) -> Result<(), StoreError> {
+        let _guard = self.templates_lock.lock().expect("templates mutex");
         let mut templates = self.load_templates()?;
         let before = templates.len();
         templates.retain(|template| !(template.id == id && template.owner == owner));

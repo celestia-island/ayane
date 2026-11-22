@@ -276,7 +276,25 @@ pub async fn mcp_handler(
             }
             (native, args)
         }
-        other => (other, params),
+        // Raw native method names are the S0 hole: the MCP-token caller
+        // holds a full admin session, so anything not explicitly enabled
+        // MUST be refused here — the dispatch table has no idea which
+        // credential the request arrived on.
+        other => {
+            if let Some(enabled) = &tool_gate {
+                let exposed = enabled
+                    .iter()
+                    .any(|candidate| mcp_native_name(candidate) == other);
+                if !exposed {
+                    return Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32601, "message": format!("tool not enabled: {other}") }
+                    }))
+                    .into_response();
+                }
+            }
+            (other, params)
+        }
     };
 
     let outcome = rpc::dispatch(&surface.app, &surface.sessions, &mut ctx, method, params).await;
@@ -315,8 +333,6 @@ pub fn mcp_tools() -> Value {
         { "name": "state.get", "description": "Read the current desired mail state (domains, accounts, aliases, policy)." },
         { "name": "state.put", "description": "Replace the desired state (same schema as state.get plus account passwords)." },
         { "name": "apply", "description": "Render the desired state into engine configuration and reload the daemons." },
-        { "name": "mail.list", "description": "List a mailbox (the admin context's own INBOX by default)." },
-        { "name": "mail.read", "description": "Read one message (sanitised body, attachment hashes, phishing verdicts)." },
         { "name": "dns.check", "description": "Run the DNS wizard (MX/SPF/DKIM/DMARC/PTR) against the hosted domains." },
     ])
 }

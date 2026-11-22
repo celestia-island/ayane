@@ -121,11 +121,11 @@ export default defineComponent({
     const pageTitle = computed(() => {
       if (route.path.startsWith("/compose")) return t("compose.button");
       if (route.path.startsWith("/read")) return t("folder.inbox");
-      if (route.path.startsWith("/net/cert")) return t("sidebar.net.cert");
-      if (route.path.startsWith("/net/traffic")) return t("sidebar.net.traffic");
-      if (route.path.startsWith("/net/lists")) return t("sidebar.net.lists");
-      if (route.path.startsWith("/net/audit")) return t("sidebar.net.audit");
-      if (route.path.startsWith("/net/mcp")) return t("sidebar.net.mcp");
+      if (route.path.startsWith("/net-cert")) return t("sidebar.net.cert");
+      if (route.path.startsWith("/net-traffic")) return t("sidebar.net.traffic");
+      if (route.path.startsWith("/net-lists")) return t("sidebar.net.lists");
+      if (route.path.startsWith("/net-audit")) return t("sidebar.net.audit");
+      if (route.path.startsWith("/net-mcp")) return t("sidebar.net.mcp");
       if (route.path.startsWith("/admin")) return t("nav.admin");
       const box = typeof route.query.box === "string" ? route.query.box : "";
       return t(FOLDER_LABEL[(box.toLowerCase() || "inbox") as keyof typeof FOLDER_LABEL]);
@@ -164,17 +164,23 @@ export default defineComponent({
         label: t("sidebar.group.mail"),
         items: navItems.value.filter((item) => FOLDER_KEYS.includes(item.key as never)),
       },
-      {
-        id: "net",
-        label: t("sidebar.group.net"),
-        items: [
+      // The network surfaces are admin-only RPCs — the group stays
+      // hidden from plain mailbox sessions.
+      ...(admin.value
+        ? [
+            {
+              id: "net",
+              label: t("sidebar.group.net"),
+              items: [
           { key: "net-cert", label: t("sidebar.net.cert"), icon: Globe },
           { key: "net-traffic", label: t("sidebar.net.traffic"), icon: Send },
           { key: "net-lists", label: t("sidebar.net.lists"), icon: ShieldAlert },
           { key: "net-audit", label: t("sidebar.net.audit"), icon: ScanSearch },
-          { key: "net-mcp", label: t("sidebar.net.mcp"), icon: Plug },
-        ],
-      },
+              { key: "net-mcp", label: t("sidebar.net.mcp"), icon: Plug },
+            ],
+          },
+          ]
+        : []),
       {
         id: "system",
         label: t("sidebar.group.system"),
@@ -194,6 +200,10 @@ export default defineComponent({
     const activeKey = computed(() => {
       if (route.path.startsWith("/compose")) return "compose";
       if (route.path.startsWith("/admin")) return "admin";
+      const netKey = ["net-cert", "net-traffic", "net-lists", "net-audit", "net-mcp"].find(
+        (key) => route.path.startsWith(`/${key}`),
+      );
+      if (netKey) return netKey;
       // The route's box parameter IS the folder key (INBOX is the default,
       // and the legacy ?box=Sent spelling reads as the sent folder).
       const box = route.query.box;

@@ -142,7 +142,16 @@ async fn health() -> Json<crate::Health> {
 
 async fn get_state(State(app): State<AppState>) -> Result<Json<DesiredState>, ApiError> {
     let stored = load_stored(&app)?;
-    Ok(Json(stored.desired))
+    // Same read-redaction as the ws surface: the MCP and arona tokens
+    // never leave the process on a state read.
+    let mut redacted = stored.desired.clone();
+    if !redacted.mcp.token.is_empty() {
+        redacted.mcp.token = "__redacted__".to_owned();
+    }
+    if !redacted.audit.ai.api_token.is_empty() {
+        redacted.audit.ai.api_token = "__redacted__".to_owned();
+    }
+    Ok(Json(redacted))
 }
 
 async fn put_state(
@@ -182,14 +191,26 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
         Ok(stored) => stored.desired,
         Err(_) => DesiredState::default(),
     };
+    let keep_audit_token = keep.audit.ai.api_token.clone();
+    let keep_mcp_token = keep.mcp.token.clone();
+    let mut audit = body.audit.unwrap_or(keep.audit);
+    let mut mcp = body.mcp.unwrap_or(keep.mcp);
+    // A read state carries the __redacted__ sentinel where secrets lived;
+    // writing it back must keep the stored secret, not store the sentinel.
+    if audit.ai.api_token == "__redacted__" {
+        audit.ai.api_token = keep_audit_token;
+    }
+    if mcp.token == "__redacted__" {
+        mcp.token = keep_mcp_token;
+    }
     let mut desired = DesiredState {
         domains: body.domains,
         accounts: Vec::with_capacity(body.accounts.len()),
         aliases: body.aliases,
         shared: Vec::with_capacity(body.shared.len()),
         policy: body.policy,
-        audit: body.audit.unwrap_or(keep.audit),
-        mcp: body.mcp.unwrap_or(keep.mcp),
+        audit,
+        mcp,
     };
     let mut password_hashes = HashMap::with_capacity(body.accounts.len());
 
