@@ -271,12 +271,17 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
 
 async fn post_apply(State(app): State<AppState>) -> Result<Json<ApplyReport>, ApiError> {
     let stored = load_stored(&app)?;
-    let report = apply::apply(app.store.as_ref(), &app.config.state_dir, &stored, app.driver.clone())
-        .await
-        .map_err(|e| ApiError {
-            error: e.to_string(),
-            status: StatusCode::CONFLICT,
-        })?;
+    let report = apply::apply(
+        app.store.as_ref(),
+        &app.config.state_dir,
+        &stored,
+        app.driver.clone(),
+    )
+    .await
+    .map_err(|e| ApiError {
+        error: e.to_string(),
+        status: StatusCode::CONFLICT,
+    })?;
     Ok(Json(report))
 }
 

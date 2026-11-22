@@ -342,8 +342,7 @@ impl StateStore for RedbStateStore {
             .map_err(|e| StoreError::Backend(format!("credential entropy: {e}")))?;
         let password: String = raw.iter().map(|b| format!("{b:02x}")).collect();
         map.insert(address.to_owned(), password.clone());
-        let bytes =
-            rmp_serde::to_vec(&map).map_err(|e| StoreError::Codec(e.to_string()))?;
+        let bytes = rmp_serde::to_vec(&map).map_err(|e| StoreError::Codec(e.to_string()))?;
         let reply = self
             .inner
             .execute(&Command::Kv {
