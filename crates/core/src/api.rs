@@ -38,6 +38,11 @@ pub struct PutState {
     /// Recipient policy.
     #[serde(default)]
     pub policy: Policy,
+    /// Message audit configuration; absent keeps the stored value (a state
+    /// replacement must not silently unconfigure the audit surface).
+    pub audit: Option<ayane_proto::AuditConfig>,
+    /// MCP tool-surface configuration; absent keeps the stored value.
+    pub mcp: Option<ayane_proto::McpConfig>,
 }
 
 /// One account as submitted: like [`Account`] plus the plaintext password.
@@ -50,6 +55,9 @@ pub struct PutAccount {
     /// Quota in bytes; 0 = unlimited.
     #[serde(default)]
     pub quota_bytes: u64,
+    /// Whether this account administers the service.
+    #[serde(default)]
+    pub admin: bool,
     /// Plaintext password (hashed and never stored in the clear).
     pub password: String,
 }
@@ -168,14 +176,20 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
         .map(|account| (account.address.to_string(), Uuid::new_v4()))
         .collect();
 
+    // Absent audit/mcp slices keep their stored values — a state
+    // replacement is not an unconfigure.
+    let keep = match app.store.load() {
+        Ok(stored) => stored.desired,
+        Err(_) => DesiredState::default(),
+    };
     let mut desired = DesiredState {
         domains: body.domains,
         accounts: Vec::with_capacity(body.accounts.len()),
         aliases: body.aliases,
         shared: Vec::with_capacity(body.shared.len()),
         policy: body.policy,
-        audit: Default::default(),
-        mcp: Default::default(),
+        audit: body.audit.unwrap_or(keep.audit),
+        mcp: body.mcp.unwrap_or(keep.mcp),
     };
     let mut password_hashes = HashMap::with_capacity(body.accounts.len());
 
@@ -190,7 +204,7 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
             address: account.address.clone(),
             display_name: account.display_name.clone(),
             quota_bytes: account.quota_bytes,
-            admin: false,
+            admin: account.admin,
         });
     }
 
