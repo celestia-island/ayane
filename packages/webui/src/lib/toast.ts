@@ -11,12 +11,13 @@ import { localizeError } from "./i18n";
 
 const toast = useToast();
 
-/** Localize and toast an RPC/application failure. */
+/** Localize and toast an RPC/application failure. Session expiry stays
+ *  SILENT: the global Session.Required hook is already redirecting to the
+ *  login page — a dead toast over the redirect is noise the user flagged. */
 export function toastError(e: unknown): void {
   const raw = e instanceof Error ? e.message : String(e);
-  // Keep the full path+prose in the console: the toast carries the
-  // localized voice, the console carries the machine channel.
   console.error(raw);
+  if (raw.startsWith("Session.Required:")) return;
   toast.error(localizeError(raw));
 }
 

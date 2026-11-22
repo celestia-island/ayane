@@ -6,6 +6,7 @@
 //! deployment (nothing persistent to leak, nothing to revoke out-of-band).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -35,24 +36,116 @@ pub struct Session {
     pub display_name: String,
     /// Whether this session may call `admin.*` (set by admin login only).
     pub admin: bool,
-    /// The mailbox password, in memory only, for the IMAP leg of this
-    /// session (`None` for admin sessions). Never persisted, never logged.
+    /// The mailbox password for the IMAP leg of this session (`None` for
+    /// admin sessions). Lives in memory and in the 0600 sessions file
+    /// only — never logged, never sent back to any client.
     pub password: Option<String>,
     /// When the session expires.
     pub expires: Instant,
 }
 
-/// In-memory token → session map.
+/// The on-disk mirror of one live session (sessions.json, 0600).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedSession {
+    address: Address,
+    display_name: String,
+    admin: bool,
+    password: Option<String>,
+    /// Seconds remaining at save time; re-armed as an absolute instant
+    /// on load.
+    expires_in: u64,
+}
+
+/// In-memory token → session map, mirrored to a 0600 JSON file so a
+/// control-plane restart does not log every browser out (the file carries
+/// the mailbox password for the IMAP leg — same sensitivity tier as the
+/// session itself, never leaves the state dir).
 #[derive(Default)]
 pub struct SessionStore {
     inner: Mutex<HashMap<String, Session>>,
+    persistence: Option<PathBuf>,
 }
 
 impl SessionStore {
-    /// An empty store.
+    /// An in-memory-only store (tests).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store that mirrors sessions to `path` (created 0600).
+    #[must_use]
+    pub fn with_persistence(path: PathBuf) -> Self {
+        let store = Self {
+            persistence: Some(path),
+            ..Self::default()
+        };
+        store.load_persisted();
+        store
+    }
+
+    fn load_persisted(&self) {
+        let Some(path) = &self.persistence else {
+            return;
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(map) = serde_json::from_str::<HashMap<String, PersistedSession>>(&raw) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut inner = self.inner.lock().expect("sessions mutex");
+        for (token, record) in map {
+            let Some(expires) = now.checked_add(Duration::from_secs(record.expires_in)) else {
+                continue;
+            };
+            if expires <= now {
+                continue;
+            }
+            inner.insert(
+                token,
+                Session {
+                    address: record.address,
+                    display_name: record.display_name,
+                    admin: record.admin,
+                    password: record.password,
+                    expires,
+                },
+            );
+        }
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.persistence else {
+            return;
+        };
+        let inner = self.inner.lock().expect("sessions mutex");
+        let now = Instant::now();
+        let map: HashMap<String, PersistedSession> = inner
+            .iter()
+            .filter(|(_, s)| s.expires > now)
+            .map(|(token, s)| {
+                (
+                    token.clone(),
+                    PersistedSession {
+                        address: s.address.clone(),
+                        display_name: s.display_name.clone(),
+                        admin: s.admin,
+                        password: s.password.clone(),
+                        expires_in: s.expires.duration_since(now).as_secs(),
+                    },
+                )
+            })
+            .collect();
+        if let Ok(json) = serde_json::to_string(&map) {
+            let _ = std::fs::write(path, json);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
     }
 
     /// Verify mailbox credentials and mint a session token.
@@ -154,6 +247,8 @@ impl SessionStore {
             .lock()
             .expect("sessions mutex")
             .insert(token.clone(), session.clone());
+        drop(self.inner.lock().expect("sessions mutex"));
+        self.persist();
         Ok((token, session))
     }
 }

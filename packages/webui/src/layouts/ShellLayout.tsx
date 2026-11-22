@@ -37,8 +37,6 @@ export default defineComponent({
     const connState = ref<ConnectionState>("connecting");
     const theme = useTheme();
 
-    const brandRef = ref<HTMLElement | null>(null);
-    const brandOpen = ref(false);
     const settingsRef = ref<HTMLElement | null>(null);
     const settingsOpen = ref(false);
 
@@ -143,50 +141,7 @@ export default defineComponent({
                   </button>
                 </span>,
               ]}
-            >
-              {{
-                brand: () => (
-                  <span ref={brandRef} style="display: inline-flex">
-                    <button
-                      class="s-brand-btn"
-                      aria-label="ayane"
-                      onClick={() => {
-                        brandOpen.value = !brandOpen.value;
-                      }}
-                    >
-                      <img
-                        style="width: 26px; height: 26px"
-                        src="https://raw.githubusercontent.com/celestia-island/celestia-island.github.io/main/res/logos/ayane.webp"
-                        alt=""
-                      />
-                      <span style="font-weight: 700; letter-spacing: 0.04em">ayane</span>
-                    </button>
-                  </span>
-                ),
-              }}
-            </HkAdminHeader>
-            <HkPopover
-              modelValue={brandOpen.value}
-              onUpdate:modelValue={(v: boolean) => {
-                brandOpen.value = v;
-              }}
-              anchorRef={brandRef.value}
-              placement="bottom-start"
-              offset={6}
-              title="ayane"
-              padding="sm"
-            >
-              <div style="display: flex; flex-direction: column; gap: 2px; min-width: 180px">
-                <div class="s-menu-identity">
-                  <small class="s-menu-caption">{t("menu.signedInAs")}</small>
-                  <span>{localStorage.getItem("ayane.address") || displayName}</span>
-                </div>
-                <button class="s-menu-row" onClick={logout}>
-                  <LogOut size={14} />
-                  {t("menu.logout")}
-                </button>
-              </div>
-            </HkPopover>
+            />
             <HkPopover
               modelValue={settingsOpen.value}
               onUpdate:modelValue={(v: boolean) => {
@@ -239,6 +194,7 @@ export default defineComponent({
                       <PenLine size={16} />
                       {t("compose.button")}
                     </button>
+                    <small class="s-nav-caption">{t("sidebar.mail")}</small>
                     <HkMenu
                       variant="sidebar"
                       open={true}
@@ -248,6 +204,7 @@ export default defineComponent({
                         router.push(key === "sent" ? "/inbox?box=Sent" : "/inbox");
                       }}
                     />
+                    <small class="s-nav-caption">{t("sidebar.system")}</small>
                     <div style="display: flex; flex-direction: column; gap: 2px; padding: 0 6px">
                       <button
                         class="s-manage-btn"

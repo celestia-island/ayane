@@ -7,8 +7,15 @@ html, body, #app { height: 100%; margin: 0; }
 
 body {
   font-family: "Inter", "Noto Sans SC", system-ui, sans-serif;
-  background: #10141c;
-  color: #e6e9f0;
+  background: rgb(var(--color-surface, 16 20 28));
+  color: rgb(var(--color-text-primary, 230 233 240));
+}
+
+/* Gmail-blend: the sidebar shares the content surface — no seam, no edge. */
+.s-admin-shell-body aside,
+.s-admin-shell-body > aside {
+  border-right: 0 !important;
+  background: transparent !important;
 }
 
 .hk-card {
@@ -165,9 +172,3 @@ textarea.hk-input:focus { outline: 1px solid var(--hk-accent, #3b7fc4); }
 }
 
 .s-manage-btn:hover { background: rgb(var(--color-surface-raised, 27 34 48)); }
-
-/* Gmail-blend: the sidebar shares the content surface — no seam. */
-.s-admin-shell-body > aside {
-  border-right: 0 !important;
-  background: transparent;
-}

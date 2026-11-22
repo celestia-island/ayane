@@ -26,9 +26,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         config: Arc::new(config.clone()),
     };
+    let sessions_path = config.state_dir.join("sessions.json");
     let surface = RpcSurface {
         app: state.clone(),
-        sessions: Arc::new(ayane::session::SessionStore::new()),
+        sessions: Arc::new(ayane::session::SessionStore::with_persistence(
+            sessions_path,
+        )),
     };
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

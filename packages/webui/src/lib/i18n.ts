@@ -37,6 +37,9 @@ export const LOCALES: Locale[] = [
 type Table = Record<string, string>;
 
 const en: Table = {
+  "sidebar.mail": "Mail",
+  "sidebar.system": "System",
+  "menu.account": "Account",
   "compose.button": "Compose",
   "folder.inbox": "Inbox",
   "folder.sent": "Sent",
@@ -89,6 +92,9 @@ const en: Table = {
 };
 
 const zhHans: Table = {
+  "sidebar.mail": "邮箱",
+  "sidebar.system": "系统",
+  "menu.account": "账号",
   "compose.button": "撰写",
   "folder.inbox": "收件箱",
   "folder.sent": "已发送",
@@ -141,6 +147,9 @@ const zhHans: Table = {
 };
 
 const zhHant: Table = {
+  "sidebar.mail": "信箱",
+  "sidebar.system": "系統",
+  "menu.account": "帳號",
   "compose.button": "撰寫",
   "folder.inbox": "收件匣",
   "folder.sent": "已送出",
@@ -193,6 +202,9 @@ const zhHant: Table = {
 };
 
 const ja: Table = {
+  "sidebar.mail": "メール",
+  "sidebar.system": "システム",
+  "menu.account": "アカウント",
   "compose.button": "作成",
   "folder.inbox": "受信トレイ",
   "folder.sent": "送信済み",
@@ -245,6 +257,9 @@ const ja: Table = {
 };
 
 const ko: Table = {
+  "sidebar.mail": "메일",
+  "sidebar.system": "시스템",
+  "menu.account": "계정",
   "compose.button": "작성",
   "folder.inbox": "받은 편지함",
   "folder.sent": "보냄",
@@ -297,6 +312,9 @@ const ko: Table = {
 };
 
 const de: Table = {
+  "sidebar.mail": "Post",
+  "sidebar.system": "System",
+  "menu.account": "Konto",
   "compose.button": "Verfassen",
   "folder.inbox": "Posteingang",
   "folder.sent": "Gesendet",
@@ -349,6 +367,9 @@ const de: Table = {
 };
 
 const fr: Table = {
+  "sidebar.mail": "Messagerie",
+  "sidebar.system": "Système",
+  "menu.account": "Compte",
   "compose.button": "Rédiger",
   "folder.inbox": "Boîte de réception",
   "folder.sent": "Envoyé",
@@ -401,6 +422,9 @@ const fr: Table = {
 };
 
 const es: Table = {
+  "sidebar.mail": "Correo",
+  "sidebar.system": "Sistema",
+  "menu.account": "Cuenta",
   "compose.button": "Redactar",
   "folder.inbox": "Bandeja de entrada",
   "folder.sent": "Enviado",
@@ -453,6 +477,9 @@ const es: Table = {
 };
 
 const ru: Table = {
+  "sidebar.mail": "Почта",
+  "sidebar.system": "Система",
+  "menu.account": "Аккаунт",
   "compose.button": "Написать",
   "folder.inbox": "Входящие",
   "folder.sent": "Отправленные",
