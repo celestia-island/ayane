@@ -22,6 +22,13 @@ export class RpcError extends Error {
 
 export type ConnectionState = "connected" | "connecting" | "reconnecting" | "disconnected";
 
+/** Invoked when the server answers Session.Required — the session is
+ *  gone (expired or service restart); the host clears the token and
+ *  returns to the login page instead of leaving a dead shell up. */
+export const onSessionRequired: { handler: (() => void) | null } = {
+  handler: null,
+};
+
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -121,7 +128,11 @@ export class RpcClient {
       this.pending.delete(reply.id);
       window.clearTimeout(pending.timer);
       if (reply.error) {
-        pending.reject(new RpcError(reply.error.message));
+        const err = new RpcError(reply.error.message);
+        if (err.path === "Session.Required") {
+          onSessionRequired.handler?.();
+        }
+        pending.reject(err);
       } else {
         pending.resolve(reply.result);
       }

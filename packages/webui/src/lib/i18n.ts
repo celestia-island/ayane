@@ -37,6 +37,16 @@ export const LOCALES: Locale[] = [
 type Table = Record<string, string>;
 
 const en: Table = {
+  "compose.button": "Compose",
+  "folder.inbox": "Inbox",
+  "folder.sent": "Sent",
+  "settings.title": "Settings",
+  "settings.theme": "Theme",
+  "settings.dark": "Dark",
+  "settings.light": "Light",
+  "settings.language": "Language",
+  "menu.logout": "Sign out",
+  "menu.signedInAs": "Signed in as",
   "nav.inbox": "Inbox",
   "nav.compose": "Compose",
   "nav.admin": "Admin",
@@ -79,6 +89,16 @@ const en: Table = {
 };
 
 const zhHans: Table = {
+  "compose.button": "撰写",
+  "folder.inbox": "收件箱",
+  "folder.sent": "已发送",
+  "settings.title": "设置",
+  "settings.theme": "主题",
+  "settings.dark": "深色",
+  "settings.light": "浅色",
+  "settings.language": "语言",
+  "menu.logout": "退出登录",
+  "menu.signedInAs": "当前账号",
   "nav.inbox": "收件箱",
   "nav.compose": "写邮件",
   "nav.admin": "管理",
@@ -121,6 +141,16 @@ const zhHans: Table = {
 };
 
 const zhHant: Table = {
+  "compose.button": "撰寫",
+  "folder.inbox": "收件匣",
+  "folder.sent": "已送出",
+  "settings.title": "設定",
+  "settings.theme": "主題",
+  "settings.dark": "深色",
+  "settings.light": "淺色",
+  "settings.language": "語言",
+  "menu.logout": "登出",
+  "menu.signedInAs": "目前帳號",
   "nav.inbox": "收件匣",
   "nav.compose": "撰寫郵件",
   "nav.admin": "管理",
@@ -163,6 +193,16 @@ const zhHant: Table = {
 };
 
 const ja: Table = {
+  "compose.button": "作成",
+  "folder.inbox": "受信トレイ",
+  "folder.sent": "送信済み",
+  "settings.title": "設定",
+  "settings.theme": "テーマ",
+  "settings.dark": "ダーク",
+  "settings.light": "ライト",
+  "settings.language": "言語",
+  "menu.logout": "ログアウト",
+  "menu.signedInAs": "現在のアカウント",
   "nav.inbox": "受信トレイ",
   "nav.compose": "作成",
   "nav.admin": "管理",
@@ -205,6 +245,16 @@ const ja: Table = {
 };
 
 const ko: Table = {
+  "compose.button": "작성",
+  "folder.inbox": "받은 편지함",
+  "folder.sent": "보냄",
+  "settings.title": "설정",
+  "settings.theme": "테마",
+  "settings.dark": "다크",
+  "settings.light": "라이트",
+  "settings.language": "언어",
+  "menu.logout": "로그아웃",
+  "menu.signedInAs": "현재 계정",
   "nav.inbox": "받은 편지함",
   "nav.compose": "작성",
   "nav.admin": "관리",
@@ -247,6 +297,16 @@ const ko: Table = {
 };
 
 const de: Table = {
+  "compose.button": "Verfassen",
+  "folder.inbox": "Posteingang",
+  "folder.sent": "Gesendet",
+  "settings.title": "Einstellungen",
+  "settings.theme": "Design",
+  "settings.dark": "Dunkel",
+  "settings.light": "Hell",
+  "settings.language": "Sprache",
+  "menu.logout": "Abmelden",
+  "menu.signedInAs": "Angemeldet als",
   "nav.inbox": "Posteingang",
   "nav.compose": "Verfassen",
   "nav.admin": "Verwaltung",
@@ -289,6 +349,16 @@ const de: Table = {
 };
 
 const fr: Table = {
+  "compose.button": "Rédiger",
+  "folder.inbox": "Boîte de réception",
+  "folder.sent": "Envoyé",
+  "settings.title": "Paramètres",
+  "settings.theme": "Thème",
+  "settings.dark": "Sombre",
+  "settings.light": "Clair",
+  "settings.language": "Langue",
+  "menu.logout": "Se déconnecter",
+  "menu.signedInAs": "Connecté en tant que",
   "nav.inbox": "Boîte de réception",
   "nav.compose": "Rédiger",
   "nav.admin": "Administration",
@@ -331,6 +401,16 @@ const fr: Table = {
 };
 
 const es: Table = {
+  "compose.button": "Redactar",
+  "folder.inbox": "Bandeja de entrada",
+  "folder.sent": "Enviado",
+  "settings.title": "Ajustes",
+  "settings.theme": "Tema",
+  "settings.dark": "Oscuro",
+  "settings.light": "Claro",
+  "settings.language": "Idioma",
+  "menu.logout": "Cerrar sesión",
+  "menu.signedInAs": "Sesión iniciada como",
   "nav.inbox": "Bandeja de entrada",
   "nav.compose": "Redactar",
   "nav.admin": "Administración",
@@ -373,6 +453,16 @@ const es: Table = {
 };
 
 const ru: Table = {
+  "compose.button": "Написать",
+  "folder.inbox": "Входящие",
+  "folder.sent": "Отправленные",
+  "settings.title": "Настройки",
+  "settings.theme": "Тема",
+  "settings.dark": "Тёмная",
+  "settings.light": "Светлая",
+  "settings.language": "Язык",
+  "menu.logout": "Выйти",
+  "menu.signedInAs": "Текущий аккаунт",
   "nav.inbox": "Входящие",
   "nav.compose": "Написать",
   "nav.admin": "Управление",
@@ -449,6 +539,17 @@ function detectLocale(): Locale {
 export function locale(): Locale {
   return active;
 }
+
+/** Switch the app locale (and hikari's own strings via the boot bridge). */
+export function setAppLocale(next: Locale): void {
+  active = next;
+  onLocaleChange.handler?.(next);
+}
+
+/** Boot bridge: main.ts wires this to hikari's setLocale. */
+export const onLocaleChange: { handler: ((l: Locale) => void) | null } = {
+  handler: null,
+};
 
 /** Resolve one message key in the active locale (English fallback). */
 export function t(key: string, params?: Record<string, string | number>): string {

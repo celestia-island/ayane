@@ -72,3 +72,102 @@ textarea.hk-input:focus { outline: 1px solid var(--hk-accent, #3b7fc4); }
   background: var(--hk-hover, #1b2230);
   color: var(--hk-text, #e6e9f0);
 }
+.s-brand-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  font-size: 1rem;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 8px;
+}
+
+.s-brand-btn:hover { background: rgb(var(--color-surface-raised, 27 34 48)); }
+
+.s-compose-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border: 0;
+  border-radius: 10px;
+  background: rgb(var(--color-primary));
+  color: rgb(var(--color-text-primary));
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.s-compose-btn:hover { filter: brightness(1.12); }
+
+.s-menu-caption {
+  display: block;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgb(var(--color-text-secondary, 127 139 161));
+}
+
+.s-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.s-menu-row:hover { background: rgb(var(--color-surface-raised, 27 34 48)); }
+
+.s-menu-row-active {
+  background: rgb(var(--color-primary) / 18%);
+  color: rgb(var(--color-primary));
+  font-weight: 600;
+}
+
+.s-menu-row-active:hover { background: rgb(var(--color-primary) / 26%); }
+
+.s-menu-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 10px 8px;
+  border-bottom: 1px solid rgb(var(--color-border) / 40%);
+  margin-bottom: 4px;
+  font-size: 0.85rem;
+}
+
+.s-manage-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.s-manage-btn:hover { background: rgb(var(--color-surface-raised, 27 34 48)); }
+
+/* Gmail-blend: the sidebar shares the content surface — no seam. */
+.s-admin-shell-body > aside {
+  border-right: 0 !important;
+  background: transparent;
+}
