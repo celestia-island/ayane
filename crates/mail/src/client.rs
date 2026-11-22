@@ -382,10 +382,11 @@ impl Imap {
         let rows = async {
             let mut rows = Vec::new();
             for mailbox in mailboxes {
-                let mailbox_data = session
-                    .select(*mailbox)
-                    .await
-                    .map_err(|e| ClientError::Imap(e.to_string()))?;
+                // A mailbox that does not exist yet simply has no starred
+                // mail — the merged roster skips it instead of failing.
+                let Ok(mailbox_data) = session.select(*mailbox).await else {
+                    continue;
+                };
                 if mailbox_data.exists == 0 {
                     continue;
                 }
