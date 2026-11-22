@@ -341,9 +341,13 @@ async fn mail_list(app: AppState, session: Session, params: Value) -> Result<Val
         .and_then(Value::as_u64)
         .unwrap_or(50)
         .clamp(1, 200) as usize;
-    let password = session.password.as_deref().expect("checked at route");
+    let (identity, password, _) = resolve_read_identity(
+        &app,
+        &session,
+        params.get("as").and_then(Value::as_str),
+    )?;
     let listing = imap_of(&app)?
-        .list(session.address.as_str(), password, &mailbox, limit)
+        .list(identity.as_str(), password.as_str(), &mailbox, limit)
         .await
         .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
     Ok(json!({
@@ -370,9 +374,13 @@ async fn mail_read(app: AppState, session: Session, params: Value) -> Result<Val
     } else {
         MarkSeen::Yes
     };
-    let password = session.password.as_deref().expect("checked at route");
+    let (identity, password, _) = resolve_read_identity(
+        &app,
+        &session,
+        params.get("as").and_then(Value::as_str),
+    )?;
     let raw = imap_of(&app)?
-        .fetch_raw(session.address.as_str(), password, &mailbox, uid, mark_seen)
+        .fetch_raw(identity.as_str(), password.as_str(), &mailbox, uid, mark_seen)
         .await
         .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
     let parsed = ayane_mail::mime::parse(&raw)
@@ -530,10 +538,14 @@ async fn mail_save_draft(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let password = session.password.as_deref().expect("checked at route");
+    let (identity, password, display) = resolve_read_identity(
+        &app,
+        &session,
+        params.get("as").and_then(Value::as_str),
+    )?;
     let message = ayane_mail::compose::build_draft_message(
-        &session.address,
-        &session.display_name,
+        &identity,
+        &display,
         &to,
         &subject,
         &body,
@@ -541,8 +553,8 @@ async fn mail_save_draft(
     .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?;
     let imap = imap_of(&app)?;
     imap.append_to_mailbox(
-        session.address.as_str(),
-        password,
+        identity.as_str(),
+        password.as_str(),
         "Drafts",
         None,
         &ayane_mail::compose::render(&message),
@@ -564,11 +576,15 @@ async fn mail_list_starred(
         .and_then(Value::as_u64)
         .unwrap_or(50)
         .clamp(1, 200) as usize;
-    let password = session.password.as_deref().expect("checked at route");
+    let (identity, password, _) = resolve_read_identity(
+        &app,
+        &session,
+        params.get("as").and_then(Value::as_str),
+    )?;
     let rows = imap_of(&app)?
         .list_flagged(
-            session.address.as_str(),
-            password,
+            identity.as_str(),
+            password.as_str(),
             &["INBOX", "Sent", "Drafts"],
             limit,
         )
@@ -583,14 +599,18 @@ async fn mail_star(app: AppState, session: Session, params: Value) -> Result<Val
     let uid = uid_of(&params)?;
     let mailbox = mailbox_of(&params, "INBOX");
     let starred = params.get("starred").and_then(Value::as_bool) != Some(false);
-    let password = session.password.as_deref().expect("checked at route");
+    let (identity, password, _) = resolve_read_identity(
+        &app,
+        &session,
+        params.get("as").and_then(Value::as_str),
+    )?;
     let op = if starred {
         "+FLAGS.SILENT (\\Flagged)"
     } else {
         "-FLAGS.SILENT (\\Flagged)"
     };
     imap_of(&app)?
-        .store_flag(session.address.as_str(), password, &mailbox, uid, op)
+        .store_flag(identity.as_str(), password.as_str(), &mailbox, uid, op)
         .await
         .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
     Ok(json!({ "ok": true, "starred": starred }))
@@ -608,9 +628,13 @@ async fn mail_trash(app: AppState, session: Session, params: Value) -> Result<Va
             "already in Trash: use mail.purge",
         ));
     }
-    let password = session.password.as_deref().expect("checked at route");
+    let (identity, password, _) = resolve_read_identity(
+        &app,
+        &session,
+        params.get("as").and_then(Value::as_str),
+    )?;
     imap_of(&app)?
-        .move_to_mailbox(session.address.as_str(), password, &mailbox, uid, "Trash")
+        .move_to_mailbox(identity.as_str(), password.as_str(), &mailbox, uid, "Trash")
         .await
         .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
     Ok(json!({ "ok": true }))
@@ -621,9 +645,13 @@ async fn mail_trash(app: AppState, session: Session, params: Value) -> Result<Va
 async fn mail_purge(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
     let uid = uid_of(&params)?;
     let mailbox = mailbox_of(&params, "Trash");
-    let password = session.password.as_deref().expect("checked at route");
+    let (identity, password, _) = resolve_read_identity(
+        &app,
+        &session,
+        params.get("as").and_then(Value::as_str),
+    )?;
     imap_of(&app)?
-        .purge_message(session.address.as_str(), password, &mailbox, uid)
+        .purge_message(identity.as_str(), password.as_str(), &mailbox, uid)
         .await
         .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
     Ok(json!({ "ok": true }))
@@ -685,6 +713,59 @@ async fn mail_from_addresses(
         }
     }
     Ok(json!({ "identities": identities }))
+}
+
+/// Resolve the mailbox identity a mail operation runs against: the
+/// session's own address by default, or a shared mailbox the account is a
+/// member of (reading it logs into IMAP with the server-minted machine
+/// credential — the member never sees it).
+///
+/// Returns the address to open, the IMAP password to use and a display name.
+fn resolve_read_identity(
+    app: &AppState,
+    session: &Session,
+    requested: Option<&str>,
+) -> Result<(ayane_proto::Address, String, String), AppError> {
+    let own = session.address.clone();
+    let password = session
+        .password
+        .clone()
+        .unwrap_or_default();
+    let Some(requested) = requested else {
+        return Ok((own, password, session.display_name.clone()));
+    };
+    if requested == own.as_str() {
+        return Ok((own, password, session.display_name.clone()));
+    }
+    let stored = app
+        .store
+        .load()
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    let parsed = ayane_proto::Address::parse(requested)
+        .map_err(|e| AppError::new("Mail.BadRecipient", e.to_string()))?;
+    let Some(account) = stored
+        .desired
+        .accounts
+        .iter()
+        .find(|account| account.address == session.address)
+    else {
+        return Err(AppError::new("Mail.BadRecipient", "unknown account"));
+    };
+    let member = stored.desired.shared.iter().any(|shared| {
+        shared.address == parsed && shared.members.contains(&account.id)
+    });
+    if !member {
+        return Err(AppError::new(
+            "Mail.BadRecipient",
+            "that shared mailbox does not belong to this account",
+        ));
+    }
+    let shared_password = app
+        .store
+        .shared_imap_password(parsed.as_str())
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    let display = parsed.local().to_owned();
+    Ok((parsed, shared_password, display))
 }
 
 /// Validate a requested send identity: the session's own address or a
@@ -1140,31 +1221,22 @@ async fn mail_mark_seen(app: AppState, session: Session, params: Value) -> Resul
         .unwrap_or("INBOX")
         .to_owned();
     let unseen = params.get("seen").and_then(Value::as_bool) == Some(false);
-    let password = session.password.as_deref().expect("checked at route");
+    let (identity, password, _) = resolve_read_identity(
+        &app,
+        &session,
+        params.get("as").and_then(Value::as_str),
+    )?;
     // Reuse fetch_raw with peek semantics; flag changes ride STORE via the
     // same session shape (a dedicated store call keeps this honest).
     let imap = imap_of(&app)?;
-    if unseen {
-        imap.store_flag(
-            session.address.as_str(),
-            password,
-            &mailbox,
-            uid,
-            "-FLAGS.SILENT (\\Seen)",
-        )
-        .await
-        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
+    let op = if unseen {
+        "-FLAGS.SILENT (\\Seen)"
     } else {
-        imap.store_flag(
-            session.address.as_str(),
-            password,
-            &mailbox,
-            uid,
-            "+FLAGS.SILENT (\\Seen)",
-        )
+        "+FLAGS.SILENT (\\Seen)"
+    };
+    imap.store_flag(identity.as_str(), password.as_str(), &mailbox, uid, op)
         .await
         .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
-    }
     Ok(json!({ "ok": true }))
 }
 
@@ -1212,7 +1284,7 @@ async fn do_apply(app: &AppState) -> Result<Value, AppError> {
         .store
         .load()
         .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
-    let report = apply::apply(&app.config.state_dir, &stored, app.driver.clone())
+    let report = apply::apply(app.store.as_ref(), &app.config.state_dir, &stored, app.driver.clone())
         .await
         .map_err(|e| AppError::new("Admin.ApplyFailed", e.to_string()))?;
     serde_json::to_value(report).map_err(|e| AppError::new("Admin.ApplyFailed", e.to_string()))

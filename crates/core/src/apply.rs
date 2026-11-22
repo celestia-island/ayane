@@ -72,12 +72,19 @@ pub struct ApplyReport {
 ///
 /// Returns [`ApplyError::MissingHash`] when an enabled account has no password
 /// hash (the API forbids this, so this guards hand-edited stores).
-pub fn render_all(stored: &StoredState) -> Result<Vec<RenderedFile>, ApplyError> {
+pub fn render_all(
+    store: &dyn ayane_store::StateStore,
+    stored: &StoredState,
+) -> Result<Vec<RenderedFile>, ApplyError> {
     let state: &DesiredState = &stored.desired;
     state
         .validate()
         .map_err(|e| ApplyError::Invalid(e.to_string()))?;
 
+    // Human accounts carry their stored hash. Shared mailboxes log in with
+    // a server-minted machine credential (members reach them through the
+    // webmail, which knows the credential); the hash is derived at render
+    // time, so rotating the store secret re-renders deterministically.
     let mut passwd_entries: Vec<(&ayane_proto::Address, &str)> = Vec::new();
     for account in &state.accounts {
         let hash = stored
@@ -85,6 +92,19 @@ pub fn render_all(stored: &StoredState) -> Result<Vec<RenderedFile>, ApplyError>
             .ok_or_else(|| ApplyError::MissingHash(account.address.to_string()))?;
         passwd_entries.push((&account.address, hash));
     }
+    let mut shared_hashes: Vec<(ayane_proto::Address, String)> = Vec::new();
+    for shared in &state.shared {
+        if let Ok(plain) = store.shared_imap_password(shared.address.as_str()) {
+            if let Ok(hash) = ayane_store::password::hash_password(&plain) {
+                shared_hashes.push((shared.address.clone(), hash));
+            }
+        }
+    }
+    let shared_refs: Vec<(&ayane_proto::Address, &str)> = shared_hashes
+        .iter()
+        .map(|(address, hash)| (address, hash.as_str()))
+        .collect();
+    passwd_entries.extend(shared_refs);
 
     Ok(vec![
         RenderedFile {
@@ -128,11 +148,12 @@ pub fn render_all(stored: &StoredState) -> Result<Vec<RenderedFile>, ApplyError>
 /// Reload problems are reported in the report (and as warnings), not as errors:
 /// a cold engine that has not been started yet must not fail the first apply.
 pub async fn apply(
+    store: &dyn ayane_store::StateStore,
     state_dir: &std::path::Path,
     stored: &StoredState,
     driver: std::sync::Arc<dyn EngineDriver>,
 ) -> Result<ApplyReport, ApplyError> {
-    let rendered = render_all(stored)?;
+    let rendered = render_all(store, stored)?;
     let mut files = Vec::with_capacity(rendered.len());
     let mut changed_any = false;
 

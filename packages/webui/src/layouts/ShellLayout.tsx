@@ -37,6 +37,12 @@ import {
 } from "../lib/i18n";
 import { onSessionRequired, rpc, sessionToken, setSessionToken, type ConnectionState } from "../lib/rpc";
 import { inboxUnread } from "../lib/mailbox";
+import {
+  currentIdentity,
+  identityList,
+  loadIdentities,
+  setCurrentIdentity,
+} from "../lib/identity";
 
 /** Build identity baked by vite (package version + <branch>:<hash7>). */
 declare const __AYANE_VERSION__: string;
@@ -228,19 +234,25 @@ export default defineComponent({
       LOCALES.map((code) => ({ code, label: LOCALE_LABELS[code] })),
     );
 
-    /** The mailbox switcher lives in the header's centre zone (the chest
-     *  console's page-owned centre group): it appears exactly on the mail
-     *  roster route and drives the same ?box= the sidebar does. */
-    const mailboxOptions = computed(() =>
-      FOLDER_KEYS.map((key) => ({ value: MAILBOX_OF_KEY[key], label: t(FOLDER_LABEL[key]) })),
+    /** The header's centre zone carries the IDENTITY switcher: which
+     *  mailbox under this account (personal or a shared one) the mail
+     *  surfaces operate on. Folders stay in the sidebar — this picker is
+     *  the account's own address book of mailboxes. */
+    const identityOptions = computed(() =>
+      identityList().map((identity) => ({
+        value: identity.address,
+        label:
+          identity.kind === "shared"
+            ? `${identity.display_name} <${identity.address}> · ${t("compose.fromShared")}`
+            : `${identity.display_name} <${identity.address}> · ${t("compose.fromPersonal")}`,
+      })),
     );
-    const onMailRoster = computed(
-      () => route.path === "/inbox" || route.path.startsWith("/inbox") || route.path === "/sent",
+    const onMailSurface = computed(
+      () =>
+        route.path.startsWith("/inbox") ||
+        route.path.startsWith("/read") ||
+        route.path.startsWith("/compose"),
     );
-    const currentMailbox = computed(() => {
-      const box = typeof route.query.box === "string" ? route.query.box : "INBOX";
-      return (FOLDERS as readonly string[]).includes(box) ? box : "INBOX";
-    });
 
     /** HkSelect's option model ({value,label}) — the header cascade takes
      *  the {code,label} shape, so each surface gets its own mapping. */
@@ -289,6 +301,7 @@ export default defineComponent({
         router.push("/login");
         return;
       }
+      void loadIdentities();
       onLocaleChange.handler = (l) => void setLocale(l);
       rpc.onChange = (state) => {
         connState.value = state;
@@ -391,15 +404,15 @@ export default defineComponent({
                   // switcher sits on the true viewport centre, like the
                   // console's filter groups do in the chest admin.
                   center: () =>
-                    onMailRoster.value ? (
+                    onMailSurface.value && identityOptions.value.length > 1 ? (
                       <div class="ay-header-mailbox">
                         <HkSelect
-                          modelValue={currentMailbox.value}
-                          onUpdate:modelValue={(box: string) => {
-                            router.push(box === "INBOX" ? "/inbox" : `/inbox?box=${box}`);
+                          modelValue={currentIdentity()}
+                          onUpdate:modelValue={(address: string) => {
+                            setCurrentIdentity(address);
                           }}
-                          options={mailboxOptions.value}
-                          panelTitle={t("mailbox.switcher")}
+                          options={identityOptions.value}
+                          panelTitle={t("identity.switcher")}
                         />
                       </div>
                     ) : null,

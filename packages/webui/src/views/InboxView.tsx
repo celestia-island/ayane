@@ -17,6 +17,7 @@ import ReadView from "./ReadView.vue";
 
 import { rpc } from "../lib/rpc";
 import { inboxUnread } from "../lib/mailbox";
+import { currentIdentity } from "../lib/identity";
 import { t } from "../lib/i18n";
 import { toastError } from "../lib/toast";
 
@@ -114,7 +115,7 @@ export default defineComponent({
       try {
         const result = await rpc.call<MailboxListing>(
           folder.value === "Starred" ? "mail.listStarred" : "mail.list",
-          { mailbox: props.mailbox, limit: 50 },
+          { mailbox: props.mailbox, limit: 50, as: currentIdentity() },
         );
         rows.value = result.messages;
         total.value = result.total;
@@ -137,7 +138,12 @@ export default defineComponent({
       // and the sidebar badge follow.
       if (!row.seen) {
         void rpc
-          .call("mail.markSeen", { uid: row.uid, mailbox: row.mailbox || props.mailbox, seen: true })
+          .call("mail.markSeen", {
+            uid: row.uid,
+            mailbox: row.mailbox || props.mailbox,
+            seen: true,
+            as: currentIdentity(),
+          })
           .then(() => {
             refreshUnreadAfterSeen(row, true);
             row.seen = true;
@@ -226,6 +232,7 @@ export default defineComponent({
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
             seen: target,
+            as: currentIdentity(),
           });
           refreshUnreadAfterSeen(row, target);
           row.seen = target;
@@ -235,12 +242,14 @@ export default defineComponent({
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
             starred: target,
+            as: currentIdentity(),
           });
           row.flagged = target;
         } else if (key === "trash") {
           await rpc.call("mail.trash", {
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
+            as: currentIdentity(),
           });
           rows.value = rows.value.filter((r) => r.uid !== row.uid);
           total.value = Math.max(0, total.value - 1);
@@ -265,6 +274,7 @@ export default defineComponent({
         await rpc.call("mail.purge", {
           uid: row.uid,
           mailbox: row.mailbox || props.mailbox,
+          as: currentIdentity(),
         });
         rows.value = rows.value.filter((r) => r.uid !== row.uid);
         total.value = Math.max(0, total.value - 1);
