@@ -4,6 +4,7 @@
 set -e
 mkdir -p /var/mail/vhosts
 chown 5000:5000 /var/mail/vhosts
+if [ -f /run/ayane/dovecot.conf ]; then cp /run/ayane/dovecot.conf /etc/dovecot/dovecot.conf; fi
 cp /run/ayane/passwd /etc/dovecot/passwd
 chown root:dovecot /etc/dovecot/passwd
 chmod 640 /etc/dovecot/passwd

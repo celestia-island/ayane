@@ -32,17 +32,25 @@ pub trait EngineDriver: Send + Sync {
 }
 
 /// Reload recipe per service: command run inside its container.
-const RELOADS: &[(&str, &[&str])] = &[
-    ("postfix", &["postfix", "reload"]),
+const RELOADS: &[(&str, Option<&[&str]>)] = &[
+    (
+        "postfix",
+        Some(&[
+            "sh",
+            "-c",
+            "cp /run/ayane/main.cf /etc/postfix/main.cf 2>/dev/null; cp /run/ayane/master.cf \
+             /etc/postfix/master.cf 2>/dev/null; postfix reload",
+        ]),
+    ),
     (
         "dovecot",
-        &[
+        Some(&[
             "sh",
             "-c",
             "cp /run/ayane/passwd /etc/dovecot/passwd && chown root:dovecot              /etc/dovecot/passwd && chmod 640 /etc/dovecot/passwd && doveadm reload",
-        ],
+        ]),
     ),
-    ("rspamd", &["rspamctl", "control", "reload"]),
+    ("rspamd", None),
 ];
 
 /// Dev/single-host driver: `docker compose exec` into the engine containers.
@@ -61,15 +69,24 @@ impl EngineDriver for ComposeDriver {
         }
         let mut out = Vec::new();
         for (service, args) in RELOADS {
-            let output = Command::new("docker")
-                .arg("compose")
-                .arg("-f")
-                .arg(&self.compose_file)
-                .arg("exec")
-                .arg("-T")
-                .arg(service)
-                .args(*args)
-                .output();
+            let output = match args {
+                Some(args) => Command::new("docker")
+                    .arg("compose")
+                    .arg("-f")
+                    .arg(&self.compose_file)
+                    .arg("exec")
+                    .arg("-T")
+                    .arg(service)
+                    .args(*args)
+                    .output(),
+                None => Command::new("docker")
+                    .arg("compose")
+                    .arg("-f")
+                    .arg(&self.compose_file)
+                    .arg("restart")
+                    .arg(service)
+                    .output(),
+            };
             let (ok, detail) = match output {
                 Ok(output) => {
                     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();

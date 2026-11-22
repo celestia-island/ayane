@@ -1,0 +1,22 @@
+[Unit]
+Description=ayane mail control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ayane
+EnvironmentFile=/opt/ayane/ayane.env
+ExecStart=/opt/ayane/ayane-bin
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the control plane needs no privileges beyond its own state dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ayane/state
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

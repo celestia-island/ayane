@@ -11,6 +11,8 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
 COPY main.cf /etc/postfix/main.cf
 COPY master.cf /etc/postfix/master.cf
 COPY subaddress.pcre /etc/postfix/subaddress.pcre
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod 755 /entrypoint.sh
 
 EXPOSE 25 587
-CMD ["postfix", "start-fg"]
+ENTRYPOINT ["/entrypoint.sh"]

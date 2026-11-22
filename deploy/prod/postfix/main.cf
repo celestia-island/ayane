@@ -1,0 +1,54 @@
+# ayane production Postfix — virtual domains via Dovecot LMTP, rspamd milter,
+# STARTTLS everywhere, submission authenticated over TLS only.
+compatibility_level = 3.6
+
+myhostname = mail.acgsyzx.me
+myorigin = $myhostname
+mydestination = localhost.$mydomain, localhost
+inet_interfaces = all
+inet_protocols = ipv4
+
+# Never trust external networks: an unauthenticated foreign MTA must pass the
+# policy checks (sender deny list) below.
+mynetworks = 127.0.0.0/8
+
+# Virtual mailbox domains (rendered by the control plane).
+virtual_mailbox_domains = texthash:/etc/postfix/maps/virtual_domains
+virtual_mailbox_maps = texthash:/etc/postfix/maps/virtual_mailboxes
+virtual_alias_maps = texthash:/etc/postfix/maps/virtual_aliases, pcre:/etc/postfix/subaddress.pcre
+virtual_alias_domains =
+virtual_uid_maps = static:5000
+virtual_gid_maps = static:5000
+virtual_transport = lmtp:dovecot:24
+recipient_delimiter = +
+
+# TLS — certificates come from the host's certbot tree (volume, read-only).
+smtpd_tls_cert_file = /etc/letsencrypt/live/mail.acgsyzx.me/fullchain.pem
+smtpd_tls_key_file = /etc/letsencrypt/live/mail.acgsyzx.me/privkey.pem
+smtpd_tls_security_level = may
+smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtpd_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtp_tls_security_level = may
+smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtp_tls_loglevel = 1
+
+# Submission auth is delegated to Dovecot SASL; the submission service in
+# master.cf enforces encrypt + auth_only.
+smtpd_sasl_type = dovecot
+smtpd_sasl_path = inet:dovecot:12345
+smtpd_sasl_auth_enable = yes
+smtpd_sasl_security_options = noanonymous
+
+smtpd_recipient_restrictions = permit_mynetworks, check_sender_access texthash:/etc/postfix/maps/sender_denylist, permit_sasl_authenticated, reject_unauth_destination
+
+# Content filter (spam / DKIM signing / headers) via milter; accept mail when
+# the filter is down so a missing rspamd never blocks delivery.
+smtpd_milters = inet:rspamd:11332
+milter_default_action = accept
+milter_protocol = 6
+
+message_size_limit = 26214400
+mailbox_size_limit = 0
+
+# Container has no syslog: log to stdout so `docker logs` shows everything.
+maillog_file = /dev/stdout
