@@ -106,6 +106,7 @@ pub fn router(state: AppState) -> Router {
         .route("/apply", post(post_apply));
     Router::new()
         .route("/api/health", get(health))
+        .fallback(crate::webui::serve)
         .nest(
             "/api/v1",
             protected.layer(axum::middleware::from_fn_with_state(

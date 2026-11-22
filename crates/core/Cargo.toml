@@ -23,6 +23,7 @@ ayane-mail = { workspace = true }
 ayane-store = { workspace = true }
 getrandom = { workspace = true }
 hickory-resolver = { workspace = true }
+rust-embed = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

@@ -18,6 +18,7 @@ pub mod rpc;
 pub mod session;
 pub mod state;
 pub mod transport;
+pub mod webui;
 
 use serde::Serialize;
 use state::AppState;

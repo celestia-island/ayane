@@ -1,0 +1,13 @@
+packages:
+  - packages/webui
+
+# @parcel/watcher ships prebuilds; its postinstall only verifies them —
+# approved here once instead of failing every install.
+allowBuilds:
+  "@parcel/watcher": true
+
+# The family minimumReleaseAge policy auto-registered these fresh
+# publishes; keep them pinned to the audited versions.
+minimumReleaseAgeExclude:
+  - "@celestia-island/hikari@0.55.458"
+  - "@celestia-island/tairitsu-host-client@0.1.0"
