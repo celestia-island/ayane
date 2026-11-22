@@ -315,5 +315,8 @@ pub fn mcp_tools() -> Value {
         { "name": "state.get", "description": "Read the current desired mail state (domains, accounts, aliases, policy)." },
         { "name": "state.put", "description": "Replace the desired state (same schema as state.get plus account passwords)." },
         { "name": "apply", "description": "Render the desired state into engine configuration and reload the daemons." },
+        { "name": "mail.list", "description": "List a mailbox (the admin context's own INBOX by default)." },
+        { "name": "mail.read", "description": "Read one message (sanitised body, attachment hashes, phishing verdicts)." },
+        { "name": "dns.check", "description": "Run the DNS wizard (MX/SPF/DKIM/DMARC/PTR) against the hosted domains." },
     ])
 }
