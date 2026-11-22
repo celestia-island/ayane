@@ -4,6 +4,8 @@ import { useRouter } from "vue-router";
 import { ShieldAlert, FileLock2 } from "lucide-vue-next";
 
 import { rpc } from "../lib/rpc";
+import { t } from "../lib/i18n";
+import { toastError } from "../lib/toast";
 
 interface AttachmentMeta {
   filename: string;
@@ -31,7 +33,6 @@ const props = defineProps<{ uid: number; mailbox: string }>();
 const router = useRouter();
 const message = ref<ParsedMessage | null>(null);
 const links = ref<LinkVerdict[]>([]);
-const error = ref("");
 const loading = ref(true);
 
 const suspicious = computed(() => links.value.filter((l) => l.verdict !== "ok"));
@@ -45,7 +46,7 @@ onMounted(async () => {
     message.value = result.message;
     links.value = result.links;
   } catch (e) {
-    error.value = String(e instanceof Error ? e.message : e);
+    toastError(e);
   } finally {
     loading.value = false;
   }
@@ -54,15 +55,14 @@ onMounted(async () => {
 
 <template>
   <div class="read">
-    <button class="hk-button ghost" @click="router.push('/inbox')">← 返回</button>
-    <p v-if="loading" class="muted">读取中…</p>
-    <p v-else-if="error" class="danger">{{ error }}</p>
+    <button class="hk-button ghost" @click="router.push('/inbox')">← {{ t("read.back") }}</button>
+    <p v-if="loading" class="muted">{{ t("inbox.loading") }}</p>
     <template v-else-if="message">
       <h2>{{ message.subject || "(无主题)" }}</h2>
       <p class="muted">{{ message.from }} → {{ message.to.join(", ") }}</p>
 
       <div v-if="suspicious.length" class="hk-card warn-card">
-        <p class="warn"><ShieldAlert :size="16" style="vertical-align: -3px" /> 此邮件包含可疑链接（{{ suspicious.length }}）：</p>
+        <p class="warn"><ShieldAlert :size="16" style="vertical-align: -3px" /> {{ t("read.suspicious", { n: suspicious.length }) }}</p>
         <ul>
           <li v-for="link in suspicious" :key="link.url" :class="link.verdict">
             <code>{{ link.url }}</code>
@@ -74,12 +74,12 @@ onMounted(async () => {
       <!-- Only ammonia-sanitised HTML from the server, remote references stripped. -->
       <div v-if="message.html" class="body html" v-html="message.html" />
       <pre v-else-if="message.text" class="body">{{ message.text }}</pre>
-      <p v-else class="muted body">（无正文）</p>
+      <p v-else class="muted body">{{ t("read.noBody") }}</p>
 
       <div v-if="message.attachments.length" class="hk-card">
         <p class="muted">
           <FileLock2 :size="16" style="vertical-align: -3px" />
-          附件默认只展示哈希，不在线打开（{{ message.attachments.length }}）：
+          {{ t("read.attachments", { n: message.attachments.length }) }}
         </p>
         <table>
           <thead>

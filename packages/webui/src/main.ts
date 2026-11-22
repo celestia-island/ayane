@@ -9,13 +9,15 @@ import "@celestia-island/hikari/styles/index.scss";
 // back to light defaults (the un-themed gray-card / white-band renders).
 import { initTheme, setLocale } from "@celestia-island/hikari";
 
+import { locale as appLocale } from "./lib/i18n";
+
 initTheme();
 // Dark-first: the mail surface reads best dark, matching the app chrome.
 localStorage.setItem("hikari-theme-mode", "dark");
 document.documentElement.setAttribute("data-mode", "dark");
 initTheme();
 // hikari's own strings (Sign in / Password / …) follow the locale.
-void setLocale("zh-Hans");
+void setLocale(appLocale());
 
 import App from "./App.vue";
 import { rpc } from "./lib/rpc";

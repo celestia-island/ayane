@@ -1,0 +1,494 @@
+/**
+ * The app i18n layer — nine locales, family set.
+ *
+ * App strings live here; hikari's own strings follow via `setLocale`
+ * (called once at boot). `t(key)` resolves the active locale with an
+ * English fallback; unknown keys render as themselves so a missing
+ * translation is visible rather than silently blank.
+ *
+ * Error localization maps the family's method-style error PATH (the
+ * machine channel on `-32000` messages) to a locale key — the server's
+ * English prose is the fallback, never the primary voice.
+ */
+
+export type Locale =
+  | "en"
+  | "zh-Hans"
+  | "zh-Hant"
+  | "ja"
+  | "ko"
+  | "de"
+  | "fr"
+  | "es"
+  | "ru";
+
+export const LOCALES: Locale[] = [
+  "en",
+  "zh-Hans",
+  "zh-Hant",
+  "ja",
+  "ko",
+  "de",
+  "fr",
+  "es",
+  "ru",
+];
+
+type Table = Record<string, string>;
+
+const en: Table = {
+  "nav.inbox": "Inbox",
+  "nav.compose": "Compose",
+  "nav.admin": "Admin",
+  "nav.logout": "Sign out",
+  "login.title": "ayane Mail",
+  "login.subtitle": "Sign in with your mailbox account",
+  "inbox.loading": "Loading…",
+  "inbox.empty": "This mailbox is empty.",
+  "read.back": "Back",
+  "read.noBody": "(no body)",
+  "read.attachments": "Attachments are hash-only by default ({n}):",
+  "read.suspicious": "This message contains suspicious links ({n}):",
+  "compose.to": "To",
+  "compose.subject": "Subject",
+  "compose.body": "Body",
+  "compose.send": "Send",
+  "compose.cancel": "Cancel",
+  "compose.sent": "Submitted ✓",
+  "admin.unlockTitle": "Admin sign-in",
+  "admin.unlockHint": "Enter the admin token to unlock configuration and the DNS panel.",
+  "admin.token": "admin token",
+  "admin.unlock": "Unlock",
+  "admin.dns": "DNS check",
+  "admin.rerun": "Re-run checks",
+  "admin.state": "Mail domain configuration (JSON)",
+  "admin.save": "Save",
+  "admin.apply": "Apply & reload",
+  "admin.saved": "Saved (not yet applied)",
+  "admin.applied": "Applied & reloaded ✓",
+  "admin.applyPartial": "Applied, but some daemons failed to reload (see server logs)",
+  "err.invalidCredentials": "Address or password is wrong",
+  "err.sessionRequired": "Please sign in first",
+  "err.forbidden": "Admin session required",
+  "err.timeout": "No answer (timeout)",
+  "err.disconnected": "The connection dropped",
+  "err.mailFailed": "Mail operation failed",
+  "err.adminFailed": "Configuration rejected",
+  "err.malformed": "Malformed request",
+  "err.generic": "Something went wrong",
+};
+
+const zhHans: Table = {
+  "nav.inbox": "收件箱",
+  "nav.compose": "写邮件",
+  "nav.admin": "管理",
+  "nav.logout": "退出登录",
+  "login.title": "ayane 邮箱",
+  "login.subtitle": "用邮箱账号登录",
+  "inbox.loading": "加载中…",
+  "inbox.empty": "这个信箱是空的。",
+  "read.back": "返回",
+  "read.noBody": "（无正文）",
+  "read.attachments": "附件默认只展示哈希，不在线打开（{n}）：",
+  "read.suspicious": "此邮件包含可疑链接（{n}）：",
+  "compose.to": "收件人",
+  "compose.subject": "主题",
+  "compose.body": "正文",
+  "compose.send": "发送",
+  "compose.cancel": "取消",
+  "compose.sent": "已提交发送 ✓",
+  "admin.unlockTitle": "管理登录",
+  "admin.unlockHint": "输入管理 token 解锁配置与 DNS 面板。",
+  "admin.token": "管理 token",
+  "admin.unlock": "解锁",
+  "admin.dns": "DNS 体检",
+  "admin.rerun": "重新检查",
+  "admin.state": "邮件域配置（JSON）",
+  "admin.save": "保存配置",
+  "admin.apply": "下发并重载",
+  "admin.saved": "已保存（配置未下发）",
+  "admin.applied": "已下发并重载 ✓",
+  "admin.applyPartial": "下发完成，但部分守护进程重载失败（见服务端日志）",
+  "err.invalidCredentials": "邮箱地址或密码错误",
+  "err.sessionRequired": "请先登录",
+  "err.forbidden": "需要管理员会话",
+  "err.timeout": "请求超时，无响应",
+  "err.disconnected": "连接已断开",
+  "err.mailFailed": "邮件操作失败",
+  "err.adminFailed": "配置被拒绝",
+  "err.malformed": "请求格式错误",
+  "err.generic": "出了点问题",
+};
+
+const zhHant: Table = {
+  "nav.inbox": "收件匣",
+  "nav.compose": "撰寫郵件",
+  "nav.admin": "管理",
+  "nav.logout": "登出",
+  "login.title": "ayane 信箱",
+  "login.subtitle": "用信箱帳號登入",
+  "inbox.loading": "載入中…",
+  "inbox.empty": "這個信匣是空的。",
+  "read.back": "返回",
+  "read.noBody": "（無內文）",
+  "read.attachments": "附件預設只顯示雜湊值，不線上開啟（{n}）：",
+  "read.suspicious": "此郵件包含可疑連結（{n}）：",
+  "compose.to": "收件人",
+  "compose.subject": "主旨",
+  "compose.body": "內文",
+  "compose.send": "傳送",
+  "compose.cancel": "取消",
+  "compose.sent": "已送出 ✓",
+  "admin.unlockTitle": "管理登入",
+  "admin.unlockHint": "輸入管理 token 以解鎖設定與 DNS 面板。",
+  "admin.token": "管理 token",
+  "admin.unlock": "解鎖",
+  "admin.dns": "DNS 體檢",
+  "admin.rerun": "重新檢查",
+  "admin.state": "郵件網域設定（JSON）",
+  "admin.save": "儲存設定",
+  "admin.apply": "下發並重載",
+  "admin.saved": "已儲存（尚未下發）",
+  "admin.applied": "已下發並重載 ✓",
+  "admin.applyPartial": "下發完成，但部分守護程序重載失敗（見伺服器日誌）",
+  "err.invalidCredentials": "電子郵件地址或密碼錯誤",
+  "err.sessionRequired": "請先登入",
+  "err.forbidden": "需要管理員工作階段",
+  "err.timeout": "請求逾時，無回應",
+  "err.disconnected": "連線已中斷",
+  "err.mailFailed": "郵件操作失敗",
+  "err.adminFailed": "設定被拒絕",
+  "err.malformed": "請求格式錯誤",
+  "err.generic": "發生錯誤",
+};
+
+const ja: Table = {
+  "nav.inbox": "受信トレイ",
+  "nav.compose": "作成",
+  "nav.admin": "管理",
+  "nav.logout": "ログアウト",
+  "login.title": "ayane メール",
+  "login.subtitle": "メールアカウントでログイン",
+  "inbox.loading": "読み込み中…",
+  "inbox.empty": "このメールボックスは空です。",
+  "read.back": "戻る",
+  "read.noBody": "（本文なし）",
+  "read.attachments": "添付ファイルは既定でハッシュのみ表示（{n}）:",
+  "read.suspicious": "不審なリンクを検出（{n}）:",
+  "compose.to": "宛先",
+  "compose.subject": "件名",
+  "compose.body": "本文",
+  "compose.send": "送信",
+  "compose.cancel": "キャンセル",
+  "compose.sent": "送信しました ✓",
+  "admin.unlockTitle": "管理ログイン",
+  "admin.unlockHint": "管理トークンで設定と DNS パネルを解除します。",
+  "admin.token": "管理トークン",
+  "admin.unlock": "解除",
+  "admin.dns": "DNS チェック",
+  "admin.rerun": "再チェック",
+  "admin.state": "メールドメイン設定（JSON）",
+  "admin.save": "保存",
+  "admin.apply": "適用して再読込",
+  "admin.saved": "保存しました（未適用）",
+  "admin.applied": "適用して再読込しました ✓",
+  "admin.applyPartial": "適用完了、ただし一部デーモンの再読込に失敗（サーバーログ参照）",
+  "err.invalidCredentials": "アドレスまたはパスワードが違います",
+  "err.sessionRequired": "先にログインしてください",
+  "err.forbidden": "管理セッションが必要です",
+  "err.timeout": "応答がありません（タイムアウト）",
+  "err.disconnected": "接続が切断されました",
+  "err.mailFailed": "メール操作に失敗しました",
+  "err.adminFailed": "設定は拒否されました",
+  "err.malformed": "リクエスト形式が不正です",
+  "err.generic": "問題が発生しました",
+};
+
+const ko: Table = {
+  "nav.inbox": "받은 편지함",
+  "nav.compose": "작성",
+  "nav.admin": "관리",
+  "nav.logout": "로그아웃",
+  "login.title": "ayane 메일",
+  "login.subtitle": "메일 계정으로 로그인",
+  "inbox.loading": "불러오는 중…",
+  "inbox.empty": "이 편지함은 비어 있습니다.",
+  "read.back": "뒤로",
+  "read.noBody": "(본문 없음)",
+  "read.attachments": "첨부파일은 기본적으로 해시만 표시됩니다({n}):",
+  "read.suspicious": "의심스러운 링크 감지({n}):",
+  "compose.to": "받는 사람",
+  "compose.subject": "제목",
+  "compose.body": "본문",
+  "compose.send": "보내기",
+  "compose.cancel": "취소",
+  "compose.sent": "전송됨 ✓",
+  "admin.unlockTitle": "관리자 로그인",
+  "admin.unlockHint": "관리 토큰을 입력해 설정과 DNS 패널을 여세요.",
+  "admin.token": "관리 토큰",
+  "admin.unlock": "잠금 해제",
+  "admin.dns": "DNS 점검",
+  "admin.rerun": "다시 검사",
+  "admin.state": "메일 도메인 설정(JSON)",
+  "admin.save": "저장",
+  "admin.apply": "적용 및 재시작",
+  "admin.saved": "저장됨(적용 전)",
+  "admin.applied": "적용 및 재시작 완료 ✓",
+  "admin.applyPartial": "적용 완료, 일부 데몬 재시작 실패(서버 로그 참조)",
+  "err.invalidCredentials": "주소 또는 비밀번호가 올바르지 않습니다",
+  "err.sessionRequired": "먼저 로그인하세요",
+  "err.forbidden": "관리자 세션이 필요합니다",
+  "err.timeout": "응답 없음(시간 초과)",
+  "err.disconnected": "연결이 끊겼습니다",
+  "err.mailFailed": "메일 작업 실패",
+  "err.adminFailed": "설정이 거부되었습니다",
+  "err.malformed": "요청 형식이 잘못되었습니다",
+  "err.generic": "문제가 발생했습니다",
+};
+
+const de: Table = {
+  "nav.inbox": "Posteingang",
+  "nav.compose": "Verfassen",
+  "nav.admin": "Verwaltung",
+  "nav.logout": "Abmelden",
+  "login.title": "ayane Mail",
+  "login.subtitle": "Mit dem Postfachkonto anmelden",
+  "inbox.loading": "Lädt…",
+  "inbox.empty": "Dieses Postfach ist leer.",
+  "read.back": "Zurück",
+  "read.noBody": "(kein Inhalt)",
+  "read.attachments": "Anhänge zeigen standardmäßig nur den Hash ({n}):",
+  "read.suspicious": "Verdächtige Links in dieser Nachricht ({n}):",
+  "compose.to": "An",
+  "compose.subject": "Betreff",
+  "compose.body": "Text",
+  "compose.send": "Senden",
+  "compose.cancel": "Abbrechen",
+  "compose.sent": "Übermittelt ✓",
+  "admin.unlockTitle": "Admin-Anmeldung",
+  "admin.unlockHint": "Admin-Token eingeben, um Konfiguration und DNS-Panel freizuschalten.",
+  "admin.token": "Admin-Token",
+  "admin.unlock": "Entsperren",
+  "admin.dns": "DNS-Check",
+  "admin.rerun": "Erneut prüfen",
+  "admin.state": "Maildomain-Konfiguration (JSON)",
+  "admin.save": "Speichern",
+  "admin.apply": "Anwenden & neu laden",
+  "admin.saved": "Gespeichert (noch nicht angewendet)",
+  "admin.applied": "Angewendet & neu geladen ✓",
+  "admin.applyPartial": "Angewendet, einige Daemons wurden nicht neu geladen (Server-Log)",
+  "err.invalidCredentials": "Adresse oder Passwort ist falsch",
+  "err.sessionRequired": "Bitte zuerst anmelden",
+  "err.forbidden": "Admin-Sitzung erforderlich",
+  "err.timeout": "Keine Antwort (Timeout)",
+  "err.disconnected": "Verbindung getrennt",
+  "err.mailFailed": "Mail-Vorgang fehlgeschlagen",
+  "err.adminFailed": "Konfiguration abgelehnt",
+  "err.malformed": "Fehlerhafte Anfrage",
+  "err.generic": "Etwas ist schiefgelaufen",
+};
+
+const fr: Table = {
+  "nav.inbox": "Boîte de réception",
+  "nav.compose": "Rédiger",
+  "nav.admin": "Administration",
+  "nav.logout": "Se déconnecter",
+  "login.title": "Messagerie ayane",
+  "login.subtitle": "Connectez-vous avec votre compte",
+  "inbox.loading": "Chargement…",
+  "inbox.empty": "Cette boîte est vide.",
+  "read.back": "Retour",
+  "read.noBody": "(aucun contenu)",
+  "read.attachments": "Les pièces jointes n'affichent que leur empreinte ({n}) :",
+  "read.suspicious": "Liens suspects dans ce message ({n}) :",
+  "compose.to": "À",
+  "compose.subject": "Objet",
+  "compose.body": "Corps",
+  "compose.send": "Envoyer",
+  "compose.cancel": "Annuler",
+  "compose.sent": "Envoyé ✓",
+  "admin.unlockTitle": "Connexion admin",
+  "admin.unlockHint": "Entrez le token admin pour débloquer la configuration et le panneau DNS.",
+  "admin.token": "token admin",
+  "admin.unlock": "Déverrouiller",
+  "admin.dns": "Vérification DNS",
+  "admin.rerun": "Revérifier",
+  "admin.state": "Configuration du domaine (JSON)",
+  "admin.save": "Enregistrer",
+  "admin.apply": "Appliquer & recharger",
+  "admin.saved": "Enregistré (non appliqué)",
+  "admin.applied": "Appliqué & rechargé ✓",
+  "admin.applyPartial": "Appliqué, certains démons n'ont pas rechargé (logs serveur)",
+  "err.invalidCredentials": "Adresse ou mot de passe incorrect",
+  "err.sessionRequired": "Connectez-vous d'abord",
+  "err.forbidden": "Session admin requise",
+  "err.timeout": "Aucune réponse (délai dépassé)",
+  "err.disconnected": "Connexion perdue",
+  "err.mailFailed": "Échec de l'opération mail",
+  "err.adminFailed": "Configuration refusée",
+  "err.malformed": "Requête mal formée",
+  "err.generic": "Une erreur est survenue",
+};
+
+const es: Table = {
+  "nav.inbox": "Bandeja de entrada",
+  "nav.compose": "Redactar",
+  "nav.admin": "Administración",
+  "nav.logout": "Cerrar sesión",
+  "login.title": "Correo ayane",
+  "login.subtitle": "Inicia sesión con tu cuenta",
+  "inbox.loading": "Cargando…",
+  "inbox.empty": "Este buzón está vacío.",
+  "read.back": "Volver",
+  "read.noBody": "(sin contenido)",
+  "read.attachments": "Los adjuntos muestran solo su hash ({n}):",
+  "read.suspicious": "Enlaces sospechosos en este mensaje ({n}):",
+  "compose.to": "Para",
+  "compose.subject": "Asunto",
+  "compose.body": "Cuerpo",
+  "compose.send": "Enviar",
+  "compose.cancel": "Cancelar",
+  "compose.sent": "Enviado ✓",
+  "admin.unlockTitle": "Acceso admin",
+  "admin.unlockHint": "Introduce el token de administración para desbloquear configuración y DNS.",
+  "admin.token": "token de admin",
+  "admin.unlock": "Desbloquear",
+  "admin.dns": "Chequeo DNS",
+  "admin.rerun": "Volver a comprobar",
+  "admin.state": "Configuración del dominio (JSON)",
+  "admin.save": "Guardar",
+  "admin.apply": "Aplicar y recargar",
+  "admin.saved": "Guardado (sin aplicar)",
+  "admin.applied": "Aplicado y recargado ✓",
+  "admin.applyPartial": "Aplicado, algunos demonios no recargaron (ver logs)",
+  "err.invalidCredentials": "Dirección o contraseña incorrecta",
+  "err.sessionRequired": "Inicia sesión primero",
+  "err.forbidden": "Se requiere sesión de administrador",
+  "err.timeout": "Sin respuesta (tiempo agotado)",
+  "err.disconnected": "Conexión perdida",
+  "err.mailFailed": "Falló la operación de correo",
+  "err.adminFailed": "Configuración rechazada",
+  "err.malformed": "Solicitud mal formada",
+  "err.generic": "Algo salió mal",
+};
+
+const ru: Table = {
+  "nav.inbox": "Входящие",
+  "nav.compose": "Написать",
+  "nav.admin": "Управление",
+  "nav.logout": "Выйти",
+  "login.title": "Почта ayane",
+  "login.subtitle": "Войдите с почтовым аккаунтом",
+  "inbox.loading": "Загрузка…",
+  "inbox.empty": "Этот ящик пуст.",
+  "read.back": "Назад",
+  "read.noBody": "(нет содержимого)",
+  "read.attachments": "Вложения показывают только хеш ({n}):",
+  "read.suspicious": "Подозрительные ссылки в письме ({n}):",
+  "compose.to": "Кому",
+  "compose.subject": "Тема",
+  "compose.body": "Текст",
+  "compose.send": "Отправить",
+  "compose.cancel": "Отмена",
+  "compose.sent": "Отправлено ✓",
+  "admin.unlockTitle": "Вход администратора",
+  "admin.unlockHint": "Введите админ-токен, чтобы открыть настройки и панель DNS.",
+  "admin.token": "админ-токен",
+  "admin.unlock": "Разблокировать",
+  "admin.dns": "Проверка DNS",
+  "admin.rerun": "Проверить снова",
+  "admin.state": "Конфигурация домена (JSON)",
+  "admin.save": "Сохранить",
+  "admin.apply": "Применить и перезагрузить",
+  "admin.saved": "Сохранено (не применено)",
+  "admin.applied": "Применено и перезагружено ✓",
+  "admin.applyPartial": "Применено, часть демонов не перезагрузилась (см. лог сервера)",
+  "err.invalidCredentials": "Адрес или пароль неверны",
+  "err.sessionRequired": "Сначала войдите",
+  "err.forbidden": "Требуется сессия администратора",
+  "err.timeout": "Нет ответа (таймаут)",
+  "err.disconnected": "Соединение потеряно",
+  "err.mailFailed": "Сбой почтовой операции",
+  "err.adminFailed": "Конфигурация отклонена",
+  "err.malformed": "Неверный формат запроса",
+  "err.generic": "Что-то пошло не так",
+};
+
+const TABLES: Record<Locale, Table> = {
+  en,
+  "zh-Hans": zhHans,
+  "zh-Hant": zhHant,
+  ja,
+  ko,
+  de,
+  fr,
+  es,
+  ru,
+};
+
+let active: Locale = detectLocale();
+
+/** Best-effort browser locale match; falls back to English. */
+function detectLocale(): Locale {
+  const candidates = navigator.languages ?? [navigator.language];
+  for (const raw of candidates) {
+    const tag = raw.toLowerCase();
+    if (tag.startsWith("zh")) {
+      return /tw|hk|hant/.test(tag) ? "zh-Hant" : "zh-Hans";
+    }
+    for (const locale of LOCALES) {
+      if (tag === locale.toLowerCase() || tag.startsWith(locale.toLowerCase() + "-")) {
+        return locale;
+      }
+    }
+  }
+  return "en";
+}
+
+/** The active locale. */
+export function locale(): Locale {
+  return active;
+}
+
+/** Resolve one message key in the active locale (English fallback). */
+export function t(key: string, params?: Record<string, string | number>): string {
+  let text = TABLES[active][key] ?? en[key] ?? key;
+  if (params) {
+    for (const [name, value] of Object.entries(params)) {
+      text = text.replaceAll(`{${name}}`, String(value));
+    }
+  }
+  return text;
+}
+
+/**
+ * Localize one family error: the method-style PATH in the message is the
+ * i18n channel; unknown paths keep the server prose verbatim (English).
+ */
+export function localizeError(rawMessage: string): string {
+  const idx = rawMessage.indexOf(": ");
+  const path = idx > 0 ? rawMessage.slice(0, idx) : "";
+  const prose = idx > 0 ? rawMessage.slice(idx + 2) : rawMessage;
+  const known: Record<string, string> = {
+    "Session.InvalidCredentials": "err.invalidCredentials",
+    "Session.Required": "err.sessionRequired",
+    "Session.MalformedParams": "err.malformed",
+    "Admin.Forbidden": "err.forbidden",
+    "Admin.MalformedState": "err.malformed",
+    "Mail.MalformedParams": "err.malformed",
+    "Mail.BadRecipient": "err.mailFailed",
+    "Mail.ComposerRejected": "err.mailFailed",
+    "Mail.ImapFailed": "err.mailFailed",
+    "Mail.ImapUnavailable": "err.mailFailed",
+    "Mail.SubmissionFailed": "err.mailFailed",
+    "Mail.SubmissionUnavailable": "err.mailFailed",
+    "Mail.Unparsable": "err.mailFailed",
+    "Admin.StoreFailed": "err.adminFailed",
+    "Admin.StateRejected": "err.adminFailed",
+    "Admin.ApplyFailed": "err.adminFailed",
+    "Dns.NoDomain": "err.adminFailed",
+    "Dns.ResolverFailed": "err.adminFailed",
+  };
+  const key = known[path];
+  return key ? t(key) : rawMessage;
+}

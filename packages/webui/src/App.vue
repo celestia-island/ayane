@@ -3,7 +3,9 @@ import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { LogOut, Mail, Plus, Settings } from "lucide-vue-next";
 
-import { HkStatusBar } from "@celestia-island/hikari";
+import { HkStatusBar, HkToast } from "@celestia-island/hikari";
+
+import { t } from "./lib/i18n";
 import type { HkConnectionInfo } from "@celestia-island/hikari";
 
 import { rpc, setSessionToken, type ConnectionState } from "./lib/rpc";
@@ -42,12 +44,15 @@ function logout(): void {
 <template>
   <div class="app">
     <header class="top">
-      <span class="brand" @click="router.push('/inbox')">ayane</span>
+      <span class="brand" @click="router.push('/inbox')">
+        <img class="brand-logo" src="https://raw.githubusercontent.com/celestia-island/celestia-island.github.io/main/res/logos/ayane.webp" alt="" />
+        <span class="brand-name">ayane</span>
+      </span>
       <nav>
-        <button title="收件箱" data-test="nav-inbox" @click="router.push('/inbox')"><Mail :size="16" /></button>
-        <button title="写邮件" data-test="nav-compose" @click="router.push('/compose')"><Plus :size="16" /></button>
-        <button title="管理" data-test="nav-admin" @click="router.push('/admin')"><Settings :size="16" /></button>
-        <button title="退出" @click="logout"><LogOut :size="16" /></button>
+        <button :title="t('nav.inbox')" data-test="nav-inbox" @click="router.push('/inbox')"><Mail :size="16" /></button>
+        <button :title="t('nav.compose')" data-test="nav-compose" @click="router.push('/compose')"><Plus :size="16" /></button>
+        <button :title="t('nav.admin')" data-test="nav-admin" @click="router.push('/admin')"><Settings :size="16" /></button>
+        <button :title="t('nav.logout')" @click="logout"><LogOut :size="16" /></button>
       </nav>
     </header>
 
@@ -56,6 +61,7 @@ function logout(): void {
     </main>
 
     <!-- The family footer: connection traffic light bottom-left. -->
+    <HkToast />
     <footer class="foot">
       <HkStatusBar
         :state="connState"
@@ -83,7 +89,12 @@ body {
 .top {
   display: flex; align-items: center; justify-content: space-between;
   padding: 0 16px; height: 46px; border-bottom: 1px solid #232a37;
-  .brand { font-weight: 700; letter-spacing: 0.06em; cursor: pointer; }
+  .brand {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-weight: 700; letter-spacing: 0.06em; cursor: pointer;
+    .brand-logo { width: 22px; height: 22px; }
+    .brand-name { color: #e6e9f0; }
+  }
   nav { display: flex; gap: 4px;
     button {
       display: inline-flex; align-items: center; justify-content: center;

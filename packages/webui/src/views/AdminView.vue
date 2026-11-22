@@ -3,6 +3,8 @@ import { onMounted, ref } from "vue";
 import { Globe, Save, Rocket } from "lucide-vue-next";
 
 import { rpc } from "../lib/rpc";
+import { t } from "../lib/i18n";
+import { toastError, toastSuccess } from "../lib/toast";
 
 interface DnsCheck {
   check: string;
@@ -13,10 +15,8 @@ interface DnsCheck {
 const adminToken = ref("");
 const adminOk = ref(false);
 const stateText = ref("");
-const saved = ref("");
 const dns = ref<DnsCheck[] | null>(null);
 const busy = ref(false);
-const error = ref("");
 
 onMounted(async () => {
   adminToken.value = localStorage.getItem("ayane.admin") || "";
@@ -24,14 +24,13 @@ onMounted(async () => {
 });
 
 async function adminLogin(): Promise<void> {
-  error.value = "";
   try {
     await rpc.call("session.adminLogin", { token: adminToken.value });
     localStorage.setItem("ayane.admin", adminToken.value);
     adminOk.value = true;
     await Promise.all([loadState(), runDns()]);
   } catch (e) {
-    error.value = String(e instanceof Error ? e.message : e);
+    toastError(e);
   }
 }
 
@@ -42,14 +41,12 @@ async function loadState(): Promise<void> {
 
 async function saveState(): Promise<void> {
   busy.value = true;
-  saved.value = "";
-  error.value = "";
   try {
     const parsed = JSON.parse(stateText.value) as Record<string, unknown>;
     await rpc.call("admin.state.put", parsed);
-    saved.value = "已保存（配置未下发）";
+    toastSuccess(t("admin.saved"));
   } catch (e) {
-    error.value = String(e instanceof Error ? e.message : e);
+    toastError(e);
   } finally {
     busy.value = false;
   }
@@ -57,14 +54,12 @@ async function saveState(): Promise<void> {
 
 async function apply(): Promise<void> {
   busy.value = true;
-  saved.value = "";
-  error.value = "";
   try {
     const report = await rpc.call<{ reloaded: { service: string; ok: boolean }[] }>("admin.apply");
     const allOk = report.reloaded.every((r) => r.ok);
-    saved.value = allOk ? "已下发并重载 ✓" : "下发完成，但部分守护进程重载失败（见服务端日志）";
+    toastSuccess(allOk ? t("admin.applied") : t("admin.applyPartial"));
   } catch (e) {
-    error.value = String(e instanceof Error ? e.message : e);
+    toastError(e);
   } finally {
     busy.value = false;
   }
@@ -75,7 +70,7 @@ async function runDns(): Promise<void> {
     const report = await rpc.call<{ checks: DnsCheck[] }>("dns.check");
     dns.value = report.checks;
   } catch (e) {
-    error.value = String(e instanceof Error ? e.message : e);
+    toastError(e);
   }
 }
 </script>
@@ -83,16 +78,15 @@ async function runDns(): Promise<void> {
 <template>
   <div class="admin">
     <form v-if="!adminOk" class="hk-card" @submit.prevent="adminLogin">
-      <h3>管理登录</h3>
-      <p class="muted">输入管理 token 解锁配置与 DNS 面板。</p>
-      <input v-model="adminToken" class="hk-input" type="password" placeholder="admin token" />
-      <p v-if="error" class="danger">{{ error }}</p>
-      <button class="hk-button" :disabled="!adminToken">解锁</button>
+      <h3>{{ t("admin.unlockTitle") }}</h3>
+      <p class="muted">{{ t("admin.unlockHint") }}</p>
+      <input v-model="adminToken" class="hk-input" type="password" :placeholder="t('admin.token')" />
+      <button class="hk-button" :disabled="!adminToken">{{ t("admin.unlock") }}</button>
     </form>
 
     <template v-else>
       <div class="hk-card">
-        <h3><Globe :size="16" style="vertical-align: -3px" /> DNS 体检</h3>
+        <h3><Globe :size="16" style="vertical-align: -3px" /> {{ t("admin.dns") }}</h3>
         <ul class="dns">
           <li v-for="c in dns || []" :key="c.check">
             <span class="pill" :class="c.status">{{ c.status }}</span>
@@ -100,18 +94,16 @@ async function runDns(): Promise<void> {
             <span class="muted">{{ c.detail }}</span>
           </li>
         </ul>
-        <button class="hk-button ghost" @click="runDns">重新检查</button>
+        <button class="hk-button ghost" @click="runDns">{{ t("admin.rerun") }}</button>
       </div>
 
       <div class="hk-card">
-        <h3><Save :size="16" style="vertical-align: -3px" /> 邮件域配置（JSON）</h3>
+        <h3><Save :size="16" style="vertical-align: -3px" /> {{ t("admin.state") }}</h3>
         <textarea v-model="stateText" class="hk-input mono" rows="18" spellcheck="false" />
-        <p v-if="error" class="danger">{{ error }}</p>
-        <p v-if="saved" class="warn">{{ saved }}</p>
         <div class="hk-row">
-          <button class="hk-button" :disabled="busy" @click="saveState">保存配置</button>
+          <button class="hk-button" :disabled="busy" @click="saveState">{{ t("admin.save") }}</button>
           <button class="hk-button" :disabled="busy" @click="apply">
-            <Rocket :size="14" /> 下发并重载
+            <Rocket :size="14" /> {{ t("admin.apply") }}
           </button>
         </div>
       </div>

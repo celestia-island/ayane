@@ -3,6 +3,8 @@ import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import { rpc } from "../lib/rpc";
+import { t } from "../lib/i18n";
+import { toastError } from "../lib/toast";
 
 interface EnvelopeRow {
   uid: number;
@@ -15,7 +17,6 @@ interface EnvelopeRow {
 const props = defineProps<{ mailbox: string }>();
 const router = useRouter();
 const messages = ref<EnvelopeRow[]>([]);
-const error = ref("");
 const loading = ref(true);
 
 onMounted(async () => {
@@ -26,7 +27,7 @@ onMounted(async () => {
     });
     messages.value = result.messages;
   } catch (e) {
-    error.value = String(e instanceof Error ? e.message : e);
+    toastError(e);
   } finally {
     loading.value = false;
   }
@@ -39,9 +40,8 @@ function open(uid: number): void {
 
 <template>
   <div>
-    <p v-if="loading" class="muted">加载中…</p>
-    <p v-else-if="error" class="danger">{{ error }}</p>
-    <p v-else-if="messages.length === 0" class="muted">这个信箱是空的。</p>
+    <p v-if="loading" class="muted">{{ t("inbox.loading") }}</p>
+    <p v-else-if="messages.length === 0" class="muted">{{ t("inbox.empty") }}</p>
     <ul v-else class="list">
       <li v-for="row in messages" :key="row.uid" :class="{ unread: !row.seen }" @click="open(row.uid)">
         <span class="from">{{ row.from || "(无发件人)" }}</span>

@@ -67,7 +67,13 @@ impl SessionStore {
         address_raw: &str,
         password_raw: &str,
     ) -> Result<(String, Session), LoginError> {
-        let address = Address::parse(address_raw).map_err(|_| LoginError::UnknownAccount)?;
+        // A bare local part ("test") resolves against the hosted domains
+        // when exactly one account matches — the common single-domain case
+        // users naturally type.
+        let address = match Address::parse(address_raw) {
+            Ok(address) => address,
+            Err(_) => resolve_bare_local(store, address_raw).ok_or(LoginError::UnknownAccount)?,
+        };
         let stored = store.load().map_err(|_| LoginError::UnknownAccount)?;
         let hash = stored
             .password_hash(&address)
@@ -161,4 +167,123 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+/// Resolve a bare local part ("test") to the single hosted account with
+/// that local part; ambiguous (multiple domains) or unknown → `None`.
+#[must_use]
+fn resolve_bare_local(store: &dyn StateStore, raw: &str) -> Option<Address> {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.contains('@') {
+        return None;
+    }
+    let stored = store.load().ok()?;
+    let mut matches: Vec<Address> = stored
+        .desired
+        .accounts
+        .iter()
+        .map(|account| account.address.clone())
+        .filter(|address| address.local() == lower)
+        .collect();
+    matches.sort();
+    matches.dedup();
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ayane_proto::{Account, DesiredState, MailDomain};
+    use ayane_store::{RedbStateStore, StoredState};
+    use std::collections::HashMap;
+
+    fn store_with(addresses: &[&str]) -> RedbStateStore {
+        let dir = std::env::temp_dir().join(format!("ayane-session-{}", uuid::Uuid::new_v4()));
+        let store = RedbStateStore::open(dir.join("state.redb")).expect("open");
+        let mut hashes = HashMap::new();
+        let accounts: Vec<Account> = addresses
+            .iter()
+            .map(|raw| {
+                let address = Address::parse(raw).expect("addr");
+                hashes.insert(address.to_string(), "{SHA512-CRYPT}x".to_owned());
+                Account {
+                    id: uuid::Uuid::new_v4(),
+                    address,
+                    display_name: "T".to_owned(),
+                    quota_bytes: 0,
+                }
+            })
+            .collect();
+        let stored = StoredState {
+            desired: DesiredState {
+                domains: vec![MailDomain {
+                    name: "example.test".to_owned(),
+                    catch_all: None,
+                    enabled: true,
+                }],
+                accounts,
+                ..Default::default()
+            },
+            password_hashes: hashes,
+        };
+        store.save(&stored).expect("save");
+        store
+    }
+
+    #[test]
+    fn bare_local_resolves_to_the_single_match() {
+        let store = store_with(&["test@example.test", "ops@example.test"]);
+        let sessions = SessionStore::new();
+        let resolved = resolve_bare_local(&store, "test");
+        assert_eq!(
+            resolved.map(|a| a.to_string()),
+            Some("test@example.test".to_owned())
+        );
+        let _ = sessions;
+    }
+
+    #[test]
+    fn bare_local_across_two_domains_is_ambiguous() {
+        use ayane_proto::MailDomain as Domain;
+        let dir = std::env::temp_dir().join(format!("ayane-session-{}", uuid::Uuid::new_v4()));
+        let store = RedbStateStore::open(dir.join("state.redb")).expect("open");
+        let mk = |raw: &str| Account {
+            id: uuid::Uuid::new_v4(),
+            address: Address::parse(raw).expect("addr"),
+            display_name: "T".to_owned(),
+            quota_bytes: 0,
+        };
+        let stored = StoredState {
+            desired: DesiredState {
+                domains: vec![
+                    Domain {
+                        name: "a.test".to_owned(),
+                        catch_all: None,
+                        enabled: true,
+                    },
+                    Domain {
+                        name: "b.test".to_owned(),
+                        catch_all: None,
+                        enabled: true,
+                    },
+                ],
+                accounts: vec![mk("test@a.test"), mk("test@b.test")],
+                ..Default::default()
+            },
+            password_hashes: HashMap::new(),
+        };
+        store.save(&stored).expect("save");
+        assert!(resolve_bare_local(&store, "test").is_none());
+    }
+
+    #[test]
+    fn full_addresses_never_hit_the_resolution_path() {
+        let store = store_with(&["test@example.test"]);
+        assert!(resolve_bare_local(&store, "test@example.test").is_none());
+        assert!(resolve_bare_local(&store, "").is_none());
+    }
 }

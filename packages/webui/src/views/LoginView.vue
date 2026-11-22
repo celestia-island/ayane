@@ -4,12 +4,14 @@ import { useRouter } from "vue-router";
 
 import { HkLoginFlow, type HkLoginChannel } from "@celestia-island/hikari";
 
+import { t } from "../lib/i18n";
+import { toastError } from "../lib/toast";
+
 import { rpc, setSessionToken } from "../lib/rpc";
 
 const router = useRouter();
 const channel = ref("mail");
 const pending = ref(false);
-const failure = ref("");
 
 // The family login panel (chest/auth.celestia.world blueprint): one
 // credentials channel renders the plain card — no dead segment group.
@@ -17,8 +19,8 @@ const channels: HkLoginChannel[] = [
   {
     key: "mail",
     mode: "credentials",
-    title: "ayane 邮箱",
-    subtitle: "用邮箱账号登录",
+    title: t("login.title"),
+    subtitle: t("login.subtitle"),
     usernameType: "email",
     usernamePlaceholder: "you@example.com",
     usernameAutocomplete: "email",
@@ -30,7 +32,6 @@ const channels: HkLoginChannel[] = [
 
 async function submit(_channel: string, username: string, password: string): Promise<void> {
   pending.value = true;
-  failure.value = "";
   try {
     const result = await rpc.call<{ token: string }>("session.login", {
       address: username,
@@ -39,7 +40,7 @@ async function submit(_channel: string, username: string, password: string): Pro
     setSessionToken(result.token);
     router.push("/inbox");
   } catch (e) {
-    failure.value = e instanceof Error ? e.message : String(e);
+    toastError(e);
   } finally {
     pending.value = false;
   }
@@ -55,11 +56,7 @@ async function submit(_channel: string, username: string, password: string): Pro
       :loading="pending"
       logo-src="https://raw.githubusercontent.com/celestia-island/celestia-island.github.io/main/res/logos/ayane.webp"
       @account-submit="submit"
-    >
-      <template #top>
-        <p v-if="failure" class="login-error" role="alert">{{ failure }}</p>
-      </template>
-    </HkLoginFlow>
+    />
   </div>
 </template>
 
@@ -71,13 +68,4 @@ async function submit(_channel: string, username: string, password: string): Pro
   justify-content: center;
 }
 
-.login-error {
-  margin: 0 0 10px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: rgba(224, 82, 82, 0.12);
-  border: 1px solid rgba(224, 82, 82, 0.45);
-  color: #e08181;
-  font-size: 13px;
-}
 </style>
