@@ -303,6 +303,7 @@ async fn mail_list(app: AppState, session: Session, params: Value) -> Result<Val
     Ok(json!({
         "mailbox": mailbox,
         "total": listing.total,
+        "unread": listing.unread,
         "messages": listing.messages,
     }))
 }
