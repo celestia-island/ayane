@@ -10,6 +10,8 @@ use ayane_proto::{Address, DefaultAction, DesiredState};
 
 pub mod client;
 pub mod compose;
+pub mod mime;
+pub mod phishing;
 
 /// Where a message for `recipient` should go.
 #[derive(Debug, Clone, PartialEq, Eq)]

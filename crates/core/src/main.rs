@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ayane::config::Config;
 use ayane::driver::ComposeDriver;
 use ayane::state::AppState;
+use ayane::transport::RpcSurface;
 use ayane_store::RedbStateStore;
 
 #[tokio::main]
@@ -25,6 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         config: Arc::new(config.clone()),
     };
+    let surface = RpcSurface {
+        app: state.clone(),
+        sessions: Arc::new(ayane::session::SessionStore::new()),
+    };
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(
@@ -34,6 +39,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_api = if config.admin_token.is_some() { "enabled" } else { "disabled" },
         "ayane control plane starting"
     );
-    axum::serve(listener, ayane::app(state)).await?;
+    axum::serve(listener, ayane::api::full_router(surface)).await?;
     Ok(())
 }

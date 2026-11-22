@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.98"
 authors = ["Celestia Island"]
 repository = "https://github.com/celestia-island/ayane"
 license-file = "LICENSE"
@@ -31,7 +31,7 @@ rmp-serde = "^1"
 
 # async / http
 tokio = { version = "^1", features = ["macros", "net", "rt-multi-thread", "signal", "process", "fs"] }
-axum = "^0.8"
+axum = { version = "^0.8", features = ["ws"] }
 tower = { version = "^0.5", features = ["util"] }
 tracing = "^0.1"
 tracing-subscriber = { version = "^0.3", features = ["env-filter"] }
@@ -39,6 +39,10 @@ futures-util = { version = "^0.3", default-features = false }
 
 # mail: client side only — the MTA stays Postfix, so nothing here listens on 25.
 lettre = { version = "^0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1"] }
+# message parsing + safe html + hashing + dns
+mail-parser = "^1"
+ammonia = "^4"
+sha2 = "^0.10"
 async-imap = { version = "^0.12", default-features = false, features = ["runtime-tokio"] }
 
 # storage

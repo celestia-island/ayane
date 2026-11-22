@@ -13,7 +13,10 @@ pub mod api;
 pub mod apply;
 pub mod config;
 pub mod driver;
+pub mod rpc;
+pub mod session;
 pub mod state;
+pub mod transport;
 
 use serde::Serialize;
 use state::AppState;

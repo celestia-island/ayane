@@ -12,13 +12,16 @@ readme = "../../README.md"
 [dependencies]
 axum = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ayane-engine = { workspace = true }
 ayane-proto = { workspace = true }
+ayane-mail = { workspace = true }
 ayane-store = { workspace = true }
+getrandom = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

@@ -85,6 +85,14 @@ pub struct ApiError {
     status: StatusCode,
 }
 
+impl ApiError {
+    /// The human-readable reason (for the ws error path).
+    #[must_use]
+    pub fn prose(&self) -> &str {
+        &self.error
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(self)).into_response()
@@ -108,6 +116,17 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The full application: the management REST face plus the ws/mcp
+/// JSON-RPC surface.
+pub fn full_router(surface: crate::transport::RpcSurface) -> Router {
+    router(surface.app.clone()).merge(
+        Router::new()
+            .route("/api/ws", get(crate::transport::ws_handler))
+            .route("/api/mcp", post(crate::transport::mcp_handler))
+            .with_state(surface),
+    )
+}
+
 async fn health() -> Json<crate::Health> {
     Json(crate::Health::default())
 }
@@ -121,6 +140,15 @@ async fn put_state(
     State(app): State<AppState>,
     Json(body): Json<PutState>,
 ) -> Result<Json<PutStateAck>, ApiError> {
+    put_state_impl(&app, body).await.map(Json)
+}
+
+/// Shared by the REST handler and the ws `admin.state.put` method.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] for every rejection the REST face would show.
+pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAck, ApiError> {
     for account in &body.accounts {
         if account.password.len() < 8 {
             return Err(ApiError {
@@ -194,12 +222,12 @@ async fn put_state(
     };
     app.store.save(&stored).map_err(store_error)?;
 
-    Ok(Json(PutStateAck {
+    Ok(PutStateAck {
         domains: stored.desired.domains.len(),
         accounts: stored.desired.accounts.len(),
         aliases: stored.desired.aliases.len(),
         shared: stored.desired.shared.len(),
-    }))
+    })
 }
 
 async fn post_apply(State(app): State<AppState>) -> Result<Json<ApplyReport>, ApiError> {

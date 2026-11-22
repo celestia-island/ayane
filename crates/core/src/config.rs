@@ -21,6 +21,15 @@ pub const DEFAULT_STATE_DIR: &str = "state";
 /// Default compose file driving the engine containers.
 pub const DEFAULT_COMPOSE_FILE: &str = "deploy/docker-compose.yml";
 
+/// Default IMAP endpoint (prod publishes Dovecot's plaintext listener on the
+/// host loopback only — the read path is a client of the engine).
+pub const DEFAULT_IMAP: &str = "127.0.0.1:143";
+
+/// Default submission endpoint (dev). The prod rig exposes a dedicated
+/// loopback-only plaintext submission listener (10587) for the control
+/// plane; the public 587/465 enforce TLS for human clients.
+pub const DEFAULT_SUBMISSION: &str = "127.0.0.1:587";
+
 /// Why the environment could not be turned into a [`Config`].
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -49,6 +58,10 @@ pub struct Config {
     pub admin_token: Option<String>,
     /// Compose file of the engine containers (for reloads).
     pub compose_file: PathBuf,
+    /// IMAP endpoint the read path talks to.
+    pub imap: String,
+    /// Submission endpoint the send path talks to.
+    pub submission: String,
 }
 
 impl Config {
@@ -73,12 +86,17 @@ impl Config {
         let compose_file = PathBuf::from(
             std::env::var("AYANE_COMPOSE_FILE").unwrap_or_else(|_| DEFAULT_COMPOSE_FILE.to_owned()),
         );
+        let imap = std::env::var("AYANE_IMAP").unwrap_or_else(|_| DEFAULT_IMAP.to_owned());
+        let submission =
+            std::env::var("AYANE_SUBMISSION").unwrap_or_else(|_| DEFAULT_SUBMISSION.to_owned());
         Ok(Self {
             listen,
             log_filter,
             state_dir,
             admin_token,
             compose_file,
+            imap,
+            submission,
         })
     }
 
