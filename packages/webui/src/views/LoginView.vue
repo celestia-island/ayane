@@ -2,56 +2,82 @@
 import { ref } from "vue";
 import { useRouter } from "vue-router";
 
+import { HkLoginFlow, type HkLoginChannel } from "@celestia-island/hikari";
+
 import { rpc, setSessionToken } from "../lib/rpc";
 
 const router = useRouter();
-const address = ref("");
-const password = ref("");
-const busy = ref(false);
-const error = ref("");
+const channel = ref("mail");
+const pending = ref(false);
+const failure = ref("");
 
-async function login(): Promise<void> {
-  busy.value = true;
-  error.value = "";
+// The family login panel (chest/auth.celestia.world blueprint): one
+// credentials channel renders the plain card — no dead segment group.
+const channels: HkLoginChannel[] = [
+  {
+    key: "mail",
+    mode: "credentials",
+    title: "ayane 邮箱",
+    subtitle: "用邮箱账号登录",
+    usernameType: "email",
+    usernamePlaceholder: "you@example.com",
+    usernameAutocomplete: "email",
+    // Account + password on the opening card: the mail service has no
+    // MFA ladder yet, so the account-first posture would only add a hop.
+    passwordField: true,
+  },
+];
+
+async function submit(_channel: string, username: string, password: string): Promise<void> {
+  pending.value = true;
+  failure.value = "";
   try {
     const result = await rpc.call<{ token: string }>("session.login", {
-      address: address.value,
-      password: password.value,
+      address: username,
+      password,
     });
     setSessionToken(result.token);
     router.push("/inbox");
   } catch (e) {
-    error.value = String(e instanceof Error ? e.message : e);
+    failure.value = e instanceof Error ? e.message : String(e);
   } finally {
-    busy.value = false;
+    pending.value = false;
   }
 }
 </script>
 
 <template>
-  <div class="login">
-    <form class="hk-card" @submit.prevent="login">
-      <h2>ayane 邮箱</h2>
-      <label>
-        <span>邮箱地址</span>
-        <input v-model="address" class="hk-input" type="email" required autocomplete="username" placeholder="you@example.com" />
-      </label>
-      <label>
-        <span>密码</span>
-        <input v-model="password" class="hk-input" type="password" required autocomplete="current-password" />
-      </label>
-      <p v-if="error" class="danger">{{ error }}</p>
-      <button class="hk-button" type="submit" :disabled="busy || !address || !password">
-        {{ busy ? "登录中…" : "登录" }}
-      </button>
-    </form>
+  <div class="login-page">
+    <HkLoginFlow
+      v-model="channel"
+      :channels="channels"
+      step="account"
+      :loading="pending"
+      logo-src="https://raw.githubusercontent.com/celestia-island/celestia-island.github.io/main/res/logos/ayane.webp"
+      @account-submit="submit"
+    >
+      <template #top>
+        <p v-if="failure" class="login-error" role="alert">{{ failure }}</p>
+      </template>
+    </HkLoginFlow>
   </div>
 </template>
 
 <style scoped lang="scss">
-.login { display: flex; align-items: center; justify-content: center; height: 100%; }
-form { width: 320px; display: flex; flex-direction: column; gap: 12px;
-  h2 { margin: 0 0 4px; }
-  label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #aab3c5; }
+.login-page {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.login-error {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(224, 82, 82, 0.12);
+  border: 1px solid rgba(224, 82, 82, 0.45);
+  color: #e08181;
+  font-size: 13px;
 }
 </style>

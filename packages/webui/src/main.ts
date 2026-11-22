@@ -1,7 +1,11 @@
 import { createApp } from "vue";
 import { createRouter, createWebHistory } from "vue-router";
 
-import "@celestia-island/hikari/styles";
+// Full hikari stylesheet bundle (the admin chrome styles its components
+// render — status bar, auth card, glass header) and the family dark mode:
+// hikari components are mode-aware and default to light without this.
+import "@celestia-island/hikari/styles/index.scss";
+document.documentElement.setAttribute("data-mode", "dark");
 
 import App from "./App.vue";
 import { rpc } from "./lib/rpc";
