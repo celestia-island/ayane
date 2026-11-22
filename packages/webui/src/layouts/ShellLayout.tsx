@@ -1,6 +1,6 @@
 import { computed, defineComponent, onMounted, ref } from "vue";
 import { RouterView, useRoute, useRouter } from "vue-router";
-import { Mail, PenLine, Send, Settings, SquarePen, Star, Trash2 } from "lucide-vue-next";
+import { Bot, Globe, Mail, PenLine, Plug, ScanSearch, Send, Settings, ShieldAlert, SquarePen, Star, Trash2 } from "lucide-vue-next";
 
 import {
   HkAboutBody,
@@ -121,6 +121,11 @@ export default defineComponent({
     const pageTitle = computed(() => {
       if (route.path.startsWith("/compose")) return t("compose.button");
       if (route.path.startsWith("/read")) return t("folder.inbox");
+      if (route.path.startsWith("/net/cert")) return t("sidebar.net.cert");
+      if (route.path.startsWith("/net/traffic")) return t("sidebar.net.traffic");
+      if (route.path.startsWith("/net/lists")) return t("sidebar.net.lists");
+      if (route.path.startsWith("/net/audit")) return t("sidebar.net.audit");
+      if (route.path.startsWith("/net/mcp")) return t("sidebar.net.mcp");
       if (route.path.startsWith("/admin")) return t("nav.admin");
       const box = typeof route.query.box === "string" ? route.query.box : "";
       return t(FOLDER_LABEL[(box.toLowerCase() || "inbox") as keyof typeof FOLDER_LABEL]);
@@ -158,6 +163,17 @@ export default defineComponent({
         id: "mail",
         label: t("sidebar.group.mail"),
         items: navItems.value.filter((item) => FOLDER_KEYS.includes(item.key as never)),
+      },
+      {
+        id: "net",
+        label: t("sidebar.group.net"),
+        items: [
+          { key: "net-cert", label: t("sidebar.net.cert"), icon: Globe },
+          { key: "net-traffic", label: t("sidebar.net.traffic"), icon: Send },
+          { key: "net-lists", label: t("sidebar.net.lists"), icon: ShieldAlert },
+          { key: "net-audit", label: t("sidebar.net.audit"), icon: ScanSearch },
+          { key: "net-mcp", label: t("sidebar.net.mcp"), icon: Plug },
+        ],
       },
       {
         id: "system",
@@ -214,7 +230,9 @@ export default defineComponent({
     };
 
     function navigate(key: string, close?: () => void): void {
-      if (key === "compose" || key === "admin") {
+      if (key.startsWith("net-")) {
+        router.push(`/${key}`);
+      } else if (key === "compose" || key === "admin") {
         router.push(`/${key}`);
       } else if (key in MAILBOX_OF_KEY) {
         router.push(key === "inbox" ? "/inbox" : `/inbox?box=${MAILBOX_OF_KEY[key]}`);

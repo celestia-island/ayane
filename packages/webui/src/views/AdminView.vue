@@ -21,8 +21,7 @@ interface DnsCheck {
   detail: string;
 }
 
-const adminToken = ref("");
-const adminOk = ref(false);
+const adminOk = ref<boolean | null>(null);
 const stateText = ref("");
 const dns = ref<DnsCheck[] | null>(null);
 const dnsLoading = ref(true);
@@ -30,21 +29,17 @@ const dnsError = ref<string | undefined>(undefined);
 const busy = ref(false);
 
 onMounted(async () => {
-  adminToken.value = localStorage.getItem("ayane.admin") || "";
-  if (adminToken.value) await adminLogin();
-  else dnsLoading.value = false;
-});
-
-async function adminLogin(): Promise<void> {
   try {
-    await rpc.call("session.adminLogin", { token: adminToken.value });
-    localStorage.setItem("ayane.admin", adminToken.value);
-    adminOk.value = true;
-    await Promise.all([loadState(), runDns()]);
+    const who = await rpc.call<{ admin: boolean }>("session.whoami");
+    adminOk.value = who.admin;
+    if (who.admin) await Promise.all([loadState(), runDns()]);
+    else dnsLoading.value = false;
   } catch (e) {
+    adminOk.value = false;
+    dnsLoading.value = false;
     toastError(e);
   }
-}
+});
 
 async function loadState(): Promise<void> {
   const state = await rpc.call<Record<string, unknown>>("admin.state.get");
@@ -109,17 +104,11 @@ const dnsRows = computed(() => dns.value ?? []);
 
 <template>
   <div class="admin">
-    <HkSectionCard v-if="!adminOk" :title="t('admin.unlockTitle')" padded class="admin-unlock">
-      <form @submit.prevent="adminLogin">
-        <p class="muted admin-hint">{{ t("admin.unlockHint") }}</p>
-        <HkInput v-model="adminToken" type="password" :placeholder="t('admin.token')" />
-        <HkButton type="submit" :disabled="!adminToken || busy">
-          <Save :size="14" /> {{ t("admin.unlock") }}
-        </HkButton>
-      </form>
+    <HkSectionCard v-if="adminOk === false" :title="t('admin.lockedTitle')" padded>
+      <p class="muted admin-hint">{{ t("admin.lockedHint") }}</p>
     </HkSectionCard>
 
-    <template v-else>
+    <template v-else-if="adminOk">
       <HkAdminTablePage
         :title="t('admin.dns')"
         :icon="Globe"
@@ -156,7 +145,6 @@ const dnsRows = computed(() => dns.value ?? []);
 
 <style scoped>
 .admin { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-.admin-unlock form { display: flex; flex-direction: column; gap: 12px; }
 .admin-hint { margin: 0; }
 .admin-actions { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
 </style>
