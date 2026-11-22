@@ -72,7 +72,7 @@ async function saveDraft(): Promise<void> {
 <template>
   <div class="compose">
     <form @submit.prevent="send">
-      <HkSectionCard :title="t('compose.button')" class="compose-card">
+      <HkSectionCard :title="t('compose.button')" padded>
         <div class="compose-fields">
           <HkInput v-model="to" type="email" required :label="t('compose.to')" placeholder="someone@example.com" />
           <HkInput v-model="subject" :label="t('compose.subject')" />
@@ -96,7 +96,6 @@ async function saveDraft(): Promise<void> {
 
 <style scoped>
 .compose { max-width: 720px; margin: 0 auto; }
-.compose-card { display: flex; }
 .compose-fields { display: flex; flex-direction: column; gap: 12px; }
 .compose-actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; }
 </style>

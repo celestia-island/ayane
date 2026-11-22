@@ -109,7 +109,7 @@ const dnsRows = computed(() => dns.value ?? []);
 
 <template>
   <div class="admin">
-    <HkSectionCard v-if="!adminOk" :title="t('admin.unlockTitle')" class="admin-unlock">
+    <HkSectionCard v-if="!adminOk" :title="t('admin.unlockTitle')" padded class="admin-unlock">
       <form @submit.prevent="adminLogin">
         <p class="muted admin-hint">{{ t("admin.unlockHint") }}</p>
         <HkInput v-model="adminToken" type="password" :placeholder="t('admin.token')" />
@@ -143,7 +143,7 @@ const dnsRows = computed(() => dns.value ?? []);
         </template>
       </HkAdminTablePage>
 
-      <HkSectionCard :title="t('admin.state')" :icon="Save">
+      <HkSectionCard :title="t('admin.state')" :icon="Save" padded>
         <HkInput v-model="stateText" type="textarea" :rows="18" :spellcheck="false" />
         <div class="admin-actions">
           <HkButton :disabled="busy" @click="saveState">{{ t("admin.save") }}</HkButton>

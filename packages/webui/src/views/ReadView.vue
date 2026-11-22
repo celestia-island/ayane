@@ -79,6 +79,7 @@ onMounted(async () => {
         :title="t('read.suspicious', { n: suspicious.length })"
         :icon="ShieldAlert"
         level="h3"
+        padded
       >
         <ul class="read-links">
           <li v-for="link in suspicious" :key="link.url">
