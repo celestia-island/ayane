@@ -224,9 +224,9 @@ fn store_error(e: ayane_store::StoreError) -> ApiError {
     }
 }
 
-/// `X-Admin-Token` gate for the management surface.
-///
-/// Compares in constant time so the token is not retrievable through timing.
+/// `X-Admin-Token` (or `Authorization: Bearer`) gate for the management
+/// surface. Compares in constant time so the token is not retrievable
+/// through timing.
 async fn require_admin(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -246,6 +246,14 @@ async fn require_admin(
     let provided = headers
         .get("x-admin-token")
         .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::to_owned)
+        })
         .unwrap_or_default();
     if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
         return ApiError {

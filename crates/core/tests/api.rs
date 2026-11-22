@@ -128,6 +128,34 @@ async fn management_requires_the_admin_token() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = get(&fixture.app, "/api/v1/state", Some("wrong")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Bearer form on the Authorization header must work identically.
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/state")
+                .header("authorization", "Bearer sekret")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/state")
+                .header("authorization", "Bearer wrong")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let (status, value) = get(&fixture.app, "/api/v1/state", Some("sekret")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["domains"].as_array().map(Vec::len), Some(0));

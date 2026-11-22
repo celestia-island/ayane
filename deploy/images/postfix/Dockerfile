@@ -5,14 +5,13 @@ FROM ${DEBIAN_IMAGE}
 
 RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
  && apt-get update \
- && apt-get install -y --no-install-recommends postfix postfix-pcre \
+ && apt-get install -y --no-install-recommends postfix postfix-pcre python3 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY main.cf /etc/postfix/main.cf
 COPY master.cf /etc/postfix/master.cf
 COPY subaddress.pcre /etc/postfix/subaddress.pcre
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod 755 /entrypoint.sh
+COPY entrypoint.py /entrypoint.py
 
 EXPOSE 25 587
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["python3", "/entrypoint.py"]
