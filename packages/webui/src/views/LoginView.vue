@@ -33,11 +33,12 @@ const channels: HkLoginChannel[] = [
 async function submit(_channel: string, username: string, password: string): Promise<void> {
   pending.value = true;
   try {
-    const result = await rpc.call<{ token: string }>("session.login", {
+    const result = await rpc.call<{ token: string; display_name: string }>("session.login", {
       address: username,
       password,
     });
     setSessionToken(result.token);
+    localStorage.setItem("ayane.displayName", result.display_name || "");
     router.push("/inbox");
   } catch (e) {
     toastError(e);
@@ -62,7 +63,7 @@ async function submit(_channel: string, username: string, password: string): Pro
 
 <style scoped lang="scss">
 .login-page {
-  min-height: 100%;
+  min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;

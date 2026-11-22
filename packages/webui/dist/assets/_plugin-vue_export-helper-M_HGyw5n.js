@@ -1,0 +1,1 @@
+import{n as e}from"./i18n-DUAXztrq.js";import{t}from"./useToast-D6YGRE6Q.js";var n=t();function r(t){let r=t instanceof Error?t.message:String(t);console.error(r),n.error(e(r))}function i(e){n.success(e)}var a=(e,t)=>{let n=e.__vccOpts||e;for(let[e,r]of t)n[e]=r;return n};export{r as n,i as r,a as t};
