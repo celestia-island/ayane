@@ -114,7 +114,7 @@ const dnsRows = computed(() => dns.value ?? []);
         <p class="muted admin-hint">{{ t("admin.unlockHint") }}</p>
         <HkInput v-model="adminToken" type="password" :placeholder="t('admin.token')" />
         <HkButton type="submit" :disabled="!adminToken || busy">
-          {{ t("admin.unlock") }}
+          <Save :size="14" /> {{ t("admin.unlock") }}
         </HkButton>
       </form>
     </HkSectionCard>
@@ -144,7 +144,7 @@ const dnsRows = computed(() => dns.value ?? []);
       </HkAdminTablePage>
 
       <HkSectionCard :title="t('admin.state')" :icon="Save">
-        <textarea v-model="stateText" class="hk-input admin-mono" rows="18" spellcheck="false" />
+        <HkInput v-model="stateText" type="textarea" :rows="18" :spellcheck="false" />
         <div class="admin-actions">
           <HkButton :disabled="busy" @click="saveState">{{ t("admin.save") }}</HkButton>
           <HkButton variant="ghost" :disabled="busy" @click="apply">{{ t("admin.apply") }}</HkButton>
@@ -156,8 +156,7 @@ const dnsRows = computed(() => dns.value ?? []);
 
 <style scoped>
 .admin { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-.admin-unlock form { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+.admin-unlock form { display: flex; flex-direction: column; gap: 12px; }
 .admin-hint { margin: 0; }
 .admin-actions { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
-.admin-mono { font-family: ui-monospace, monospace; font-size: 12px; }
 </style>

@@ -117,8 +117,9 @@ onMounted(async () => {
 .read-route { margin: 0; font-size: 0.85rem; }
 .read-body {
   white-space: pre-wrap;
-  background: rgb(var(--color-surface-raised, 27 34 48));
-  border: 1px solid rgb(var(--color-border, 35 42 55));
+  /* The HkCard surface grammar (card blend over the page surface). */
+  background: color-mix(in srgb, rgb(var(--color-surface)) 70%, transparent);
+  border: 1px solid rgb(var(--color-border, 35 42 55) / 60%);
   border-radius: 12px;
   padding: 16px;
 }

@@ -791,11 +791,14 @@ const TABLES: Record<Locale, Table> = {
   ru,
 };
 
+/** Chosen locales survive reloads; detection only runs on the first visit.
+ *  Declared BEFORE the `active` ref: detectLocale() reads this binding and
+ *  a module-init `const` is not hoisted (the TDZ a reload-restore once
+ *  silently fell through). */
+const LOCALE_STORAGE_KEY = "ayane-locale";
+
 /** The active locale as a ref — the reactivity root of every `t()` read. */
 const active = ref<Locale>(detectLocale());
-
-/** Chosen locales survive reloads; detection only runs on the first visit. */
-const LOCALE_STORAGE_KEY = "ayane-locale";
 
 /** Stored choice first, then the browser locale; falls back to English. */
 function detectLocale(): Locale {
