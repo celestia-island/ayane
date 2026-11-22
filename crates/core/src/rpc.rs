@@ -481,8 +481,12 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
         )
         .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
     };
+    // SASL authenticates as the LOGIN account (its password proves it);
+    // the chosen identity only becomes the envelope sender and the From
+    // header. Authenticating as the shared address would need the machine
+    // credential, which Postfix SASL does not know about.
     submission_of(&app)?
-        .send(from_address.as_str(), password, message.clone())
+        .send(session.address.as_str(), password, message.clone())
         .await
         .map_err(|e| AppError::new("Mail.SubmissionFailed", e.to_string()))?;
     // Best-effort Sent copy; a failure to append must not fail the send.
