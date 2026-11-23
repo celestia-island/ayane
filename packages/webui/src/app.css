@@ -215,11 +215,9 @@ body {
   flex-direction: column;
   gap: 0.3rem;
   min-width: 0;
-  /* The subject aligns with the SENDER CHIP's border. The chip is the
-   * head row's second child (the unread dot leads it), so the offset is
-   * that dot plus the row gap — measured, not guessed: 14.4px at the
-   * family's 8px dot + 0.4rem gap. */
-  padding-inline-start: calc(8px + 0.4rem);
+  /* NOTE: no leading inset here — padding on this container would push
+   * the sender chip along with the text and align nothing. The subject
+   * and preview take their own inset below, measured against the chip. */
   /* The ⋯ lane overlays this region's trailing edge; keep the subject
    * clear of it so a long line never runs under the button. */
   padding-inline-end: 1.5rem;
@@ -280,6 +278,15 @@ body {
     50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%,
     50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%
   );
+}
+
+/* The subject and the preview start at the SENDER CHIP's border: the chip
+ * is the head row's second child (the unread dot leads it), so the inset
+ * is that dot plus the row gap — 8px + 0.4rem, the same numbers the head
+ * row uses. */
+.ay-mail-card-subject,
+.ay-mail-card-preview {
+  margin-inline-start: calc(8px + 0.4rem);
 }
 
 /* Two lines at most: a subject is a glance, the reader is one click on. */
