@@ -247,6 +247,7 @@ dependencies = [
  "ayane-proto",
  "base64 0.22.1",
  "futures-util",
+ "imap-proto",
  "lettre",
  "mail-parser",
  "pulldown-cmark",

@@ -280,7 +280,12 @@ fn row_from_fetch(fetch: &async_imap::types::Fetch, mailbox: &str) -> Option<Env
         subject,
         seen,
         flagged,
-        preview: preview_from_head(fetch.body()),
+        // `BODY[TEXT]<0.1024>` arrives as a PARTIAL text section —
+        // `fetch.body()` only matches an unsectioned BODY[], so the head
+        // comes through `section()` with the explicit path.
+        preview: preview_from_head(fetch.section(&imap_proto::SectionPath::Full(
+            imap_proto::MessageSection::Text,
+        ))),
         date: fetch.internal_date().map(|d| d.to_rfc3339()),
     })
 }
