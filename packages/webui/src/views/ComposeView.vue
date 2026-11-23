@@ -17,7 +17,7 @@ import {
 import { rpc } from "../lib/rpc";
 import { t } from "../lib/i18n";
 import { toastError, toastSuccess } from "../lib/toast";
-import { currentIdentity } from "../lib/identity";
+import { identityParams } from "../lib/identity";
 
 interface Identity {
   address: string;
@@ -180,7 +180,7 @@ async function send(): Promise<void> {
       body: body.value,
       format: bodyMode.value === "markdown" ? "markdown" : "text",
       ...(from.value ? { from: from.value } : {}),
-      as: currentIdentity(),
+      ...identityParams(),
       ...(draftUid.value ? { draftUid: draftUid.value } : {}),
     };
     // Attachments ride base64; each file is read once before the call.
@@ -224,7 +224,7 @@ async function saveDraft(): Promise<void> {
       to: to.value,
       subject: subject.value,
       body: body.value,
-      as: currentIdentity(),
+      ...identityParams(),
     });
     toastSuccess(t("compose.draftSaved"));
   } catch (e) {

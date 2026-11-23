@@ -46,6 +46,15 @@ export function currentIdentity(): string {
   return current.value;
 }
 
+/** The `as` param for a mail call, spread into its params. Omitted until
+ *  an identity has resolved — the backend reads an absent `as` as the
+ *  personal mailbox, while a literal "" would parse as a bogus address
+ *  and fail the whole call (the roster's mount-time race). */
+export function identityParams(): { as?: string } {
+  const address = current.value;
+  return address ? { as: address } : {};
+}
+
 /** Switch the active identity; the roster/reader reload through it. */
 export function setCurrentIdentity(address: string): void {
   current.value = address;

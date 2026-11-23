@@ -8,6 +8,7 @@ import {
   HkAdminShell,
   HkAvatar,
   HkButton,
+  HkHeaderPicker,
   HkIconButton,
   HkMenu,
   HkModal,
@@ -401,20 +402,22 @@ export default defineComponent({
                 ]}
                 v-slots={{
                   // The page-owned header centre zone: the mailbox
-                  // switcher sits on the true viewport centre, like the
-                  // console's filter groups do in the chest admin.
+                  // identity picker sits on the true viewport centre —
+                  // the family's header selector (HkHeaderPicker, the
+                  // same facility the chest console's hub pickers use),
+                  // not a form select.
                   center: () =>
                     onMailSurface.value && identityOptions.value.length > 1 ? (
-                      <div class="ay-header-mailbox">
-                        <HkSelect
-                          modelValue={currentIdentity()}
-                          onUpdate:modelValue={(address: string) => {
-                            setCurrentIdentity(address);
-                          }}
-                          options={identityOptions.value}
-                          panelTitle={t("identity.switcher")}
-                        />
-                      </div>
+                      <HkHeaderPicker
+                        modelValue={currentIdentity()}
+                        onUpdate:modelValue={(address: string) => {
+                          setCurrentIdentity(address);
+                        }}
+                        options={identityOptions.value}
+                        placeholder={t("identity.switcher")}
+                        panelTitle={t("identity.switcher")}
+                        ariaLabel={t("identity.switcher")}
+                      />
                     ) : null,
                   "avatar-modal": ({
                     open,

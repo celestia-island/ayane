@@ -17,7 +17,7 @@ import ReadView from "./ReadView.vue";
 
 import { rpc } from "../lib/rpc";
 import { inboxUnread } from "../lib/mailbox";
-import { currentIdentity } from "../lib/identity";
+import { currentIdentity, identityParams } from "../lib/identity";
 import { t } from "../lib/i18n";
 import { toastError } from "../lib/toast";
 
@@ -115,7 +115,7 @@ export default defineComponent({
       try {
         const result = await rpc.call<MailboxListing>(
           folder.value === "Starred" ? "mail.listStarred" : "mail.list",
-          { mailbox: props.mailbox, limit: 50, as: currentIdentity() },
+          { mailbox: props.mailbox, limit: 50, ...identityParams() },
         );
         rows.value = result.messages;
         total.value = result.total;
@@ -131,6 +131,14 @@ export default defineComponent({
     }
     onMounted(load);
     watch(() => props.mailbox, () => void load());
+    // Switching the header's mailbox identity swaps the whole roster (and
+    // closes the open email — it belongs to the previous identity). This
+    // also self-heals the mount race: the first load may run before the
+    // identity list resolves, and the watch re-runs once it lands.
+    watch(currentIdentity, () => {
+      selected.value = null;
+      void load();
+    });
 
     function open(row: EnvelopeRow): void {
       selected.value = row;
@@ -142,7 +150,7 @@ export default defineComponent({
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
             seen: true,
-            as: currentIdentity(),
+            ...identityParams(),
           })
           .then(() => {
             refreshUnreadAfterSeen(row, true);
@@ -232,7 +240,7 @@ export default defineComponent({
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
             seen: target,
-            as: currentIdentity(),
+            ...identityParams(),
           });
           refreshUnreadAfterSeen(row, target);
           row.seen = target;
@@ -242,14 +250,14 @@ export default defineComponent({
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
             starred: target,
-            as: currentIdentity(),
+            ...identityParams(),
           });
           row.flagged = target;
         } else if (key === "trash") {
           await rpc.call("mail.trash", {
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
-            as: currentIdentity(),
+            ...identityParams(),
           });
           rows.value = rows.value.filter((r) => r.uid !== row.uid);
           total.value = Math.max(0, total.value - 1);
@@ -274,7 +282,7 @@ export default defineComponent({
         await rpc.call("mail.purge", {
           uid: row.uid,
           mailbox: row.mailbox || props.mailbox,
-          as: currentIdentity(),
+          ...identityParams(),
         });
         rows.value = rows.value.filter((r) => r.uid !== row.uid);
         total.value = Math.max(0, total.value - 1);

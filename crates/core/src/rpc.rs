@@ -341,8 +341,7 @@ async fn mail_list(app: AppState, session: Session, params: Value) -> Result<Val
         .and_then(Value::as_u64)
         .unwrap_or(50)
         .clamp(1, 200) as usize;
-    let (identity, password, _) =
-        resolve_read_identity(&app, &session, params.get("as").and_then(Value::as_str))?;
+    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
     let listing = imap_of(&app)?
         .list(identity.as_str(), password.as_str(), &mailbox, limit)
         .await
@@ -371,8 +370,7 @@ async fn mail_read(app: AppState, session: Session, params: Value) -> Result<Val
     } else {
         MarkSeen::Yes
     };
-    let (identity, password, _) =
-        resolve_read_identity(&app, &session, params.get("as").and_then(Value::as_str))?;
+    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
     let raw = imap_of(&app)?
         .fetch_raw(
             identity.as_str(),
@@ -543,7 +541,7 @@ async fn mail_save_draft(
         .unwrap_or("")
         .to_owned();
     let (identity, password, display) =
-        resolve_read_identity(&app, &session, params.get("as").and_then(Value::as_str))?;
+        resolve_read_identity(&app, &session, identity_of(&params))?;
     let message =
         ayane_mail::compose::build_draft_message(&identity, &display, &to, &subject, &body)
             .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?;
@@ -572,8 +570,7 @@ async fn mail_list_starred(
         .and_then(Value::as_u64)
         .unwrap_or(50)
         .clamp(1, 200) as usize;
-    let (identity, password, _) =
-        resolve_read_identity(&app, &session, params.get("as").and_then(Value::as_str))?;
+    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
     let rows = imap_of(&app)?
         .list_flagged(
             identity.as_str(),
@@ -592,8 +589,7 @@ async fn mail_star(app: AppState, session: Session, params: Value) -> Result<Val
     let uid = uid_of(&params)?;
     let mailbox = mailbox_of(&params, "INBOX");
     let starred = params.get("starred").and_then(Value::as_bool) != Some(false);
-    let (identity, password, _) =
-        resolve_read_identity(&app, &session, params.get("as").and_then(Value::as_str))?;
+    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
     let op = if starred {
         "+FLAGS.SILENT (\\Flagged)"
     } else {
@@ -618,8 +614,7 @@ async fn mail_trash(app: AppState, session: Session, params: Value) -> Result<Va
             "already in Trash: use mail.purge",
         ));
     }
-    let (identity, password, _) =
-        resolve_read_identity(&app, &session, params.get("as").and_then(Value::as_str))?;
+    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
     imap_of(&app)?
         .move_to_mailbox(identity.as_str(), password.as_str(), &mailbox, uid, "Trash")
         .await
@@ -632,8 +627,7 @@ async fn mail_trash(app: AppState, session: Session, params: Value) -> Result<Va
 async fn mail_purge(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
     let uid = uid_of(&params)?;
     let mailbox = mailbox_of(&params, "Trash");
-    let (identity, password, _) =
-        resolve_read_identity(&app, &session, params.get("as").and_then(Value::as_str))?;
+    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
     imap_of(&app)?
         .purge_message(identity.as_str(), password.as_str(), &mailbox, uid)
         .await
@@ -659,6 +653,17 @@ fn mailbox_of(params: &Value, fallback: &str) -> String {
         .filter(|m| !m.trim().is_empty())
         .unwrap_or(fallback)
         .to_owned()
+}
+
+/// The `as` param (the mailbox identity), treated as absent when empty:
+/// the webui forwards the header picker's value on every call, and "" is
+/// its "identity list not resolved yet" state — not a request for a
+/// mailbox named "".
+fn identity_of(params: &Value) -> Option<&str> {
+    params
+        .get("as")
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.trim().is_empty())
 }
 
 // ── send identities + templates ───────────────────────────────────────────
@@ -1201,8 +1206,7 @@ async fn mail_mark_seen(app: AppState, session: Session, params: Value) -> Resul
         .unwrap_or("INBOX")
         .to_owned();
     let unseen = params.get("seen").and_then(Value::as_bool) == Some(false);
-    let (identity, password, _) =
-        resolve_read_identity(&app, &session, params.get("as").and_then(Value::as_str))?;
+    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
     // Reuse fetch_raw with peek semantics; flag changes ride STORE via the
     // same session shape (a dedicated store call keeps this honest).
     let imap = imap_of(&app)?;
@@ -1298,4 +1302,23 @@ async fn dns_check(app: &AppState, params: &Value) -> Result<Value, AppError> {
         "checks": checks,
     }))
     .map_err(|e| AppError::new("Dns.ResolverFailed", e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An empty `as` is the webui picker's "not resolved yet" state, not
+    /// a mailbox request — it must read as absent so the mount-time race
+    /// degrades to the personal mailbox instead of a parse error.
+    #[test]
+    fn empty_identity_param_reads_as_absent() {
+        assert_eq!(identity_of(&json!({})), None);
+        assert_eq!(identity_of(&json!({ "as": "" })), None);
+        assert_eq!(identity_of(&json!({ "as": "  " })), None);
+        assert_eq!(
+            identity_of(&json!({ "as": "team@example.test" })),
+            Some("team@example.test")
+        );
+    }
 }

@@ -8,7 +8,7 @@ import { HkButton, HkSectionCard } from "@celestia-island/hikari";
 import { rpc } from "../lib/rpc";
 import { t } from "../lib/i18n";
 import { toastError } from "../lib/toast";
-import { currentIdentity } from "../lib/identity";
+import { identityParams } from "../lib/identity";
 
 interface AttachmentMeta {
   filename: string;
@@ -45,7 +45,7 @@ onMounted(async () => {
     const result = await rpc.call<{ message: ParsedMessage; links: LinkVerdict[] }>("mail.read", {
       uid: props.uid,
       mailbox: props.mailbox,
-      as: currentIdentity(),
+      ...identityParams(),
     });
     message.value = result.message;
     links.value = result.links;
