@@ -1,12 +1,12 @@
 import { computed, defineComponent, onMounted, ref, watch, type VNode } from "vue";
 
 import {
-  HkAdminTablePage,
-  HkCard,
   HkConfirmDialog,
   HkDateTag,
+  HkEmptyState,
   HkMasterDetail,
   HkMenu,
+  HkScrollContainer,
   HTable,
   useConfirm,
   type HkMenuItem,
@@ -68,11 +68,14 @@ function isToday(value: string | null): boolean {
   return !Number.isNaN(at.getTime()) && at.toDateString() === new Date().toDateString();
 }
 
-/** The standard mail roster: HkAdminTablePage (page header + count readout
- *  + scroll-progress dock) over an HkTable whose swimlanes are date groups.
+/** The standard mail console: HkMasterDetail's flush two-column form —
+ *  the roster column (quiet small-caps head + count readout over the
+ *  HkTable whose swimlanes are date groups; the column scrolls
+ *  internally, the page never does) and the reading region beside it.
  *  Rows navigate on cell-click (HkTable owns no row-click — every data
  *  cell carries the enter click, the family EdgeFleet pattern); the ⋯
- *  column carries read-flag, star, trash and (in Trash) permanent delete. */
+ *  column carries read-flag, star, trash and (in Trash) permanent
+ *  delete. */
 export default defineComponent({
   name: "InboxView",
   props: { mailbox: { type: String, required: true } },
@@ -173,9 +176,9 @@ export default defineComponent({
     );
 
     const columns = computed(() => [
-      { key: "from", title: t("mail.col.from") },
+      { key: "from", title: t("mail.col.from"), width: "6.5rem" },
       { key: "subject", title: t("mail.col.subject") },
-      { key: "date", title: t("mail.col.date"), width: "9.5rem", align: "right" as const, copyable: false },
+      { key: "date", title: t("mail.col.date"), width: "6.5rem", align: "right" as const, copyable: false },
     ]);
 
     /** Every data cell's content carries the enter click — the whole row
@@ -302,66 +305,76 @@ export default defineComponent({
           emptyTitle={t("mail.pickOne")}
           emptyDescription={t("mail.pickOneHint")}
           closeLabel={t("mail.closeDetail")}
+          listWidth="24rem"
           onClose={closeDetail}
         >
         {{
           list: () => (
             <>
-        <HkAdminTablePage
-          title={folderTitle.value}
-          rows={rows.value}
-          columns={columns.value}
-          rowKey="uid"
-          loading={loading.value}
-          error={error.value}
-          emptyTitle={folder.value === "INBOX" ? t("inbox.empty") : folderTitle.value}
-          total={total.value}
-        >
-          {{
-            body: () => (
-              <HkCard padded={false}>
-                <HTable
-                  columns={columns.value}
-                  rows={rows.value}
-                  sections={sections.value}
-                  rowKey="uid"
-                  total={total.value}
-                  manageable={true}
-                  onManage={onManage}
-                >
-                  {{
-                    "cell-from": ({ row }: { row: EnvelopeRow }) =>
-                      enterWrap(row, (
-                        <span class="ay-mail-from">
-                          <span class="ay-mail-dot" aria-hidden="true" data-unread={!row.seen || undefined} />
-                          {row.flagged && (
-                            <span class="ay-mail-star" aria-hidden="true" data-flagged="true" />
-                          )}
-                          <span class="ay-mail-from-text">{row.from || t("mail.unknownSender")}</span>
-                        </span>
-                      )),
-                    "cell-subject": ({ row }: { row: EnvelopeRow }) =>
-                      enterWrap(row, (
-                        <span class="ay-mail-subject" data-unread={!row.seen || undefined}>
-                          {row.subject || t("mail.noSubject")}
-                        </span>
-                      )),
-                    "cell-date": ({ row }: { row: EnvelopeRow }) =>
-                      enterWrap(
-                        row,
-                        <span class="ay-mail-date">
-                          <HkDateTag
-                            value={row.date ?? ""}
-                            time={isToday(row.date)}
-                          />
-                        </span>,
-                      ),
-                  }}
-                </HTable>
-              </HkCard>
-            ),
-          }}
-        </HkAdminTablePage>
+              {/* The roster column's quiet head — the page identity lives
+               * in the shell's nav; the column speaks the small-caps
+               * voice the family's console sidebars use (wowsp's replay
+               * list shape). */}
+              <div class="ay-roster-head">
+                <h2 class="ay-roster-title">{folderTitle.value}</h2>
+                {total.value > 0 && (
+                  <span class="ay-roster-count">
+                    {t("mail.totalCount").replace("{n}", String(total.value))}
+                  </span>
+                )}
+              </div>
+              <HkScrollContainer class="ay-roster-scroll">
+                <div class="ay-roster-body">
+                  {loading.value ? (
+                    <HkEmptyState loading />
+                  ) : error.value ? (
+                    <HkEmptyState title={error.value} />
+                  ) : rows.value.length === 0 ? (
+                    <HkEmptyState
+                      title={folder.value === "INBOX" ? t("inbox.empty") : folderTitle.value}
+                    />
+                  ) : (
+                    <HTable
+                      columns={columns.value}
+                      rows={rows.value}
+                      sections={sections.value}
+                      rowKey="uid"
+                      total={total.value}
+                      manageable={true}
+                      onManage={onManage}
+                    >
+                      {{
+                        "cell-from": ({ row }: { row: EnvelopeRow }) =>
+                          enterWrap(row, (
+                            <span class="ay-mail-from">
+                              <span class="ay-mail-dot" aria-hidden="true" data-unread={!row.seen || undefined} />
+                              {row.flagged && (
+                                <span class="ay-mail-star" aria-hidden="true" data-flagged="true" />
+                              )}
+                              <span class="ay-mail-from-text">{row.from || t("mail.unknownSender")}</span>
+                            </span>
+                          )),
+                        "cell-subject": ({ row }: { row: EnvelopeRow }) =>
+                          enterWrap(row, (
+                            <span class="ay-mail-subject" data-unread={!row.seen || undefined}>
+                              {row.subject || t("mail.noSubject")}
+                            </span>
+                          )),
+                        "cell-date": ({ row }: { row: EnvelopeRow }) =>
+                          enterWrap(
+                            row,
+                            <span class="ay-mail-date">
+                              <HkDateTag
+                                value={row.date ?? ""}
+                                time={isToday(row.date)}
+                              />
+                            </span>,
+                          ),
+                      }}
+                    </HTable>
+                  )}
+                </div>
+              </HkScrollContainer>
             </>
           ),
           detail: () =>

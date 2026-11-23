@@ -9,8 +9,8 @@ importers:
   packages/webui:
     dependencies:
       '@celestia-island/hikari':
-        specifier: ^0.55.462
-        version: 0.55.462(@types/three@0.185.4)(three@0.185.1)(vue@3.5.46(typescript@5.9.3))
+        specifier: ^0.55.464
+        version: 0.55.464(@types/three@0.185.4)(three@0.185.1)(vue@3.5.46(typescript@5.9.3))
       lucide-vue-next:
         specifier: ^1
         version: 1.0.0(vue@3.5.46(typescript@5.9.3))
@@ -238,8 +238,8 @@ packages:
   '@bytecodealliance/preview2-shim@0.31.1':
     resolution: {integrity: sha512-uDVB/IhExDW70TquqVx2l2Q5uwwpH7r5M2ltYccux+0YxXBm4TvqyNHTyYxcoLBsoAar28o7uZSj7GOKVx9uvA==}
 
-  '@celestia-island/hikari@0.55.462':
-    resolution: {integrity: sha512-8Vn1W6CDvTP+RvVFjWFyqxiHiE+te9wTW1ES+7pTNTiZ+fmJSd1AKwfCQ6DkYP2ihCD9nAVsIAUBlGzAZtYvBA==}
+  '@celestia-island/hikari@0.55.464':
+    resolution: {integrity: sha512-bEYHoS/xGJkPJ96X7dtBdtHegmHYnk+okSDE5bn8qjhsp/vE28j081lL8wGJOlhsubjVMqyq+dUVnlKSTUbIuQ==}
     peerDependencies:
       '@types/three': ^0.185
       pinia: ^3
@@ -1330,7 +1330,7 @@ snapshots:
     dependencies:
       '@bytecodealliance/jco-node-fs': 0.3.2
 
-  '@celestia-island/hikari@0.55.462(@types/three@0.185.4)(three@0.185.1)(vue@3.5.46(typescript@5.9.3))':
+  '@celestia-island/hikari@0.55.464(@types/three@0.185.4)(three@0.185.1)(vue@3.5.46(typescript@5.9.3))':
     dependencies:
       '@bytecodealliance/preview2-shim': 0.31.1
       '@celestia-island/tairitsu-host-client': 0.1.0

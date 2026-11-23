@@ -255,6 +255,14 @@ export default defineComponent({
         route.path.startsWith("/compose"),
     );
 
+    /** The inbox is a CONSOLE, not a document: its master-detail surface
+     *  owns the full content box (flush columns, internal scrolls), so
+     *  the shell hands it the stage host — no page scroll viewport, no
+     *  padding. Every other page keeps the document host. */
+    const contentMode = computed<"document" | "stage">(() =>
+      route.path.startsWith("/inbox") ? "stage" : "document",
+    );
+
     /** HkSelect's option model ({value,label}) — the header cascade takes
      *  the {code,label} shape, so each surface gets its own mapping. */
     const selectOptions = computed(() =>
@@ -372,7 +380,12 @@ export default defineComponent({
 
     return () => (
       <>
-        <HkAdminShell sidebarCollapsed={false} navTitle="ayane" contentKey={route.path}>
+        <HkAdminShell
+          sidebarCollapsed={false}
+          navTitle="ayane"
+          contentKey={route.path}
+          contentMode={contentMode.value}
+        >
           {{
             header: () => (
               <HkAdminHeader

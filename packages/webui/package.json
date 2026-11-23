@@ -8,7 +8,7 @@
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
-    "@celestia-island/hikari": "^0.55.462",
+    "@celestia-island/hikari": "^0.55.464",
     "lucide-vue-next": "^1",
     "vue": "^3",
     "vue-router": "^5"

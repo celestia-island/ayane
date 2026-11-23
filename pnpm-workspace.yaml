@@ -9,5 +9,5 @@ allowBuilds:
 # The family minimumReleaseAge policy auto-registered these fresh
 # publishes; keep them pinned to the audited versions.
 minimumReleaseAgeExclude:
-  - '@celestia-island/hikari@0.55.458 || 0.55.460 || 0.55.461 || 0.55.462'
+  - '@celestia-island/hikari@0.55.458 || 0.55.460 || 0.55.461 || 0.55.462 || 0.55.464'
   - "@celestia-island/tairitsu-host-client@0.1.0"

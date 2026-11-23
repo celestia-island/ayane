@@ -114,6 +114,49 @@ body {
   text-align: center;
 }
 
+/* ── Mail console: the roster column's flush chrome (the console
+   sidebars' quiet small-caps voice — the page identity lives in the
+   shell's nav, not a banner) ── */
+
+.ay-roster-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 1.1rem 1rem 0.75rem;
+  white-space: nowrap;
+}
+
+.ay-roster-title {
+  margin: 0;
+  font-size: var(--text-sm, 0.8125rem);
+  font-weight: 600;
+  color: rgb(var(--color-muted));
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ay-roster-count {
+  font-size: var(--text-xs, 0.75rem);
+  color: rgb(var(--color-muted));
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ay-roster-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.ay-roster-body {
+  /* The table breathes inside the column's track; a flush HTable (no
+   * card wrapper) keeps the rows hugging the column's own rhythm. */
+  padding: 0 0.75rem calc(0.75rem + env(safe-area-inset-bottom, 0px));
+}
+
 /* ── Mail roster rows: whole-row enter surface ── */
 
 .ay-mail-row-enter {
