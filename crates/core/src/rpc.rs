@@ -15,8 +15,11 @@ use serde_json::{json, Value};
 
 use ayane_mail::client::{Imap, MarkSeen, Submission};
 
+use kirino::auth::identity::external::ExternalIdentityStore;
+
 use crate::api::PutState;
 use crate::apply;
+use crate::auth::{self, AttemptPurpose, AuthError, IdentityLinks};
 use crate::session::{LoginError, Session, SessionStore};
 use crate::state::AppState;
 
@@ -92,12 +95,30 @@ pub async fn dispatch(
 ) -> RpcOutcome {
     match method {
         "session.ping" => RpcOutcome::Result(json!({ "ok": true })),
-        // Which sign-in channels this deployment actually offers — the
-        // login panel renders a switch only for what comes back here, so
-        // an unconfigured identity provider never shows as a dead option.
-        "session.channels" => RpcOutcome::Result(session_channels(app)),
+        // The family's login contract: the discovery document the panel
+        // renders its channels from — password plus one row per CONFIGURED
+        // provider, so an unconfigured provider never shows as a dead option.
+        "session.loginPolicy" => RpcOutcome::Result(login_policy(app)),
         "session.login" => wrap(login(app, sessions, ctx, &params)),
         "session.adminLogin" => wrap(admin_login(app, sessions, ctx, &params)),
+        // Provider sign-in: start (ticket → href), claim the callback's
+        // handoff, prove the mailbox password of a locked session.
+        "session.oauthBegin" => wrap(oauth_begin(app, sessions, ctx, &params).await),
+        "session.claimHandoff" => wrap(claim_handoff(app, sessions, ctx, &params)),
+        "session.unlockMailbox" => wrap(unlock_mailbox(app, sessions, ctx, &params)),
+        // Linked sign-ins of the authenticated mailbox.
+        "session.identities" => match session_of(sessions, ctx, &params) {
+            Ok(session) => wrap_result(list_identities(app, &session).await),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "session.unlinkIdentity" => match session_of(sessions, ctx, &params) {
+            Ok(session) => wrap_result(unlink_identity(app, &session, &params).await),
+            Err(e) => RpcOutcome::App(e),
+        },
+        "session.linkIdentity" => match session_of(sessions, ctx, &params) {
+            Ok(session) => wrap_result(link_identity(app, &session, &params).await),
+            Err(e) => RpcOutcome::App(e),
+        },
         "session.whoami" => match session_of(sessions, ctx, &params) {
             Ok(session) => {
                 let admin = sessions.is_admin(app.store.as_ref(), &session);
@@ -105,6 +126,7 @@ pub async fn dispatch(
                     "address": session.address.as_str(),
                     "display_name": session.display_name,
                     "admin": admin,
+                    "needs_mailbox_password": session.needs_mailbox_password,
                 }))
             }
             Err(e) => RpcOutcome::App(e),
@@ -214,6 +236,14 @@ where
         Ok(session) => session,
         Err(e) => return RpcOutcome::App(e),
     };
+    // MUT:mail-locked — a provider-minted session owes the mailbox password;
+    // nothing that opens the mailbox may run before it is proven.
+    if session.mailbox_locked() {
+        return RpcOutcome::App(AppError::new(
+            "Session.MailboxLocked",
+            "the mailbox is locked: enter the mailbox password",
+        ));
+    }
     if session.password.is_none() {
         return RpcOutcome::App(AppError::new(
             "Session.Required",
@@ -223,26 +253,204 @@ where
     wrap_result(method(app.clone(), session, params.clone()).await)
 }
 
-/// The sign-in channels this deployment offers. Credentials are always
-/// available; a third-party identity provider joins the list only once its
-/// client is configured (none is wired yet — the OAuth lane is a follow-up),
-/// which is exactly the "unconfigured → never advertised" contract the login
-/// panel relies on to avoid a dead switch.
-fn session_channels(app: &AppState) -> Value {
-    let mut channels = vec![json!({ "key": "credentials", "mode": "credentials" })];
-    if let Some((key, label)) = configured_oauth_provider(app) {
-        channels.push(json!({ "key": key, "mode": "sso", "label": label }));
-    }
-    json!({ "channels": channels })
+/// `session.loginPolicy` — the discovery document, the same value
+/// `GET /api/auth/login-methods` serves.
+fn login_policy(app: &AppState) -> Value {
+    serde_json::to_value(app.auth.catalog.login_policy()).unwrap_or(Value::Null)
 }
 
-/// The configured third-party identity provider, when one exists.
+/// `session.oauthBegin {provider, returnTo?}`: start a provider sign-in and
+/// answer the same-origin `href` the browser navigates to.
 ///
-/// An OAuth client is usable only with BOTH an id and a secret (a
-/// half-configured pair would render a row that cannot complete). Nothing is
-/// wired today, so this answers `None` and the panel stays credentials-only.
-fn configured_oauth_provider(_app: &AppState) -> Option<(String, String)> {
-    None
+/// A live session (the account page) LINKS the identity to its mailbox;
+/// without one (the login page, which passes an explicit `token: null`)
+/// the sign-in LOGS IN and lands on `returnTo` — sanitised to a
+/// same-origin path; a foreign address is dropped, never forwarded.
+async fn oauth_begin(
+    app: &AppState,
+    sessions: &SessionStore,
+    ctx: &mut WsContext,
+    params: &Value,
+) -> Result<Value, AppError> {
+    let provider = required(params, "provider")?;
+    let purpose = match session_of(sessions, ctx, params) {
+        Ok(session) => AttemptPurpose::Link {
+            address: session.address.clone(),
+        },
+        Err(_) => AttemptPurpose::Login {
+            return_to: auth::safe_return_to(
+                &app.auth.catalog,
+                params.get("returnTo").and_then(Value::as_str),
+            ),
+        },
+    };
+    let href = auth::begin(app, &provider, purpose)
+        .await
+        .map_err(|e| oauth_error(&provider, e))?;
+    Ok(json!({ "href": href }))
+}
+
+/// `session.linkIdentity {provider}` (authenticated only): start a link
+/// sign-in for the session's mailbox; answers the `href` to navigate to.
+async fn link_identity(
+    app: &AppState,
+    session: &Session,
+    params: &Value,
+) -> Result<Value, AppError> {
+    let provider = required(params, "provider")?;
+    let href = auth::begin(
+        app,
+        &provider,
+        AttemptPurpose::Link {
+            address: session.address.clone(),
+        },
+    )
+    .await
+    .map_err(|e| oauth_error(&provider, e))?;
+    Ok(json!({ "href": href }))
+}
+
+/// The application error of a sign-in that could not start.
+fn oauth_error(provider: &str, e: AuthError) -> AppError {
+    match e {
+        AuthError::UnknownProvider(_) => AppError::new(
+            "Session.OAuthProviderUnknown",
+            format!("provider {provider} is not offered here"),
+        ),
+        AuthError::NotConfigured => AppError::new(
+            "Session.OAuthUnavailable",
+            "provider sign-in is not configured on this deployment",
+        ),
+        other => AppError::new("Session.OAuthFailed", other.to_string()),
+    }
+}
+
+/// `session.claimHandoff {code}` — redeem, exactly once, the sign-in the
+/// callback parked. Same shape as `session.login`, plus
+/// `needs_mailbox_password` (the verify card follows) and `return_to`.
+fn claim_handoff(
+    app: &AppState,
+    sessions: &SessionStore,
+    ctx: &mut WsContext,
+    params: &Value,
+) -> Result<Value, AppError> {
+    let code = required(params, "code")?;
+    // MUT:handoff-one-time — a spent or unknown code mints nothing.
+    let handoff = app.auth.attempts.take_handoff(&code).ok_or_else(|| {
+        AppError::new(
+            "Session.HandoffInvalid",
+            "the sign-in handoff is unknown, spent or expired",
+        )
+    })?;
+    let admin = handoff.admin;
+    let (token, session) = sessions
+        .mint_provider(
+            handoff.address,
+            handoff.display_name,
+            admin,
+            handoff.credential,
+        )
+        .map_err(|_| AppError::new("Session.InvalidCredentials", "session could not be minted"))?;
+    ctx.token = Some(token.clone());
+    Ok(json!({
+        "token": token,
+        "address": session.address.as_str(),
+        "display_name": session.display_name,
+        "admin": admin,
+        "needs_mailbox_password": session.needs_mailbox_password,
+        "return_to": handoff.return_to,
+    }))
+}
+
+/// `session.unlockMailbox {password}` — prove the mailbox password of a
+/// locked (provider-minted) session; wrong passwords are refused and leave
+/// it locked.
+fn unlock_mailbox(
+    app: &AppState,
+    sessions: &SessionStore,
+    ctx: &mut WsContext,
+    params: &Value,
+) -> Result<Value, AppError> {
+    let password = required(params, "password")?;
+    let session = session_of(sessions, ctx, params)?;
+    let token = ctx.token.clone().expect("set by session_of");
+    match sessions.unlock_mailbox(app.store.as_ref(), &token, &password) {
+        Ok(()) => Ok(json!({
+            "ok": true,
+            "address": session.address.as_str(),
+            "display_name": session.display_name,
+            "admin": session.admin,
+        })),
+        Err(LoginError::NotLocked) => Err(AppError::new(
+            "Session.MailboxNotLocked",
+            "this session owes no mailbox password",
+        )),
+        Err(LoginError::UnknownAccount | LoginError::InvalidCredentials) => Err(AppError::new(
+            "Session.InvalidCredentials",
+            "mailbox password is wrong",
+        )),
+    }
+}
+
+/// The live account id behind a session, or the error that ends the call.
+fn account_id_of(
+    app: &AppState,
+    session: &Session,
+) -> Result<(IdentityLinks, uuid::Uuid), AppError> {
+    let links = IdentityLinks::new(app.store.clone());
+    let user_id = links
+        .account_id_of(&session.address)
+        .map_err(|_| AppError::new("Session.AccountMissing", "this mailbox no longer exists"))?;
+    Ok((links, user_id))
+}
+
+/// `session.identities` — the sign-ins linked to the authenticated mailbox.
+async fn list_identities(app: &AppState, session: &Session) -> Result<Value, AppError> {
+    let (links, user_id) = account_id_of(app, session)?;
+    let listed = links
+        .list_for_user(user_id)
+        .await
+        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
+    let identities: Vec<Value> = listed
+        .iter()
+        .map(|link| {
+            json!({
+                "provider": link.identity.provider,
+                "subject": link.identity.subject,
+                "created_at": link.created_at,
+                "last_login_at": link.last_login_at,
+            })
+        })
+        .collect();
+    Ok(json!({ "identities": identities }))
+}
+
+/// `session.unlinkIdentity {provider}` — remove one linked sign-in from
+/// the authenticated mailbox. Always allowed for the owner: an own-domain
+/// account keeps its password whatever is linked.
+async fn unlink_identity(
+    app: &AppState,
+    session: &Session,
+    params: &Value,
+) -> Result<Value, AppError> {
+    let provider = required(params, "provider")?;
+    let (links, user_id) = account_id_of(app, session)?;
+    let store_failed = |e: anyhow::Error| AppError::new("Admin.StoreFailed", e.to_string());
+    let listed = links.list_for_user(user_id).await.map_err(store_failed)?;
+    let Some(link) = listed
+        .iter()
+        .find(|link| link.identity.provider == provider)
+    else {
+        return Err(AppError::new(
+            "Session.IdentityUnknown",
+            "that provider is not linked to this mailbox",
+        ));
+    };
+    let removed = links
+        .unlink(&link.identity, user_id)
+        .await
+        .map_err(store_failed)?;
+    Ok(json!({ "ok": true, "removed": removed }))
 }
 
 fn login(
@@ -263,7 +471,9 @@ fn login(
                 "admin": session.admin,
             }))
         }
-        Err(LoginError::UnknownAccount | LoginError::InvalidCredentials) => Err(AppError::new(
+        Err(
+            LoginError::UnknownAccount | LoginError::InvalidCredentials | LoginError::NotLocked,
+        ) => Err(AppError::new(
             "Session.InvalidCredentials",
             "address or password is wrong",
         )),
@@ -1073,6 +1283,12 @@ async fn audit_run(
     // The session reading the mail: audit runs under the admin session that
     // called it (their INBOX is the surface being audited).
     let session = session_of(sessions, ctx, &params)?;
+    if session.mailbox_locked() {
+        return Err(AppError::new(
+            "Session.MailboxLocked",
+            "the mailbox is locked: enter the mailbox password",
+        ));
+    }
     let password = session.password.as_deref().ok_or_else(|| {
         AppError::new(
             "Session.Required",

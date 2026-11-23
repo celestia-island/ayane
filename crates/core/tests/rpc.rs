@@ -45,6 +45,7 @@ async fn surface(tag: &str) -> (RpcSurface, PathBuf) {
             ..Default::default()
         },
         password_hashes: hashes,
+        external_identities: Vec::new(),
     };
     store.save(&stored).expect("seed");
     let config = ayane::config::Config {
@@ -65,6 +66,7 @@ async fn surface(tag: &str) -> (RpcSurface, PathBuf) {
             root.join("docker-compose.yml"),
         )),
         config: Arc::new(config),
+        auth: Arc::new(ayane::auth::AuthState::local()),
     };
     let surface = RpcSurface {
         app,

@@ -45,6 +45,7 @@ fn fixture(tag: &str, token: Option<&str>) -> Fixture {
         store: Arc::new(store),
         driver: Arc::new(driver),
         config: Arc::new(config),
+        auth: Arc::new(ayane::auth::AuthState::local()),
     });
     Fixture {
         app,

@@ -114,6 +114,9 @@ pub fn router(state: AppState) -> Router {
         .route("/apply", post(post_apply));
     Router::new()
         .route("/api/health", get(health))
+        // The family login contract's browser face: the discovery document
+        // and the provider sign-in routes (same origin, beside health).
+        .merge(crate::auth::router())
         .fallback(crate::webui::serve)
         .nest(
             "/api/v1",
@@ -203,6 +206,12 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
     if mcp.token == crate::rpc::REDACTED_SENTINEL {
         mcp.token = keep_mcp_token;
     }
+    let ack = PutStateAck {
+        domains: body.domains.len(),
+        accounts: body.accounts.len(),
+        aliases: body.aliases.len(),
+        shared: body.shared.len(),
+    };
     let mut desired = DesiredState {
         domains: body.domains,
         accounts: Vec::with_capacity(body.accounts.len()),
@@ -258,14 +267,45 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
     let stored = StoredState {
         desired,
         password_hashes,
+        external_identities: Vec::new(),
     };
-    app.store.save(&stored).map_err(store_error)?;
+    replace_state(app.store.as_ref(), stored).map_err(store_error)?;
 
-    Ok(PutStateAck {
-        domains: stored.desired.domains.len(),
-        accounts: stored.desired.accounts.len(),
-        aliases: stored.desired.aliases.len(),
-        shared: stored.desired.shared.len(),
+    Ok(ack)
+}
+
+/// Replace the whole snapshot, keeping the external identities of every
+/// account that survives the replacement.
+///
+/// A link is keyed by address (an account's id is minted afresh here), so
+/// it follows the address. A link whose account the replacement drops is
+/// dropped with it — it must not revive if the address is ever created
+/// again. The keep-and-replace runs as one locked step
+/// ([`StateStore::update`]): a link made while the replacement is being
+/// built is not lost to it.
+///
+/// # Errors
+///
+/// [`ayane_store::StoreError`] when the backend or the codec fails.
+pub fn replace_state(
+    store: &dyn ayane_store::StateStore,
+    next: StoredState,
+) -> Result<(), ayane_store::StoreError> {
+    store.update(&mut |current| {
+        let mut next = next.clone();
+        next.external_identities = current
+            .external_identities
+            .iter()
+            .filter(|link| {
+                next.desired
+                    .accounts
+                    .iter()
+                    .any(|account| account.address == link.address)
+            })
+            .cloned()
+            .collect();
+        *current = next;
+        Ok(())
     })
 }
 

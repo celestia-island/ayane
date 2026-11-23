@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use ayane_proto::{Address, DesiredState};
+use chrono::{DateTime, Utc};
 use lacrymira::{Command, KvOp, Reply, Value};
 use lacrymira_redb::RedbStore;
 
@@ -28,6 +29,40 @@ pub enum StoreError {
     /// The snapshot could not be encoded or decoded.
     #[error("snapshot codec: {0}")]
     Codec(String),
+    /// A mutation was refused by a rule on the snapshot (the store keeps
+    /// the check and the write in one locked step, so the rule lives here).
+    #[error("snapshot rule: {0}")]
+    Rejected(String),
+}
+
+/// One third-party identity linked to an own-domain mailbox.
+///
+/// The link is keyed by the provider's **subject** (its opaque, stable
+/// account id) — never by an email address, which changes, is reassigned
+/// and collides across realms. The mailbox side is the account's address:
+/// the address is what stays stable in ayane (an account's `id` is minted
+/// afresh by every whole-state replacement), and the account is always an
+/// own-domain one, since ayane only administers its own domains.
+///
+/// No field is ever skipped on the wire: the snapshot is msgpack with
+/// positional structs, so an omitted field would shift every field after
+/// it. Absent values travel as `None`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExternalLink {
+    /// The host's provider id as it names it (`github`, `google`).
+    pub provider: String,
+    /// The issuer URL for URL-addressed providers; `None` for opaque ones.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// The provider's stable subject for this account.
+    pub subject: String,
+    /// The linked account.
+    pub address: Address,
+    /// When the link was created.
+    pub created_at: DateTime<Utc>,
+    /// The last sign-in that arrived through this link, if any was recorded.
+    #[serde(default)]
+    pub last_login_at: Option<DateTime<Utc>>,
 }
 
 /// Everything the control plane persists.
@@ -42,6 +77,10 @@ pub struct StoredState {
     pub desired: DesiredState,
     /// Dovecot-format password hashes keyed by account address.
     pub password_hashes: HashMap<String, String>,
+    /// Third-party identities linked to accounts ([`ExternalLink`]). Absent
+    /// on snapshots written before federated sign-in: an empty list.
+    #[serde(default)]
+    pub external_identities: Vec<ExternalLink>,
 }
 
 /// One user-owned compose template.
@@ -77,6 +116,28 @@ impl StoredState {
             .get(address.as_str())
             .map(String::as_str)
     }
+
+    /// The credential a provider sign-in opens `address` with, when the
+    /// server holds one for it.
+    ///
+    /// # Product rule (2026-11-24)
+    ///
+    /// ayane controls only its own mail domains. A foreign mailbox is at
+    /// most signed in to *on behalf of* its owner and used as a forwarding
+    /// node, whose credentials and some records are **cached on the
+    /// server** — a user never re-enters the password of an already
+    /// registered foreign mailbox after signing in. Such an account signs
+    /// in through its provider and the session is minted with the cached
+    /// credential directly, with no mailbox-password step.
+    ///
+    /// Returns `None` today: the account model has no cached-credential
+    /// node yet. It is the single hook a future "forwarding node" account
+    /// kind fills in; the session minting already branches on it.
+    #[must_use]
+    pub fn cached_credential(&self, address: &Address) -> Option<String> {
+        let _ = address;
+        None
+    }
 }
 
 /// Persistent storage for [`StoredState`].
@@ -94,6 +155,25 @@ pub trait StateStore: Send + Sync {
     ///
     /// Returns [`StoreError`] when the backend or the codec fails.
     fn save(&self, state: &StoredState) -> Result<(), StoreError>;
+
+    /// Read-modify-write the snapshot under the store's write lock.
+    ///
+    /// `edit` runs exactly once, with the lock held, on the **latest**
+    /// saved snapshot; when it returns `Ok` the result is saved before the
+    /// lock is released, so two concurrent edits cannot overwrite each
+    /// other's change (last-write-drops-the-other was a real race). An
+    /// `Err` leaves the stored snapshot untouched. A rule that must hold
+    /// for the written state belongs inside `edit` — that is what makes
+    /// the check and the write one step.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Rejected`] (or any other variant) from `edit`, or a
+    /// backend/codec failure.
+    fn update(
+        &self,
+        edit: &mut dyn FnMut(&mut StoredState) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
 
     /// List the compose templates owned by `owner` (name order).
     ///
@@ -143,6 +223,10 @@ pub struct RedbStateStore {
     /// owner saves atomic against each other (last-write-drops-the-other
     /// was a real race with two owners saving at once).
     templates_lock: std::sync::Mutex<()>,
+    /// The same discipline for the state snapshot: every locked
+    /// read-modify-write ([`StateStore::update`]) runs under this lock, so
+    /// two edits (a link, a whole-state replacement) see each other.
+    state_lock: std::sync::Mutex<()>,
 }
 
 impl RedbStateStore {
@@ -159,6 +243,7 @@ impl RedbStateStore {
         Ok(Self {
             inner: RedbStore::open(path).map_err(|e| StoreError::Backend(e.to_string()))?,
             templates_lock: std::sync::Mutex::new(()),
+            state_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -278,6 +363,20 @@ impl StateStore for RedbStateStore {
 
     fn save(&self, state: &StoredState) -> Result<(), StoreError> {
         self.execute_set(state)
+    }
+
+    fn update(
+        &self,
+        edit: &mut dyn FnMut(&mut StoredState) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        // One lock spans load → edit → save: the edit sees the latest
+        // snapshot and nothing can slip in between the check it makes and
+        // the write it performs. The closure must not call back into the
+        // store (the lock is not reentrant).
+        let _guard = self.state_lock.lock().expect("state mutex");
+        let mut current = self.load()?;
+        edit(&mut current)?;
+        self.execute_set(&current)
     }
 
     fn list_templates(&self, owner: &str) -> Result<Vec<Template>, StoreError> {
@@ -401,6 +500,7 @@ mod tests {
                 mcp: Default::default(),
             },
             password_hashes: hashes,
+            external_identities: Vec::new(),
         }
     }
 
@@ -434,6 +534,136 @@ mod tests {
         let state = StoredState::empty();
         let address = Address::parse("nobody@example.test").expect("address");
         assert!(state.password_hash(&address).is_none());
+    }
+
+    /// A link row for the identity tests.
+    fn link(subject: &str, address: &str) -> ExternalLink {
+        ExternalLink {
+            provider: "example-idp".to_owned(),
+            issuer: None,
+            subject: subject.to_owned(),
+            address: Address::parse(address).expect("address"),
+            created_at: Utc::now(),
+            last_login_at: None,
+        }
+    }
+
+    #[test]
+    fn a_snapshot_written_before_links_existed_still_loads() {
+        // The field is absent on every snapshot the store wrote before
+        // federated sign-in: it must read as "no links", never as a codec
+        // error that would take the whole control plane down on upgrade.
+        let path = temp_path("legacy").join("state.redb");
+        let store = RedbStateStore::open(&path).expect("open");
+        // The shape the store wrote before the field existed: the two
+        // fields it had, encoded the same way.
+        #[derive(serde::Serialize)]
+        struct Legacy<'a> {
+            desired: &'a DesiredState,
+            password_hashes: &'a HashMap<String, String>,
+        }
+        let current = sample();
+        let bytes = rmp_serde::to_vec(&Legacy {
+            desired: &current.desired,
+            password_hashes: &current.password_hashes,
+        })
+        .expect("msgpack");
+        let reply = store
+            .inner
+            .execute(&Command::Kv {
+                namespace: "ayane".to_owned(),
+                op: KvOp::Set {
+                    key: Value::Text(STATE_KEY.to_owned()),
+                    value: Value::Bytes(bytes),
+                },
+            })
+            .expect("set");
+        assert!(matches!(reply, Reply::Unit));
+        let loaded = store.load().expect("legacy snapshot loads");
+        assert!(loaded.external_identities.is_empty());
+        assert_eq!(loaded.desired.accounts.len(), 1);
+    }
+
+    #[test]
+    fn links_roundtrip_through_the_snapshot() {
+        let path = temp_path("links").join("state.redb");
+        let store = RedbStateStore::open(&path).expect("open");
+        let mut state = sample();
+        state
+            .external_identities
+            .push(link("sub-1", "alice@example.test"));
+        store.save(&state).expect("save");
+        let loaded = store.load().expect("load");
+        assert_eq!(loaded.external_identities.len(), 1);
+        assert_eq!(loaded.external_identities[0].subject, "sub-1");
+        assert_eq!(
+            loaded.external_identities[0].address.to_string(),
+            "alice@example.test"
+        );
+    }
+
+    #[test]
+    fn a_rejected_edit_leaves_the_stored_snapshot_untouched() {
+        let path = temp_path("rejected").join("state.redb");
+        let store = RedbStateStore::open(&path).expect("open");
+        store.save(&sample()).expect("save");
+        let refused = store.update(&mut |state| {
+            state
+                .external_identities
+                .push(link("sub-1", "alice@example.test"));
+            Err(StoreError::Rejected("identity taken".to_owned()))
+        });
+        assert!(matches!(refused, Err(StoreError::Rejected(_))));
+        assert!(store.load().expect("load").external_identities.is_empty());
+        // The lock is released after a rejected edit: the next one runs.
+        store
+            .update(&mut |state| {
+                state
+                    .external_identities
+                    .push(link("sub-1", "alice@example.test"));
+                Ok(())
+            })
+            .expect("second edit");
+        assert_eq!(store.load().expect("load").external_identities.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_edits_never_lose_one_another() {
+        // MUT:locked-read-modify-write — every locked edit sees the result
+        // of the edits before it; an unlocked load→save here would drop
+        // pushes and leave fewer rows than threads.
+        let path = temp_path("concurrent").join("state.redb");
+        let store = std::sync::Arc::new(RedbStateStore::open(&path).expect("open"));
+        store.save(&sample()).expect("save");
+        let threads: Vec<_> = (0..16)
+            .map(|index| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .update(&mut |state| {
+                            state
+                                .external_identities
+                                .push(link(&format!("sub-{index}"), "alice@example.test"));
+                            Ok(())
+                        })
+                        .expect("edit");
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("thread");
+        }
+        assert_eq!(store.load().expect("load").external_identities.len(), 16);
+    }
+
+    #[test]
+    fn no_account_has_a_cached_credential_yet() {
+        // The forwarding-node account kind does not exist yet; until it
+        // does, every provider sign-in goes through the mailbox password.
+        let state = sample();
+        assert!(state
+            .cached_credential(&Address::parse("alice@example.test").expect("address"))
+            .is_none());
     }
 
     #[test]

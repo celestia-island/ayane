@@ -1,9 +1,12 @@
 //! Account sessions for the webmail surface.
 //!
 //! A session is a random bearer token minted after the mailbox password
-//! verifies against the store's hash. Tokens live in memory only: a service
-//! restart logs everyone out, which is the right trade for a test-stage
-//! deployment (nothing persistent to leak, nothing to revoke out-of-band).
+//! verifies against the store's hash — or after a provider proved the
+//! visitor's identity and that identity is linked to a mailbox. A
+//! provider-minted session for an own-domain account starts **locked**
+//! ([`Session::needs_mailbox_password`]): the provider said nothing about
+//! the mailbox, so the password is proven once on the verify card before
+//! any mail is read.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,6 +28,9 @@ pub enum LoginError {
     /// The password did not verify.
     #[error("invalid credentials")]
     InvalidCredentials,
+    /// The session's mailbox is not locked, so there is nothing to unlock.
+    #[error("the mailbox is not locked")]
+    NotLocked,
 }
 
 /// One live session.
@@ -40,8 +46,21 @@ pub struct Session {
     /// admin sessions). Lives in memory and in the 0600 sessions file
     /// only — never logged, never sent back to any client.
     pub password: Option<String>,
+    /// Set while a provider-minted session still owes the mailbox password
+    /// (an own-domain account without a cached credential): `password` is
+    /// `None` and every mail method refuses with `Session.MailboxLocked`
+    /// until [`SessionStore::unlock_mailbox`] verifies it once.
+    pub needs_mailbox_password: bool,
     /// When the session expires.
     pub expires: Instant,
+}
+
+impl Session {
+    /// Whether mail must refuse this session until the mailbox is unlocked.
+    #[must_use]
+    pub fn mailbox_locked(&self) -> bool {
+        self.needs_mailbox_password
+    }
 }
 
 /// The on-disk mirror of one live session (sessions.json, 0600).
@@ -50,7 +69,11 @@ struct PersistedSession {
     address: Address,
     display_name: String,
     admin: bool,
+    #[serde(default)]
     password: Option<String>,
+    /// Absent on files written before provider sign-in: never locked.
+    #[serde(default)]
+    needs_mailbox_password: bool,
     /// Seconds remaining at save time; re-armed as an absolute instant
     /// on load.
     expires_in: u64,
@@ -110,6 +133,7 @@ impl SessionStore {
                     display_name: record.display_name,
                     admin: record.admin,
                     password: record.password,
+                    needs_mailbox_password: record.needs_mailbox_password,
                     expires,
                 },
             );
@@ -133,6 +157,7 @@ impl SessionStore {
                         display_name: s.display_name.clone(),
                         admin: s.admin,
                         password: s.password.clone(),
+                        needs_mailbox_password: s.needs_mailbox_password,
                         expires_in: s.expires.duration_since(now).as_secs(),
                     },
                 )
@@ -186,7 +211,82 @@ impl SessionStore {
         // the admin session, so the webmail never asks for a second
         // credential.
         let admin = account.is_some_and(|account| account.admin);
-        self.mint(address, display_name, admin, Some(password_raw.to_owned()))
+        self.mint(
+            address,
+            display_name,
+            admin,
+            Some(password_raw.to_owned()),
+            false,
+        )
+    }
+
+    /// Mint a session after a provider proved the visitor's identity.
+    ///
+    /// `cached_credential` is what the account opens its mailbox with when
+    /// the server holds one (a forwarding-node account, see
+    /// [`ayane_store::StoredState::cached_credential`]): such a session is
+    /// complete at once — a user never re-enters the password of an
+    /// already-registered foreign mailbox. `None` means an own-domain
+    /// account: the session starts locked and the SPA asks for the mailbox
+    /// password once ([`Self::unlock_mailbox`]).
+    ///
+    /// # Errors
+    ///
+    /// [`LoginError::InvalidCredentials`] when the token entropy fails.
+    pub fn mint_provider(
+        &self,
+        address: Address,
+        display_name: String,
+        admin: bool,
+        cached_credential: Option<String>,
+    ) -> Result<(String, Session), LoginError> {
+        let locked = cached_credential.is_none();
+        self.mint(address, display_name, admin, cached_credential, locked)
+    }
+
+    /// Prove the mailbox password of a locked session and unlock it.
+    ///
+    /// Verifies against the store's hash (the server never keeps the
+    /// plaintext), then sets the session's password and clears the lock
+    /// for the rest of the session's lifetime.
+    ///
+    /// # Errors
+    ///
+    /// [`LoginError::NotLocked`] when the session owes no password,
+    /// [`LoginError::InvalidCredentials`] when the token is unknown,
+    /// expired, or the password does not match.
+    pub fn unlock_mailbox(
+        &self,
+        store: &dyn StateStore,
+        token: &str,
+        password_raw: &str,
+    ) -> Result<(), LoginError> {
+        let session = {
+            let mut inner = self.inner.lock().expect("sessions mutex");
+            inner.retain(|_, session| session.expires > Instant::now());
+            inner
+                .get(token)
+                .cloned()
+                .ok_or(LoginError::InvalidCredentials)?
+        };
+        if !session.needs_mailbox_password {
+            return Err(LoginError::NotLocked);
+        }
+        let stored = store.load().map_err(|_| LoginError::UnknownAccount)?;
+        let hash = stored
+            .password_hash(&session.address)
+            .ok_or(LoginError::UnknownAccount)?;
+        password::verify_password(password_raw, hash)
+            .map_err(|_| LoginError::InvalidCredentials)?;
+        // MUT:unlock-verify-then-clear — the lock clears only after the
+        // hash verified; a wrong password leaves the session locked.
+        let mut inner = self.inner.lock().expect("sessions mutex");
+        let session = inner.get_mut(token).ok_or(LoginError::InvalidCredentials)?;
+        session.password = Some(password_raw.to_owned());
+        session.needs_mailbox_password = false;
+        drop(inner);
+        self.persist();
+        Ok(())
     }
 
     /// Mint an admin session after the admin token matched.
@@ -208,6 +308,7 @@ impl SessionStore {
             "Administrator".to_owned(),
             true,
             None,
+            false,
         )
     }
 
@@ -234,7 +335,10 @@ impl SessionStore {
     /// token override keep their grant (there is no account behind them).
     #[must_use]
     pub fn is_admin(&self, store: &dyn StateStore, session: &Session) -> bool {
-        if session.admin && session.password.is_none() {
+        // The no-password marker of a token-override session is not a
+        // locked provider session: that one owes its password and must
+        // re-earn admin through the live table like any account session.
+        if session.admin && session.password.is_none() && !session.needs_mailbox_password {
             return true;
         }
         store.load().is_ok_and(|stored| {
@@ -251,13 +355,13 @@ impl SessionStore {
         self.inner.lock().expect("sessions mutex").remove(token);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn mint(
         &self,
         address: Address,
         display_name: String,
         admin: bool,
         password: Option<String>,
+        needs_mailbox_password: bool,
     ) -> Result<(String, Session), LoginError> {
         let mut raw = [0u8; 32];
         getrandom::fill(&mut raw).map_err(|_| LoginError::InvalidCredentials)?;
@@ -267,6 +371,7 @@ impl SessionStore {
             display_name,
             admin,
             password,
+            needs_mailbox_password,
             expires: Instant::now() + SESSION_TTL,
         };
         self.inner
@@ -351,6 +456,38 @@ mod tests {
                 ..Default::default()
             },
             password_hashes: hashes,
+            external_identities: Vec::new(),
+        };
+        store.save(&stored).expect("save");
+        store
+    }
+
+    /// A store whose one account has a REAL hash, so a password verifies.
+    fn store_with_password(address: &str, password: &str) -> RedbStateStore {
+        let dir = std::env::temp_dir().join(format!("ayane-session-{}", uuid::Uuid::new_v4()));
+        let store = RedbStateStore::open(dir.join("state.redb")).expect("open");
+        let address = Address::parse(address).expect("addr");
+        let stored = StoredState {
+            desired: DesiredState {
+                domains: vec![MailDomain {
+                    name: "example.test".to_owned(),
+                    catch_all: None,
+                    enabled: true,
+                }],
+                accounts: vec![Account {
+                    id: uuid::Uuid::new_v4(),
+                    address: address.clone(),
+                    display_name: "Test".to_owned(),
+                    quota_bytes: 0,
+                    admin: false,
+                }],
+                ..Default::default()
+            },
+            password_hashes: HashMap::from([(
+                address.to_string(),
+                password::hash_password(password).expect("hash"),
+            )]),
+            external_identities: Vec::new(),
         };
         store.save(&stored).expect("save");
         store
@@ -398,6 +535,7 @@ mod tests {
                 ..Default::default()
             },
             password_hashes: HashMap::new(),
+            external_identities: Vec::new(),
         };
         store.save(&stored).expect("save");
         assert!(resolve_bare_local(&store, "test").is_none());
@@ -408,5 +546,133 @@ mod tests {
         let store = store_with(&["test@example.test"]);
         assert!(resolve_bare_local(&store, "test@example.test").is_none());
         assert!(resolve_bare_local(&store, "").is_none());
+    }
+
+    #[test]
+    fn a_provider_session_without_a_credential_starts_locked() {
+        let _store = store_with_password("test@example.test", "correct-horse-battery");
+        let sessions = SessionStore::new();
+        let (token, session) = sessions
+            .mint_provider(
+                Address::parse("test@example.test").expect("addr"),
+                "Test".to_owned(),
+                false,
+                None,
+            )
+            .expect("mint");
+        // MUT:provider-session-locked — the provider proved the identity,
+        // not the mailbox: the password is owed and mail must refuse.
+        assert!(session.needs_mailbox_password);
+        assert!(session.mailbox_locked());
+        assert!(session.password.is_none());
+        let _ = token;
+    }
+
+    #[test]
+    fn a_cached_credential_mints_an_unlocked_session() {
+        // The forwarding-node shape: the server holds the credential, so
+        // the user is never asked for the password again.
+        let sessions = SessionStore::new();
+        let (_, session) = sessions
+            .mint_provider(
+                Address::parse("node@example.test").expect("addr"),
+                "Node".to_owned(),
+                false,
+                Some("cached-credential".to_owned()),
+            )
+            .expect("mint");
+        assert!(!session.needs_mailbox_password);
+        assert_eq!(session.password.as_deref(), Some("cached-credential"));
+    }
+
+    #[test]
+    fn unlock_refuses_a_wrong_password_and_clears_the_lock_on_the_right_one() {
+        let store = store_with_password("test@example.test", "correct-horse-battery");
+        let sessions = SessionStore::new();
+        let (token, _) = sessions
+            .mint_provider(
+                Address::parse("test@example.test").expect("addr"),
+                "Test".to_owned(),
+                false,
+                None,
+            )
+            .expect("mint");
+        // MUT:unlock-wrong-password — a wrong password never unlocks.
+        assert!(matches!(
+            sessions.unlock_mailbox(&store, &token, "wrong"),
+            Err(LoginError::InvalidCredentials)
+        ));
+        let still = sessions.resolve(&token).expect("live");
+        assert!(still.needs_mailbox_password);
+        assert!(still.password.is_none());
+        // An unknown token is refused the same way.
+        assert!(matches!(
+            sessions.unlock_mailbox(&store, "no-such-token", "correct-horse-battery"),
+            Err(LoginError::InvalidCredentials)
+        ));
+        sessions
+            .unlock_mailbox(&store, &token, "correct-horse-battery")
+            .expect("unlock");
+        let unlocked = sessions.resolve(&token).expect("live");
+        assert!(!unlocked.needs_mailbox_password);
+        assert_eq!(unlocked.password.as_deref(), Some("correct-horse-battery"));
+        // Unlocked, there is nothing left to unlock.
+        assert!(matches!(
+            sessions.unlock_mailbox(&store, &token, "correct-horse-battery"),
+            Err(LoginError::NotLocked)
+        ));
+    }
+
+    #[test]
+    fn the_lock_survives_the_persisted_file() {
+        let dir = std::env::temp_dir().join(format!("ayane-session-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("sessions.json");
+        let (token, _) = SessionStore::with_persistence(path.clone())
+            .mint_provider(
+                Address::parse("test@example.test").expect("addr"),
+                "Test".to_owned(),
+                false,
+                None,
+            )
+            .expect("mint");
+        let reloaded = SessionStore::with_persistence(path.clone());
+        let session = reloaded.resolve(&token).expect("restored");
+        assert!(session.needs_mailbox_password);
+        // A file written before the flag existed reads as unlocked.
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "t": { "address": "test@example.test", "display_name": "T", "admin": false,
+                       "password": "p", "expires_in": 600 }
+            })
+            .to_string(),
+        )
+        .expect("legacy file");
+        let legacy = SessionStore::with_persistence(path);
+        assert!(!legacy.resolve("t").expect("legacy").needs_mailbox_password);
+    }
+
+    #[test]
+    fn a_locked_provider_session_earns_admin_only_through_the_live_table() {
+        let store = store_with_password("boss@example.test", "correct-horse-battery");
+        let mut stored = store.load().expect("load");
+        stored.desired.accounts[0].admin = true;
+        store.save(&stored).expect("save");
+        let sessions = SessionStore::new();
+        let (_, locked) = sessions
+            .mint_provider(
+                Address::parse("boss@example.test").expect("addr"),
+                "Boss".to_owned(),
+                true,
+                None,
+            )
+            .expect("mint");
+        assert!(sessions.is_admin(&store, &locked));
+        // MUT:locked-admin-live — withdrawing the grant must bite a locked
+        // provider session at once; it is not a token-override session.
+        stored.desired.accounts[0].admin = false;
+        store.save(&stored).expect("save");
+        assert!(!sessions.is_admin(&store, &locked));
     }
 }

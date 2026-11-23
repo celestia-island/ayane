@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod apply;
+pub mod auth;
 pub mod config;
 pub mod dns;
 pub mod driver;
