@@ -30,6 +30,14 @@ pub struct ParsedMessage {
     pub from: Option<String>,
     /// Joined `To` addresses.
     pub to: Vec<String>,
+    /// Joined `Cc` addresses (empty when the header is absent).
+    pub cc: Vec<String>,
+    /// Joined `Bcc` addresses (rarely delivered, but a header that IS
+    /// present is worth showing).
+    pub bcc: Vec<String>,
+    /// The Date field rendered as RFC 3339 (offset preserved), when the
+    /// header parses.
+    pub date: Option<String>,
     /// `Subject` header.
     pub subject: Option<String>,
     /// Raw `X-Ayane-Draft-To` header — the composer's recipient input as
@@ -64,6 +72,17 @@ pub fn parse(raw: &[u8]) -> Option<ParsedMessage> {
                 .collect()
         })
         .unwrap_or_default();
+    let addresses = |list: Option<mail_parser::AddressList>| -> Vec<String> {
+        list.map(|list| {
+            list.mailboxes()
+                .filter_map(|addr| addr.address())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    let cc = addresses(message.cc());
+    let bcc = addresses(message.bcc());
 
     let text = message.body_text(0).map(|t| t.into_owned());
     // Sanitise aggressively: no media/embed/form tags, no scripts, no
@@ -115,6 +134,9 @@ pub fn parse(raw: &[u8]) -> Option<ParsedMessage> {
         message_id: message.message_id().map(str::to_owned),
         from,
         to,
+        cc,
+        bcc,
+        date: message.date().map(|d| d.to_rfc3339()),
         subject: message.subject().map(str::to_owned),
         draft_to: message
             .headers()

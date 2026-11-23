@@ -215,6 +215,10 @@ body {
   flex-direction: column;
   gap: 0.3rem;
   min-width: 0;
+  /* The subject aligns with the SENDER CHIP's border, not its text: the
+   * chip carries its own padding, so without this the title hangs 6px
+     left of everything above it (the field report). */
+  padding-inline-start: 2px;
   /* The ⋯ lane overlays this region's trailing edge; keep the subject
    * clear of it so a long line never runs under the button. */
   padding-inline-end: 1.5rem;
@@ -230,6 +234,10 @@ body {
   align-items: center;
   gap: 0.4rem;
   min-width: 0;
+  /* The ⋯ icon button (24px) parks absolute at the card's corner; the
+   * head row reserves its height so the date tag centres on the SAME
+   * axis as the button instead of riding the row's text height. */
+  min-height: 24px;
 }
 
 /* A sender address is longer than any chip wants to be: the tag keeps the
@@ -301,7 +309,9 @@ body {
 
 .ay-mail-card-actions {
   position: absolute;
-  inset-block-start: 0.35rem;
-  inset-inline-end: 0.35rem;
+  /* The head row's centre line: body pad (12px) + row height (24px) / 2
+   * = 24px from the card top, minus half the button (12px) = 12px. */
+  inset-block-start: 12px;
+  inset-inline-end: 8px;
 }
 

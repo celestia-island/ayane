@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { ArrowLeft, ShieldAlert, FileLock2, SquarePen } from "lucide-vue-next";
 
-import { HkButton, HkSectionCard } from "@celestia-island/hikari";
+import { HkButton, HkDateTag, HkSectionCard, HkTag } from "@celestia-island/hikari";
 
 import { rpc } from "../lib/rpc";
 import { t } from "../lib/i18n";
@@ -26,6 +26,9 @@ interface LinkVerdict {
 interface ParsedMessage {
   from: string | null;
   to: string[];
+  cc: string[];
+  bcc: string[];
+  date: string | null;
   subject: string | null;
   text: string | null;
   html: string | null;
@@ -74,7 +77,30 @@ onMounted(async () => {
     <p v-if="loading" class="muted">{{ t("inbox.loading") }}</p>
     <template v-else-if="message">
       <h2>{{ message.subject || t("mail.noSubject") }}</h2>
-      <p class="muted read-route">{{ message.from }} → {{ message.to.join(", ") }}</p>
+      <div class="read-headers">
+        <div class="read-header-row">
+          <span class="read-header-label">{{ t("read.from") }}</span>
+          <span class="read-header-value">{{ message.from || t("mail.unknownSender") }}</span>
+        </div>
+        <div class="read-header-row">
+          <span class="read-header-label">{{ t("read.to") }}</span>
+          <span class="read-header-value">{{ message.to.join(", ") || "—" }}</span>
+        </div>
+        <div v-if="message.cc.length" class="read-header-row">
+          <span class="read-header-label">{{ t("read.cc") }}</span>
+          <span class="read-header-value">{{ message.cc.join(", ") }}</span>
+        </div>
+        <div v-if="message.bcc.length" class="read-header-row">
+          <span class="read-header-label">{{ t("read.bcc") }}</span>
+          <span class="read-header-value">{{ message.bcc.join(", ") }}</span>
+        </div>
+        <div v-if="message.date" class="read-header-row">
+          <span class="read-header-label">{{ t("read.date") }}</span>
+          <span class="read-header-value">
+            <HkDateTag :value="message.date" time />
+          </span>
+        </div>
+      </div>
 
       <HkSectionCard
         v-if="suspicious.length"
@@ -125,7 +151,38 @@ onMounted(async () => {
 .read-embedded { max-width: none; }
 .read-top { display: flex; gap: 8px; align-items: center; }
 .read h2 { margin: 0; font-size: 1.3rem; }
-.read-route { margin: 0; font-size: 0.85rem; }
+.read-headers {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border: 1px solid rgb(var(--color-border, 35 42 55) / 50%);
+  border-radius: 10px;
+  background: color-mix(in srgb, rgb(var(--color-surface)) 45%, transparent);
+}
+
+.read-header-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.read-header-label {
+  flex: none;
+  width: 3.5rem;
+  font-size: 0.75rem;
+  color: rgb(var(--color-muted));
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.read-header-value {
+  min-width: 0;
+  font-size: 0.85rem;
+  color: rgb(var(--color-text));
+  overflow-wrap: anywhere;
+}
 .read-body {
   white-space: pre-wrap;
   /* The HkCard surface grammar (card blend over the page surface). */

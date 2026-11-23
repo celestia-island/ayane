@@ -242,10 +242,12 @@ export default defineComponent({
     const identityOptions = computed(() =>
       identityList().map((identity) => ({
         value: identity.address,
-        label:
-          identity.kind === "shared"
-            ? `${identity.display_name} <${identity.address}> · ${t("compose.fromShared")}`
-            : `${identity.display_name} <${identity.address}> · ${t("compose.fromPersonal")}`,
+        label: `${identity.display_name} <${identity.address}>`,
+        // The address is an identifier, so the row wears it as a tag, and
+        // its KIND rides a second one — both wordings localised.
+        labelTag: true,
+        badge: identity.kind === "shared" ? t("compose.fromShared") : t("compose.fromPersonal"),
+        badgeVariant: identity.kind === "shared" ? ("info" as const) : ("primary" as const),
       })),
     );
     const onMailSurface = computed(
