@@ -165,10 +165,6 @@ export default defineComponent({
       }
     }
 
-    function closeDetail(): void {
-      selected.value = null;
-    }
-
     /** The roster's date lanes (today / yesterday / this week / earlier) —
      *  group headers over the card stack, the family's swimlane order. */
     const sections = computed(() =>
@@ -343,9 +339,7 @@ export default defineComponent({
           detailTitle={selected.value?.subject || t("mail.noSubject")}
           emptyTitle={t("mail.pickOne")}
           emptyDescription={t("mail.pickOneHint")}
-          closeLabel={t("mail.closeDetail")}
           listWidth="24rem"
-          onClose={closeDetail}
         >
         {{
           list: () => (
