@@ -201,17 +201,18 @@ export default defineComponent({
           }}
         >
         <div class="ay-mail-card-head">
+          <span class="ay-mail-card-subject" data-unread={!row.seen || undefined}>
+            {row.subject || t("mail.noSubject")}
+          </span>
+        </div>
+        <div class="ay-mail-card-from">
           <HkTag size="sm" variant={row.seen ? "default" : "primary"}>
             {row.from || t("mail.unknownSender")}
           </HkTag>
           {row.flagged && (
             <span class="ay-mail-star" aria-hidden="true" data-flagged="true" />
           )}
-          <span class="ay-mail-card-push" />
-          <HkDateTag value={row.date ?? ""} time={isToday(row.date)} />
-        </div>
-        <div class="ay-mail-card-subject" data-unread={!row.seen || undefined}>
-          {row.subject || t("mail.noSubject")}
+          <HkDateTag value={row.date ?? ""} time seconds={false} />
         </div>
         {row.preview && (
           <div class="ay-mail-card-preview">

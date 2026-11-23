@@ -250,11 +250,15 @@ body {
   white-space: nowrap;
 }
 
-/* Grow-spacer: the sender chip and its marks keep their width, the date
- * tag parks on the trailing edge. */
-.ay-mail-card-push {
-  flex: 1 1 auto;
-  min-width: 0;
+/* The date tag keeps its width; the subject above takes the slack. */
+.ay-mail-card-head .hk-date-tag {
+  flex: none;
+}
+
+/* The ⋯ lane overlays the FIRST row's trailing edge; the title keeps clear
+ * of it via the enter region's own end padding. */
+.ay-mail-card-head {
+  padding-inline-end: 0;
 }
 
 /* The star glyph: a filled five-point star in the primary ink (unread
@@ -270,13 +274,17 @@ body {
   );
 }
 
-/* Two lines at most: a subject is a glance, the reader is one click on. */
+/* The headline: the subject leads the card, the sender is its metadata.
+ * Two lines at most — a subject is a glance, the reader is one click on. */
 .ay-mail-card-subject {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  font-size: var(--text-sm, 0.8125rem);
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--text-base, 0.875rem);
+  font-weight: 500;
   line-height: 1.35;
   color: rgb(var(--color-text));
 }
