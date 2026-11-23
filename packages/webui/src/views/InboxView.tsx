@@ -187,7 +187,7 @@ export default defineComponent({
         class={
           "ay-mail-card" + (selected.value?.uid === row.uid ? " ay-mail-card--open" : "")
         }
-        padding="sm"
+        padding="md"
         hoverable
       >
         <div

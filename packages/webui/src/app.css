@@ -188,11 +188,10 @@ body {
 .ay-roster-lane-label {
   margin: 0;
   /* The lane header aligns with the CARD TEXT below it, not the card
-   * BORDER: text-left = column pad (0.75rem) + card border (1px) + the
-   * HkCard sm body inset (0.5rem) ≈ 0.75rem + 0.56rem of extra offset
-   * over the column edge, carried by the roster body's own 0.75rem —
-   * so the header needs the border + inset only. */
-  padding: 0 calc(1px + var(--space-8, 0.5rem));
+   * BORDER: text-left = column pad + card border (1px) + the HkCard md
+   * body inset (0.75rem). Both live inside the roster body's own padding,
+   * so the header carries border + inset only. */
+  padding: 0 calc(1px + var(--space-12, 0.75rem));
   font-size: var(--text-2xs, 0.6875rem);
   font-weight: 600;
   color: rgb(var(--color-muted));
