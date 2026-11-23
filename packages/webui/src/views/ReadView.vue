@@ -151,14 +151,15 @@ onMounted(async () => {
 .read-embedded { max-width: none; }
 .read-top { display: flex; gap: 8px; align-items: center; }
 .read h2 { margin: 0; font-size: 1.3rem; }
+/* The envelope header is a LABEL BLOCK, not a card: the reader already
+ * frames the body, and a second outline directly above it reads as one
+ * frame too many (field report). No border, no fill — the rows align with
+ * the subject above and the body below. */
 .read-headers {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 10px 14px;
-  border: 1px solid rgb(var(--color-border, 35 42 55) / 50%);
-  border-radius: 10px;
-  background: color-mix(in srgb, rgb(var(--color-surface)) 45%, transparent);
+  gap: 3px;
+  padding: 0;
 }
 
 .read-header-row {
@@ -170,8 +171,8 @@ onMounted(async () => {
 
 .read-header-label {
   flex: none;
-  width: 3.5rem;
-  font-size: 0.75rem;
+  width: 4rem;
+  font-size: 0.72rem;
   color: rgb(var(--color-muted));
   text-transform: uppercase;
   letter-spacing: 0.05em;
