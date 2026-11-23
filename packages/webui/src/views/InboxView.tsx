@@ -41,7 +41,7 @@ interface EnvelopeRow {
   subject: string | null;
   seen: boolean;
   flagged: boolean;
-  size: number;
+  preview: string | null;
   date: string | null;
 }
 
@@ -218,6 +218,11 @@ export default defineComponent({
         <div class="ay-mail-card-subject" data-unread={!row.seen || undefined}>
           {row.subject || t("mail.noSubject")}
         </div>
+        {row.preview && (
+          <div class="ay-mail-card-preview">
+            {row.preview}
+          </div>
+        )}
         </div>
         <span class="ay-mail-card-actions">
           <HkIconButton

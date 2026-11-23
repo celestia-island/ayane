@@ -222,8 +222,10 @@ pub struct EnvelopeRow {
     pub seen: bool,
     /// `\Flagged` (starred) flag state.
     pub flagged: bool,
-    /// RFC 5322 size in bytes.
-    pub size: u32,
+    /// Opening lines of the text body (whitespace collapsed, truncated)
+    /// for the roster's preview line — `None` when the fetch carried no
+    /// usable text head.
+    pub preview: Option<String>,
     /// Server INTERNALDATE rendered as RFC 3339 (offset preserved), when
     /// the server returned one. Drives the webmail's date column and the
     /// 今天/昨天/更早 swimlanes.
@@ -278,9 +280,90 @@ fn row_from_fetch(fetch: &async_imap::types::Fetch, mailbox: &str) -> Option<Env
         subject,
         seen,
         flagged,
-        size: fetch.size.unwrap_or(0),
+        preview: preview_from_head(fetch.body()),
         date: fetch.internal_date().map(|d| d.to_rfc3339()),
     })
+}
+
+/// The roster's preview line from a text-body head: skip quoted reply
+/// headers and leading blank lines, collapse the run of whitespace a
+/// wrapped plain-text paragraph carries, and cut on a character boundary
+/// just past two lines' worth. HTML part bytes render as tag soup — a
+/// head without a clean text line is dropped (`None`) rather than shown.
+fn preview_from_head(head: Option<&[u8]>) -> Option<String> {
+    let head = head?;
+    let text = String::from_utf8_lossy(head);
+    let mut line = String::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        // Blank and quoted-reply lines are structure, not content: skip
+        // them wherever they run (a head often opens with a wrapped
+        // sentence, then the quote of what it answers — the author's
+        // words are what the roster previews).
+        if trimmed.is_empty() || trimmed.starts_with('>') {
+            continue;
+        }
+        let needs = line.chars().count() + trimmed.chars().count() + 1;
+        if needs > 160 {
+            break;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(trimmed);
+        if line.chars().count() >= 80 {
+            break;
+        }
+    }
+    // A line must read as prose before it earns the preview: an HTML
+    // part's tag soup, a bare `Content-…` header line, a base64 run —
+    // all drop out (`None`) rather than render as junk under the subject.
+    let prose = !line.is_empty()
+        && !line.contains('<')
+        && !line.contains("Content-")
+        && line.chars().all(|c| c.is_alphanumeric() || c.is_whitespace() || PREVIEW_PUNCT.contains(c));
+    let mut out = line;
+    if out.chars().count() > 180 {
+        out = out.chars().take(180).collect::<String>();
+        // Never split inside a multi-byte char: drop to the boundary.
+        while !out.is_char_boundary(out.len()) {
+            out.pop();
+        }
+    }
+    prose.then_some(out)
+}
+
+/// Punctuation a plain-text sentence may carry and still read as prose.
+const PREVIEW_PUNCT: &str = ".,;:!?'\"()[]{}%+-=/@#&*_ ~—…、，。：；！？「」『』（）";
+
+#[cfg(test)]
+mod preview_tests {
+    use super::preview_from_head;
+
+    #[test]
+    fn skips_quotes_and_collapses_wrapping() {
+        let head = b"> On Mon, someone wrote:\r\n> quoted line\r\n\r\nHello,\r\n\r\nthis wrapped\r\nparagraph keeps going.\r\n";
+        let preview = preview_from_head(Some(head)).expect("a usable head");
+        assert_eq!(preview, "Hello, this wrapped paragraph keeps going.");
+    }
+
+    #[test]
+    fn html_soup_drops_out() {
+        let head = b"<html><body><p>Hi</p></body></html>";
+        assert!(preview_from_head(Some(head)).is_none());
+    }
+
+    #[test]
+    fn cuts_at_a_char_boundary() {
+        // A wrapped CJK paragraph: two lines that together pass the 160-char
+        // join budget, so the second one breaks off — and the 180-char cut
+        // must still land on a boundary, never mid-char.
+        let head = format!("{}\r\n{}{}", "段".repeat(120), "段".repeat(120), " tail");
+        let preview = preview_from_head(Some(head.as_bytes())).expect("a usable head");
+        assert!(preview.chars().count() <= 180, "got {}", preview.chars().count());
+        assert!(preview.is_char_boundary(preview.len()));
+        assert!(!preview.contains("tail"), "the overflow line never leaks in");
+    }
 }
 
 impl Imap {
@@ -331,7 +414,7 @@ impl Imap {
             let mut fetches = session
                 .fetch(
                     format!("{start}:{total}"),
-                    "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)",
+                    "(UID FLAGS ENVELOPE INTERNALDATE BODY.PEEK[TEXT]<0.1024>)",
                 )
                 .await
                 .map_err(|e| ClientError::Imap(e.to_string()))?;
