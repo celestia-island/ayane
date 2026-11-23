@@ -326,7 +326,9 @@ fn preview_from_head(head: Option<&[u8]>) -> Option<String> {
     let prose = !line.is_empty()
         && !line.contains('<')
         && !line.contains("Content-")
-        && line.chars().all(|c| c.is_alphanumeric() || c.is_whitespace() || PREVIEW_PUNCT.contains(c));
+        && line
+            .chars()
+            .all(|c| c.is_alphanumeric() || c.is_whitespace() || PREVIEW_PUNCT.contains(c));
     let mut out = line;
     if out.chars().count() > 180 {
         out = out.chars().take(180).collect::<String>();
@@ -340,36 +342,6 @@ fn preview_from_head(head: Option<&[u8]>) -> Option<String> {
 
 /// Punctuation a plain-text sentence may carry and still read as prose.
 const PREVIEW_PUNCT: &str = ".,;:!?'\"()[]{}%+-=/@#&*_ ~—…、，。：；！？「」『』（）";
-
-#[cfg(test)]
-mod preview_tests {
-    use super::preview_from_head;
-
-    #[test]
-    fn skips_quotes_and_collapses_wrapping() {
-        let head = b"> On Mon, someone wrote:\r\n> quoted line\r\n\r\nHello,\r\n\r\nthis wrapped\r\nparagraph keeps going.\r\n";
-        let preview = preview_from_head(Some(head)).expect("a usable head");
-        assert_eq!(preview, "Hello, this wrapped paragraph keeps going.");
-    }
-
-    #[test]
-    fn html_soup_drops_out() {
-        let head = b"<html><body><p>Hi</p></body></html>";
-        assert!(preview_from_head(Some(head)).is_none());
-    }
-
-    #[test]
-    fn cuts_at_a_char_boundary() {
-        // A wrapped CJK paragraph: two lines that together pass the 160-char
-        // join budget, so the second one breaks off — and the 180-char cut
-        // must still land on a boundary, never mid-char.
-        let head = format!("{}\r\n{}{}", "段".repeat(120), "段".repeat(120), " tail");
-        let preview = preview_from_head(Some(head.as_bytes())).expect("a usable head");
-        assert!(preview.chars().count() <= 180, "got {}", preview.chars().count());
-        assert!(preview.is_char_boundary(preview.len()));
-        assert!(!preview.contains("tail"), "the overflow line never leaks in");
-    }
-}
 
 impl Imap {
     /// List the newest `limit` messages of `mailbox`, newest first.
@@ -745,5 +717,42 @@ impl Imap {
 
         let _ = session.logout().await;
         result
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::preview_from_head;
+
+    #[test]
+    fn skips_quotes_and_collapses_wrapping() {
+        let head = b"> On Mon, someone wrote:\r\n> quoted line\r\n\r\nHello,\r\n\r\nthis wrapped\r\nparagraph keeps going.\r\n";
+        let preview = preview_from_head(Some(head)).expect("a usable head");
+        assert_eq!(preview, "Hello, this wrapped paragraph keeps going.");
+    }
+
+    #[test]
+    fn html_soup_drops_out() {
+        let head = b"<html><body><p>Hi</p></body></html>";
+        assert!(preview_from_head(Some(head)).is_none());
+    }
+
+    #[test]
+    fn cuts_at_a_char_boundary() {
+        // A wrapped CJK paragraph: two lines that together pass the 160-char
+        // join budget, so the second one breaks off — and the 180-char cut
+        // must still land on a boundary, never mid-char.
+        let head = format!("{}\r\n{}{}", "段".repeat(120), "段".repeat(120), " tail");
+        let preview = preview_from_head(Some(head.as_bytes())).expect("a usable head");
+        assert!(
+            preview.chars().count() <= 180,
+            "got {}",
+            preview.chars().count()
+        );
+        assert!(preview.is_char_boundary(preview.len()));
+        assert!(
+            !preview.contains("tail"),
+            "the overflow line never leaks in"
+        );
     }
 }
