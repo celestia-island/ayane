@@ -13,6 +13,8 @@ import { toastError } from "../lib/toast";
 
 import { rpc, setSessionToken } from "../lib/rpc";
 
+import logoUrl from "../res/ayane.webp";
+
 /** One sign-in channel as the deployment advertises it. */
 interface ChannelRow {
   key: string;
@@ -118,7 +120,8 @@ function onVerifyBack(): void {
       :verify-factors="['password']"
       :verify-account-name="account"
       :verify-loading="pending"
-      logo-src="https://raw.githubusercontent.com/celestia-island/celestia-island.github.io/main/res/logos/ayane.webp"
+      :verify-show-factor-picker="false"
+      :logo-src="logoUrl"
       @account-submit="onAccountSubmit"
       @verify="onVerify"
       @verify-back="onVerifyBack"
