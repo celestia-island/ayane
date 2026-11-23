@@ -215,10 +215,11 @@ body {
   flex-direction: column;
   gap: 0.3rem;
   min-width: 0;
-  /* The subject aligns with the SENDER CHIP's border, not its text: the
-   * chip carries its own padding, so without this the title hangs 6px
-     left of everything above it (the field report). */
-  padding-inline-start: 2px;
+  /* The subject aligns with the SENDER CHIP's border. The chip is the
+   * head row's second child (the unread dot leads it), so the offset is
+   * that dot plus the row gap — measured, not guessed: 14.4px at the
+   * family's 8px dot + 0.4rem gap. */
+  padding-inline-start: calc(8px + 0.4rem);
   /* The ⋯ lane overlays this region's trailing edge; keep the subject
    * clear of it so a long line never runs under the button. */
   padding-inline-end: 1.5rem;
