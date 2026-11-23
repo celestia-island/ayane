@@ -1,6 +1,6 @@
 import { computed, defineComponent, onMounted, ref } from "vue";
 import { RouterView, useRoute, useRouter } from "vue-router";
-import { Globe, Mail, PenLine, Plug, ScanSearch, Send, Settings, ShieldAlert, SquarePen, Star, Trash2, Users } from "lucide-vue-next";
+import { Globe, Link2, Mail, PenLine, Plug, ScanSearch, Send, Settings, ShieldAlert, SquarePen, Star, Trash2, Users } from "lucide-vue-next";
 
 import {
   HkAboutBody,
@@ -134,6 +134,7 @@ export default defineComponent({
       if (route.path.startsWith("/net-audit")) return t("sidebar.net.audit");
       if (route.path.startsWith("/net-mcp")) return t("sidebar.net.mcp");
       if (route.path.startsWith("/admin")) return t("sidebar.users");
+      if (route.path.startsWith("/account")) return t("account.pageTitle");
       const box = typeof route.query.box === "string" ? route.query.box : "";
       return t(FOLDER_LABEL[(box.toLowerCase() || "inbox") as keyof typeof FOLDER_LABEL]);
     });
@@ -321,7 +322,9 @@ export default defineComponent({
       // Fresh identity for the header face (localStorage is only the
       // pre-connect fallback): address, display name and the admin badge.
       rpc
-        .call<{ address: string; display_name: string; admin: boolean }>("session.whoami")
+        .call<{ address: string; display_name: string; admin: boolean; needs_mailbox_password: boolean }>(
+          "session.whoami",
+        )
         .then((who) => {
           address.value = who.address;
           admin.value = who.admin;
@@ -330,6 +333,12 @@ export default defineComponent({
             localStorage.setItem("ayane.displayName", who.display_name);
           }
           localStorage.setItem("ayane.address", who.address);
+          // A provider-minted session owes the mailbox password: the shell
+          // cannot read mail until the verify card proves it once (the
+          // token stays; only the page changes).
+          if (who.needs_mailbox_password) {
+            void router.replace("/login?unlock=1");
+          }
         })
         .catch(() => undefined);
     });
@@ -467,6 +476,19 @@ export default defineComponent({
                           )}
                         </div>
                         <div class="ay-account-actions">
+                          {/* The way in to linked sign-ins: the identity
+                              menu is the account's own surface, and
+                              linking is an account action. */}
+                          <HkButton
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => {
+                              onUpdateOpen(false);
+                              void router.push("/account");
+                            }}
+                          >
+                            <Link2 size={14} /> {t("menu.linked")}
+                          </HkButton>
                           <input
                             ref={avatarInput}
                             type="file"

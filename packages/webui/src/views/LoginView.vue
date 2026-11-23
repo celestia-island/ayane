@@ -1,28 +1,53 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { computed, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 
 import {
+  HkAuthHandoff,
   HkLoginFlow,
+  hkIsSameOriginPath,
+  hkLoginPlanFromDiscovery,
   type HkLoginChannel,
+  type HkLoginCredentialsChannel,
+  type HkLoginDiscovery,
   type HkMfaFactor,
 } from "@celestia-island/hikari";
 
-import { t } from "../lib/i18n";
+import { oauthErrorKey, t } from "../lib/i18n";
 import { toastError } from "../lib/toast";
 
 import { rpc, setSessionToken } from "../lib/rpc";
 
 import logoUrl from "../res/ayane.webp";
 
-/** One sign-in channel as the deployment advertises it. */
-interface ChannelRow {
-  key: string;
-  mode: "credentials" | "sso";
-  label?: string;
+/**
+ * The sign-in channels come from the server's login policy (the family
+ * contract): the password card, plus one row per provider the deployment
+ * CONFIGURED. A deployment with no provider renders a plain card — an
+ * unconfigured provider must never surface as a dead option. hikari's
+ * adapter maps the document to channels; this view enriches the password
+ * card with its own copy and keeps the provider rows as buttons (the
+ * navigation target needs a server ticket, so the row carries no href).
+ */
+const policy = ref<HkLoginDiscovery | null>(null);
+
+const LOCAL_POLICY: HkLoginDiscovery = { version: 1, mode: "local", password: true, methods: [] };
+
+/** The server localises nothing: a provider row is named by its id, here. */
+function providerLabel(id: string): string {
+  const key = `login.provider.${id}`;
+  const label = t(key);
+  return label === key ? id : label;
 }
 
+/** Where the browser asked to land after signing in (a same-origin path). */
+const returnTo = computed(() => {
+  const raw = route.query.returnTo;
+  return typeof raw === "string" && hkIsSameOriginPath(raw) ? raw : "";
+});
+
 const router = useRouter();
+const route = useRoute();
 const channel = ref("credentials");
 /** The identifier collected in stage one — the ladder needs it again. */
 const account = ref("");
@@ -30,40 +55,66 @@ const account = ref("");
  *  there, never on the opening card. */
 const verifyOpen = ref(false);
 const pending = ref(false);
-const rows = ref<ChannelRow[]>([{ key: "credentials", mode: "credentials" }]);
+/** The provider row whose sign-in is being started (it stays disabled). */
+const starting = ref<string | null>(null);
+
+type Phase = "form" | "completing" | "failed";
+/** `completing` and `failed` are the hand-off screens (no form at all). */
+const phase = ref<Phase>("form");
+const failureText = ref("");
 
 /**
- * The channels this deployment offers. A deployment with no third-party
- * provider configured advertises credentials only, and the panel then
- * renders a plain card with no segment group — an unconfigured provider
- * must never surface as a dead option.
+ * Unlock mode: the session exists (a provider proved the identity) but owes
+ * the mailbox password. The SAME verify card collects it; nothing is
+ * logged in again.
  */
+const unlockAddress = ref<string | null>(null);
+/** The server-carried landing path of a provider sign-in. */
+const providerReturnTo = ref("");
+
 onMounted(async () => {
+  // The callback lands here with a one-time handoff code, a closed failure
+  // reason, or the unlock marker (the shell sends a locked session back).
+  const handoff = route.query.handoff;
+  const error = route.query.oauth_error;
+  const unlock = route.query.unlock;
+  const code = typeof handoff === "string" ? handoff : "";
+  const reason = typeof error === "string" ? error : "";
+  if (code || reason || unlock !== undefined) {
+    // Strip the query after reading it: a handoff code must not survive a
+    // refresh, and a failure must not loop.
+    void router.replace({ path: "/login", query: returnTo.value ? { returnTo: returnTo.value } : {} });
+  }
+  if (code) {
+    phase.value = "completing";
+    await claim(code);
+    return;
+  }
+  if (reason) {
+    phase.value = "failed";
+    failureText.value = t(oauthErrorKey(reason));
+    return;
+  }
+  if (unlock !== undefined) {
+    unlockAddress.value = localStorage.getItem("ayane.address") || "";
+    account.value = unlockAddress.value;
+    verifyOpen.value = true;
+  }
   try {
-    const result = await rpc.call<{ channels: ChannelRow[] }>("session.channels");
-    if (result.channels?.length) rows.value = result.channels;
+    policy.value = await rpc.call<HkLoginDiscovery>("session.loginPolicy", { token: null });
   } catch {
     // The probe is an enhancement, not a gate: credentials always work.
+    policy.value = LOCAL_POLICY;
   }
 });
 
 const channels = computed<HkLoginChannel[]>(() =>
-  rows.value.map((row): HkLoginChannel => {
-    if (row.mode === "sso") {
-      // A redirect channel renders the standard single-row card; the host
-      // builds the URL. No provider is configured yet, so this arm is the
-      // seam the OAuth lane will fill in.
-      return {
-        key: row.key,
-        mode: "sso",
-        label: row.label ?? row.key,
-        icon: undefined,
-        buttonLabel: row.label ?? row.key,
-      };
-    }
-    return {
-      key: row.key,
-      mode: "credentials",
+  hkLoginPlanFromDiscovery(policy.value ?? LOCAL_POLICY, {
+    credentialsKey: "credentials",
+  }).channels.map((entry): HkLoginChannel => {
+    if (entry.mode !== "credentials") return entry;
+    const credentials: HkLoginCredentialsChannel = {
+      ...entry,
       title: t("login.title"),
       subtitle: t("login.subtitle"),
       usernameType: "email",
@@ -73,8 +124,102 @@ const channels = computed<HkLoginChannel[]>(() =>
       // password is a factor, and factors are proven on the verify step.
       passwordField: false,
     };
+    if (entry.methods?.length) {
+      // The provider rows: no href — the target needs a server ticket, so
+      // `method-select` starts the sign-in and navigates.
+      credentials.methods = entry.methods.map((row) => ({
+        key: row.key,
+        label: providerLabel(row.key),
+        disabled: starting.value !== null,
+      }));
+      credentials.methodsDivider = t("login.methodsDivider");
+    }
+    return credentials;
   }),
 );
+
+// The active segment follows the policy once it arrives (the plan names
+// the default channel; it is the password card in every mode ayane serves).
+watch(policy, (discovered) => {
+  const plan = hkLoginPlanFromDiscovery(discovered ?? LOCAL_POLICY, {
+    credentialsKey: "credentials",
+  });
+  channel.value = plan.defaultChannel ?? "credentials";
+});
+
+/** The landing path of a finished sign-in: the server-carried one, else
+ *  the page's own `returnTo`, else the inbox — never a foreign address. */
+function landingPath(serverCarried?: string | null): string {
+  for (const candidate of [serverCarried, returnTo.value]) {
+    if (candidate && hkIsSameOriginPath(candidate)) return candidate;
+  }
+  return "/inbox";
+}
+
+/** Remember who is signed in (the shell reads these before it connects). */
+function remember(address: string, displayName: string): void {
+  localStorage.setItem("ayane.displayName", displayName || "");
+  localStorage.setItem("ayane.address", address);
+}
+
+/**
+ * Redeem the one-time handoff the callback parked. An own-domain mailbox
+ * answers `needs_mailbox_password`: the session exists but is locked, and
+ * the verify card asks for that password once (kept for the session only).
+ */
+async function claim(code: string): Promise<void> {
+  pending.value = true;
+  try {
+    const result = await rpc.call<{
+      token: string;
+      address: string;
+      display_name: string;
+      needs_mailbox_password: boolean;
+      return_to: string | null;
+    }>("session.claimHandoff", { code });
+    setSessionToken(result.token);
+    remember(result.address, result.display_name);
+    if (result.needs_mailbox_password) {
+      unlockAddress.value = result.address;
+      account.value = result.address;
+      providerReturnTo.value = result.return_to ?? "";
+      verifyOpen.value = true;
+      phase.value = "form";
+      return;
+    }
+    await router.push(landingPath(result.return_to));
+  } catch (e) {
+    phase.value = "failed";
+    failureText.value = t("err.handoffInvalid");
+    toastError(e);
+  } finally {
+    pending.value = false;
+  }
+}
+
+/** A provider row was picked: ask for a ticket and leave for the provider. */
+async function startProvider(_channel: string, provider: string): Promise<void> {
+  if (starting.value !== null) return;
+  starting.value = provider;
+  try {
+    // `token: null` says "sign in", never "link": the login page has no
+    // session to link to, and the server must not read a stale one.
+    const result = await rpc.call<{ href: string }>("session.oauthBegin", {
+      provider,
+      token: null,
+      returnTo: returnTo.value || undefined,
+    });
+    if (hkIsSameOriginPath(result.href)) {
+      window.location.assign(result.href);
+      return;
+    }
+    toastError(new Error("Session.OAuthFailed: the sign-in target is not a same-origin path"));
+  } catch (e) {
+    toastError(e);
+  } finally {
+    starting.value = null;
+  }
+}
 
 /** Stage one: the account name. Nothing is proven yet — open the step-up. */
 function onAccountSubmit(_channel: string, username: string): void {
@@ -84,19 +229,27 @@ function onAccountSubmit(_channel: string, username: string): void {
   verifyOpen.value = true;
 }
 
-/** Stage two: the password, proven against the account from stage one. */
+/**
+ * Stage two: the password. Either the mailbox password of a fresh sign-in,
+ * or — after a provider proved the identity — the one-time password that
+ * unlocks the session.
+ */
 async function onVerify(kind: HkMfaFactor, proof: string): Promise<void> {
   if (kind !== "password") return;
   pending.value = true;
   try {
+    if (unlockAddress.value !== null) {
+      await rpc.call("session.unlockMailbox", { password: proof });
+      await router.push(landingPath(providerReturnTo.value));
+      return;
+    }
     const result = await rpc.call<{ token: string; address: string; display_name: string }>(
       "session.login",
       { address: account.value, password: proof },
     );
     setSessionToken(result.token);
-    localStorage.setItem("ayane.displayName", result.display_name || "");
-    localStorage.setItem("ayane.address", result.address);
-    await router.push("/inbox");
+    remember(result.address, result.display_name);
+    await router.push(landingPath());
   } catch (e) {
     toastError(e);
   } finally {
@@ -106,12 +259,30 @@ async function onVerify(kind: HkMfaFactor, proof: string): Promise<void> {
 
 function onVerifyBack(): void {
   verifyOpen.value = false;
+  // A locked session has nowhere to go back to: the card is the only way
+  // forward, so the step stays open.
+  if (unlockAddress.value !== null) verifyOpen.value = true;
+}
+
+/** The failed screen's one action: back to the sign-in card. */
+function onHandoffBack(): void {
+  phase.value = "form";
+  void router.replace({ path: "/login" });
 }
 </script>
 
 <template>
   <div class="login-page">
+    <HkAuthHandoff v-if="phase === 'completing'" status="completing" :logo-src="logoUrl" />
+    <HkAuthHandoff
+      v-else-if="phase === 'failed'"
+      status="failed"
+      :description="failureText"
+      :logo-src="logoUrl"
+      @back="onHandoffBack"
+    />
     <HkLoginFlow
+      v-else
       v-model="channel"
       :channels="channels"
       :step="verifyOpen ? 'verify' : 'account'"
@@ -121,8 +292,11 @@ function onVerifyBack(): void {
       :verify-account-name="account"
       :verify-loading="pending"
       :verify-show-factor-picker="false"
+      :verify-title="unlockAddress !== null ? t('login.unlock.title') : undefined"
+      :verify-subtitle="unlockAddress !== null ? t('login.unlock.subtitle', { name: account }) : undefined"
       :logo-src="logoUrl"
       @account-submit="onAccountSubmit"
+      @method-select="startProvider"
       @verify="onVerify"
       @verify-back="onVerifyBack"
     />

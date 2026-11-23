@@ -46,6 +46,9 @@ const router = createRouter({
           }),
         },
         { path: "compose", component: () => import("./views/ComposeView.vue") },
+        // Linked sign-ins: the one place a provider identity is linked to
+        // (or unlinked from) the signed-in mailbox.
+        { path: "account", component: () => import("./views/AccountView.vue") },
         { path: "admin", component: () => import("./views/UsersView.vue") },
         { path: "net-cert", component: () => import("./views/NetCertView.tsx") },
         { path: "net-traffic", component: () => import("./views/NetTrafficView.tsx") },
