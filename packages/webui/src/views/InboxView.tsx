@@ -62,14 +62,6 @@ function laneOf(row: EnvelopeRow): LaneKey {
   return "earlier";
 }
 
-/** Today's messages carry the locale time beside the date (the family
- *  date tag's `time` flag) — older rows keep the calendar segments only. */
-function isToday(value: string | null): boolean {
-  if (!value) return false;
-  const at = new Date(value);
-  return !Number.isNaN(at.getTime()) && at.toDateString() === new Date().toDateString();
-}
-
 /** The standard mail console: HkMasterDetail's flush two-column form —
  *  the roster column (quiet small-caps head + count readout over the
  *  HkTable whose swimlanes are date groups; the column scrolls
