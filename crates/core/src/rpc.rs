@@ -92,6 +92,10 @@ pub async fn dispatch(
 ) -> RpcOutcome {
     match method {
         "session.ping" => RpcOutcome::Result(json!({ "ok": true })),
+        // Which sign-in channels this deployment actually offers — the
+        // login panel renders a switch only for what comes back here, so
+        // an unconfigured identity provider never shows as a dead option.
+        "session.channels" => RpcOutcome::Result(session_channels(app)),
         "session.login" => wrap(login(app, sessions, ctx, &params)),
         "session.adminLogin" => wrap(admin_login(app, sessions, ctx, &params)),
         "session.whoami" => match session_of(sessions, ctx, &params) {
@@ -217,6 +221,28 @@ where
         ));
     }
     wrap_result(method(app.clone(), session, params.clone()).await)
+}
+
+/// The sign-in channels this deployment offers. Credentials are always
+/// available; a third-party identity provider joins the list only once its
+/// client is configured (none is wired yet — the OAuth lane is a follow-up),
+/// which is exactly the "unconfigured → never advertised" contract the login
+/// panel relies on to avoid a dead switch.
+fn session_channels(app: &AppState) -> Value {
+    let mut channels = vec![json!({ "key": "credentials", "mode": "credentials" })];
+    if let Some((key, label)) = configured_oauth_provider(app) {
+        channels.push(json!({ "key": key, "mode": "sso", "label": label }));
+    }
+    json!({ "channels": channels })
+}
+
+/// The configured third-party identity provider, when one exists.
+///
+/// An OAuth client is usable only with BOTH an id and a secret (a
+/// half-configured pair would render a row that cannot complete). Nothing is
+/// wired today, so this answers `None` and the panel stays credentials-only.
+fn configured_oauth_provider(_app: &AppState) -> Option<(String, String)> {
+    None
 }
 
 fn login(
