@@ -161,29 +161,88 @@ body {
 }
 
 .ay-roster-body {
-  /* The table breathes inside the column's track; a flush HTable (no
-   * card wrapper) keeps the rows hugging the column's own rhythm. */
+  /* Cards on the column's own rhythm: one gap between entries, and the
+   * lane headers breathe above their group. */
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
   padding: 0 0.75rem calc(0.75rem + env(safe-area-inset-bottom, 0px));
 }
 
-/* ── Mail roster rows: whole-row enter surface ── */
+/* ── Mail roster: one card per message ──
+   The card is the SURFACE (HkCard's body + hover chrome); the enter
+   contract rides the inner focusable region so keyboard users get a real
+   node to land on, and the ⋯ lane parks outside it so its click never
+   drills through. */
 
-.ay-mail-row-enter {
+.ay-roster-lane {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.ay-roster-lane:not(:first-child) {
+  margin-top: 0.5rem;
+}
+
+.ay-roster-lane-label {
+  margin: 0;
+  padding: 0 0.25rem;
+  font-size: var(--text-2xs, 0.6875rem);
+  font-weight: 600;
+  color: rgb(var(--color-muted));
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ay-mail-card {
+  position: relative;
+}
+
+/* The open message keeps its card marked — the roster is the only place
+   that knows which one the reader is showing. */
+.ay-mail-card--open {
+  border-color: rgb(var(--color-primary) / 45%);
+}
+
+.ay-mail-card-enter {
   cursor: pointer;
   display: flex;
-  align-items: center;
-  min-height: 1.5rem;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 0;
+  /* The ⋯ lane overlays this region's trailing edge; keep the subject
+   * clear of it so a long line never runs under the button. */
+  padding-inline-end: 1.5rem;
 }
 
-.ay-mail-row-enter:focus-visible {
+.ay-mail-card-enter:focus-visible {
   outline: 1px solid rgb(var(--color-primary));
-  border-radius: 4px;
+  border-radius: 6px;
 }
 
-.ay-mail-from {
-  display: inline-flex;
+.ay-mail-card-head {
+  display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+/* A sender address is longer than any chip wants to be: the tag keeps the
+ * date tag its slot and ellipsises what it cannot show (the full value is
+ * still one hover away in the reader's header). */
+.ay-mail-card-head .hk-tag {
+  min-width: 0;
+  max-width: 11rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Grow-spacer: the sender chip and its marks keep their width, the date
+ * tag parks on the trailing edge. */
+.ay-mail-card-push {
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -210,17 +269,24 @@ body {
   );
 }
 
-.ay-mail-from-text {
+/* Two lines at most: a subject is a glance, the reader is one click on. */
+.ay-mail-card-subject {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: var(--text-sm, 0.8125rem);
+  line-height: 1.35;
+  color: rgb(var(--color-text));
 }
 
-.ay-mail-subject {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.ay-mail-card-subject[data-unread] {
+  font-weight: 700;
 }
 
-.ay-mail-subject[data-unread] { font-weight: 700; }
+.ay-mail-card-actions {
+  position: absolute;
+  inset-block-start: 0.35rem;
+  inset-inline-end: 0.35rem;
+}
 

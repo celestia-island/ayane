@@ -1,17 +1,19 @@
 import { computed, defineComponent, onMounted, ref, watch, type VNode } from "vue";
 
 import {
+  HkCard,
   HkConfirmDialog,
   HkDateTag,
   HkEmptyState,
+  HkIconButton,
   HkMasterDetail,
   HkMenu,
   HkScrollContainer,
-  HTable,
+  HkTag,
   useConfirm,
   type HkMenuItem,
-  type HkTableSection,
 } from "@celestia-island/hikari";
+import { MoreHorizontal } from "lucide-vue-next";
 
 import ReadView from "./ReadView.vue";
 
@@ -167,7 +169,9 @@ export default defineComponent({
       selected.value = null;
     }
 
-    const sections = computed<HkTableSection[]>(() =>
+    /** The roster's date lanes (today / yesterday / this week / earlier) —
+     *  group headers over the card stack, the family's swimlane order. */
+    const sections = computed(() =>
       LANES.map((lane) => ({
         key: lane,
         label: t(`mail.${lane}`),
@@ -175,30 +179,60 @@ export default defineComponent({
       })).filter((section) => section.rows.length > 0),
     );
 
-    const columns = computed(() => [
-      { key: "from", title: t("mail.col.from"), width: "6.5rem" },
-      { key: "subject", title: t("mail.col.subject") },
-      { key: "date", title: t("mail.col.date"), width: "6.5rem", align: "right" as const, copyable: false },
-    ]);
-
-    /** Every data cell's content carries the enter click — the whole row
-     *  navigates while HkTable's copy/menus keep their own semantics. */
-    const enterWrap = (row: EnvelopeRow, cell: VNode | string): VNode => (
-      <div
-        class="ay-mail-row-enter"
-        role="button"
-        tabindex={0}
-        aria-label={`${t("mail.open")}: ${row.subject || t("mail.noSubject")}`}
-        onClick={() => open(row)}
-        onKeydown={(e: KeyboardEvent) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            open(row);
-          }
-        }}
+    /** One message = one card (HkCard's surface + hover chrome). The card
+     *  IS the enter affordance, so the whole surface drills through while
+     *  the ⋯ lane stops its own click; Enter/Space mirror the pointer. */
+    const mailCard = (row: EnvelopeRow): VNode => (
+      <HkCard
+        class={
+          "ay-mail-card" + (selected.value?.uid === row.uid ? " ay-mail-card--open" : "")
+        }
+        padding="sm"
+        hoverable
       >
-        {cell}
-      </div>
+        <div
+          class="ay-mail-card-enter"
+          role="button"
+          tabindex={0}
+          data-unread={!row.seen || undefined}
+          aria-label={`${t("mail.open")}: ${row.subject || t("mail.noSubject")}`}
+          onClick={() => open(row)}
+          onKeydown={(e: KeyboardEvent) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              open(row);
+            }
+          }}
+        >
+        <div class="ay-mail-card-head">
+          <span class="ay-mail-dot" aria-hidden="true" data-unread={!row.seen || undefined} />
+          <HkTag size="sm" variant={row.seen ? "default" : "primary"}>
+            {row.from || t("mail.unknownSender")}
+          </HkTag>
+          {row.flagged && (
+            <span class="ay-mail-star" aria-hidden="true" data-flagged="true" />
+          )}
+          <span class="ay-mail-card-push" />
+          <HkDateTag value={row.date ?? ""} time={isToday(row.date)} />
+        </div>
+        <div class="ay-mail-card-subject" data-unread={!row.seen || undefined}>
+          {row.subject || t("mail.noSubject")}
+        </div>
+        </div>
+        <span class="ay-mail-card-actions">
+          <HkIconButton
+            size={24}
+            variant="ghost"
+            aria-label={t("mail.actions")}
+            onClick={(e: MouseEvent) => {
+              e.stopPropagation();
+              onManage(row, e.currentTarget as HTMLElement);
+            }}
+          >
+            <MoreHorizontal size={14} />
+          </HkIconButton>
+        </span>
+      </HkCard>
     );
 
     const menuRow = computed(() =>
@@ -272,9 +306,9 @@ export default defineComponent({
       }
     }
 
-    function onManage(row: Record<string, unknown>, opener: HTMLElement): void {
+    function onManage(row: EnvelopeRow, opener: HTMLElement): void {
       rowMenuAnchor.value = opener;
-      rowMenuUid.value = (row as unknown as EnvelopeRow).uid;
+      rowMenuUid.value = row.uid;
     }
 
     async function onPurgeConfirm(): Promise<void> {
@@ -334,44 +368,12 @@ export default defineComponent({
                       title={folder.value === "INBOX" ? t("inbox.empty") : folderTitle.value}
                     />
                   ) : (
-                    <HTable
-                      columns={columns.value}
-                      rows={rows.value}
-                      sections={sections.value}
-                      rowKey="uid"
-                      total={total.value}
-                      manageable={true}
-                      onManage={onManage}
-                    >
-                      {{
-                        "cell-from": ({ row }: { row: EnvelopeRow }) =>
-                          enterWrap(row, (
-                            <span class="ay-mail-from">
-                              <span class="ay-mail-dot" aria-hidden="true" data-unread={!row.seen || undefined} />
-                              {row.flagged && (
-                                <span class="ay-mail-star" aria-hidden="true" data-flagged="true" />
-                              )}
-                              <span class="ay-mail-from-text">{row.from || t("mail.unknownSender")}</span>
-                            </span>
-                          )),
-                        "cell-subject": ({ row }: { row: EnvelopeRow }) =>
-                          enterWrap(row, (
-                            <span class="ay-mail-subject" data-unread={!row.seen || undefined}>
-                              {row.subject || t("mail.noSubject")}
-                            </span>
-                          )),
-                        "cell-date": ({ row }: { row: EnvelopeRow }) =>
-                          enterWrap(
-                            row,
-                            <span class="ay-mail-date">
-                              <HkDateTag
-                                value={row.date ?? ""}
-                                time={isToday(row.date)}
-                              />
-                            </span>,
-                          ),
-                      }}
-                    </HTable>
+                    sections.value.map((section) => (
+                      <section class="ay-roster-lane" key={section.key}>
+                        <h3 class="ay-roster-lane-label">{section.label}</h3>
+                        {section.rows.map((row) => mailCard(row))}
+                      </section>
+                    ))
                   )}
                 </div>
               </HkScrollContainer>
