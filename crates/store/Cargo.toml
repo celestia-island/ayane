@@ -18,6 +18,7 @@ serde = { workspace = true }
 sha-crypt = { workspace = true }
 getrandom = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true }

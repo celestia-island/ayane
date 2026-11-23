@@ -28,6 +28,11 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 x509-parser = { workspace = true }
 reqwest = { workspace = true }
+kirino = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 ayane-mail = { workspace = true }
