@@ -80,19 +80,28 @@ onMounted(async () => {
       <div class="read-headers">
         <div class="read-header-row">
           <span class="read-header-label">{{ t("read.from") }}</span>
-          <span class="read-header-value">{{ message.from || t("mail.unknownSender") }}</span>
+          <span class="read-header-value">
+            <HkTag size="sm">{{ message.from || t("mail.unknownSender") }}</HkTag>
+          </span>
         </div>
         <div class="read-header-row">
           <span class="read-header-label">{{ t("read.to") }}</span>
-          <span class="read-header-value">{{ message.to.join(", ") || "—" }}</span>
+          <span class="read-header-value">
+            <HkTag v-for="addr in message.to" :key="addr" size="sm">{{ addr }}</HkTag>
+            <span v-if="!message.to.length">—</span>
+          </span>
         </div>
         <div v-if="message.cc.length" class="read-header-row">
           <span class="read-header-label">{{ t("read.cc") }}</span>
-          <span class="read-header-value">{{ message.cc.join(", ") }}</span>
+          <span class="read-header-value">
+            <HkTag v-for="addr in message.cc" :key="addr" size="sm" variant="info">{{ addr }}</HkTag>
+          </span>
         </div>
         <div v-if="message.bcc.length" class="read-header-row">
           <span class="read-header-label">{{ t("read.bcc") }}</span>
-          <span class="read-header-value">{{ message.bcc.join(", ") }}</span>
+          <span class="read-header-value">
+            <HkTag v-for="addr in message.bcc" :key="addr" size="sm" variant="info">{{ addr }}</HkTag>
+          </span>
         </div>
         <div v-if="message.date" class="read-header-row">
           <span class="read-header-label">{{ t("read.date") }}</span>
@@ -101,6 +110,7 @@ onMounted(async () => {
           </span>
         </div>
       </div>
+      <hr class="read-divider" />
 
       <HkSectionCard
         v-if="suspicious.length"
@@ -179,18 +189,30 @@ onMounted(async () => {
 }
 
 .read-header-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
   min-width: 0;
   font-size: 0.85rem;
   color: rgb(var(--color-text));
   overflow-wrap: anywhere;
 }
+/* A message body is text, not a panel: no frame, no fill. The envelope
+ * above it is separated by a divider instead, so a plain-text mail reads
+ * as one column instead of a box inside a box. */
 .read-body {
   white-space: pre-wrap;
-  /* The HkCard surface grammar (card blend over the page surface). */
-  background: color-mix(in srgb, rgb(var(--color-surface)) 70%, transparent);
-  border: 1px solid rgb(var(--color-border, 35 42 55) / 60%);
-  border-radius: 12px;
-  padding: 16px;
+  padding: 0;
+  background: none;
+  border: 0;
+}
+
+/* The envelope/body divider: one faint rule, the full measure. */
+.read-divider {
+  margin: 2px 0 4px;
+  border: 0;
+  border-top: 1px solid var(--border-faint, rgb(var(--color-border) / 12%));
 }
 .read-body.html { white-space: normal; }
 .read-body.html :deep(a) { color: rgb(var(--color-primary, 108 178 255)); }

@@ -201,7 +201,6 @@ export default defineComponent({
           }}
         >
         <div class="ay-mail-card-head">
-          <span class="ay-mail-dot" aria-hidden="true" data-unread={!row.seen || undefined} />
           <HkTag size="sm" variant={row.seen ? "default" : "primary"}>
             {row.from || t("mail.unknownSender")}
           </HkTag>

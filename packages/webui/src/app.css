@@ -166,7 +166,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  padding: 0 0.75rem calc(0.75rem + env(safe-area-inset-bottom, 0px));
+  padding: 0 0.5rem calc(0.5rem + env(safe-area-inset-bottom, 0px));
 }
 
 /* ── Mail roster: one card per message ──
@@ -257,16 +257,6 @@ body {
   min-width: 0;
 }
 
-.ay-mail-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: transparent;
-  flex-shrink: 0;
-}
-
-.ay-mail-dot[data-unread] { background: rgb(var(--color-primary)); }
-
 /* The star glyph: a filled five-point star in the primary ink (unread
    dots and stars coexist on the same row). */
 .ay-mail-star {
@@ -278,15 +268,6 @@ body {
     50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%,
     50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%
   );
-}
-
-/* The subject and the preview start at the SENDER CHIP's border: the chip
- * is the head row's second child (the unread dot leads it), so the inset
- * is that dot plus the row gap — 8px + 0.4rem, the same numbers the head
- * row uses. */
-.ay-mail-card-subject,
-.ay-mail-card-preview {
-  margin-inline-start: calc(8px + 0.4rem);
 }
 
 /* Two lines at most: a subject is a glance, the reader is one click on. */
