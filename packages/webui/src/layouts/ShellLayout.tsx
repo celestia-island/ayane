@@ -422,6 +422,7 @@ export default defineComponent({
                   center: () =>
                     onMailSurface.value && identityOptions.value.length > 1 ? (
                       <HkHeaderPicker
+                        class="ay-identity-picker"
                         modelValue={currentIdentity()}
                         onUpdate:modelValue={(address: string) => {
                           setCurrentIdentity(address);

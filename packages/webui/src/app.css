@@ -114,6 +114,15 @@ body {
   text-align: center;
 }
 
+/* ── Header identity picker: the label is an identity, not a chip ──
+   "Ayane Test <test@acgsyzx.me>" is the whole point of the control, so the
+   family's band-friendly 16rem cap is lifted here; the header's centre
+   band still sizes to the trigger, it just no longer ellipsises. */
+
+.ay-identity-picker {
+  --hk-header-picker-max-w: none;
+}
+
 /* ── Mail console: the roster column's flush chrome (the console
    sidebars' quiet small-caps voice — the page identity lives in the
    shell's nav, not a banner) ── */
