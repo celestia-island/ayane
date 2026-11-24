@@ -97,6 +97,10 @@ pub const GITHUB_CLIENT_SECRET_ENV: &str = "AUTH_PROVIDER_GITHUB_CLIENT_SECRET";
 pub const GOOGLE_CLIENT_ID_ENV: &str = "AUTH_PROVIDER_GOOGLE_CLIENT_ID";
 /// `AUTH_PROVIDER_GOOGLE_CLIENT_SECRET`: optional; absent = public client.
 pub const GOOGLE_CLIENT_SECRET_ENV: &str = "AUTH_PROVIDER_GOOGLE_CLIENT_SECRET";
+/// `AUTH_PROVIDER_CELESTIA_CLIENT_ID`: the family IdP's client id.
+pub const CELESTIA_CLIENT_ID_ENV: &str = "AUTH_PROVIDER_CELESTIA_CLIENT_ID";
+/// `AUTH_PROVIDER_CELESTIA_CLIENT_SECRET`: optional; absent = public client.
+pub const CELESTIA_CLIENT_SECRET_ENV: &str = "AUTH_PROVIDER_CELESTIA_CLIENT_SECRET";
 /// `AUTH_PUBLIC_BASE_URL`: this service's public origin (`https://mail.example`).
 pub const PUBLIC_BASE_URL_ENV: &str = "AUTH_PUBLIC_BASE_URL";
 /// Every provider variable; a deployment sets none of them or complete pairs.
@@ -105,7 +109,27 @@ pub const PROVIDER_ENV_VARS: &[&str] = &[
     GITHUB_CLIENT_SECRET_ENV,
     GOOGLE_CLIENT_ID_ENV,
     GOOGLE_CLIENT_SECRET_ENV,
+    CELESTIA_CLIENT_ID_ENV,
+    CELESTIA_CLIENT_SECRET_ENV,
 ];
+
+/// The family identity provider: the **one** IdP the family rules name
+/// (`auth.celestia.world`, the personal face of the ERP OAuth service).
+///
+/// Hard-coded, not an environment variable, exactly like GitHub's and
+/// Google's endpoints below: the deployment chooses whether to offer the
+/// IdP, never which issuer it is. Its three endpoints are the issuer's
+/// contract paths — `/oauth/authorize` is the consent page the browser
+/// visits, `/api/oauth/token` and `/api/oauth/userinfo` are the server
+/// legs — so they are derived from this one constant instead of being
+/// spelled out three times.
+pub const CELESTIA_ISSUER: &str = "https://auth.celestia.world";
+/// The issuer's authorization (consent) endpoint.
+pub const CELESTIA_AUTHORIZE_URL: &str = "https://auth.celestia.world/oauth/authorize";
+/// The issuer's token endpoint.
+pub const CELESTIA_TOKEN_URL: &str = "https://auth.celestia.world/api/oauth/token";
+/// The issuer's UserInfo endpoint.
+pub const CELESTIA_USERINFO_URL: &str = "https://auth.celestia.world/api/oauth/userinfo";
 
 /// How long a ticket (the right to start one attempt) stays usable.
 pub const TICKET_TTL: Duration = Duration::from_secs(10 * 60);
@@ -147,7 +171,7 @@ pub enum AuthConfigError {
 /// log line; [`ProviderCatalog`]'s `Debug` names providers by id only.
 #[derive(Clone)]
 pub struct Provider {
-    /// The host's provider id (`github`, `google`).
+    /// The host's provider id (`github`, `google`, `celestia`).
     pub id: &'static str,
     /// The registered client (`Public` when no secret was configured).
     pub client: ClientAuth,
@@ -423,7 +447,10 @@ struct BuiltIn {
     scopes: &'static [&'static str],
 }
 
-/// GitHub (opaque subjects, JSON token endpoint) then Google (OIDC issuer).
+/// GitHub (opaque subjects, JSON token endpoint) then Google (OIDC issuer),
+/// then the family IdP (an OIDC-shaped issuer with a form token endpoint).
+///
+/// The order is the display order every login panel renders.
 const BUILT_INS: &[BuiltIn] = &[
     BuiltIn {
         id: "github",
@@ -444,6 +471,23 @@ const BUILT_INS: &[BuiltIn] = &[
         token_url: "https://oauth2.googleapis.com/token",
         userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo",
         issuer: Some("https://accounts.google.com"),
+        token_body: TokenBody::Form,
+        scopes: &["openid", "profile", "email"],
+    },
+    BuiltIn {
+        // MUT:celestia-endpoints — the family IdP's three paths are the
+        // issuer's contract (consent page under `/oauth`, both API legs
+        // under `/api/oauth`); deriving them from one constant keeps the
+        // three from drifting apart.
+        id: "celestia",
+        client_id_env: CELESTIA_CLIENT_ID_ENV,
+        client_secret_env: CELESTIA_CLIENT_SECRET_ENV,
+        authorize_url: CELESTIA_AUTHORIZE_URL,
+        token_url: CELESTIA_TOKEN_URL,
+        userinfo_url: CELESTIA_USERINFO_URL,
+        issuer: Some(CELESTIA_ISSUER),
+        // RFC 6749 §4.1.3 form body: what the ERP OAuth service accepts
+        // first (it also takes JSON, for chest's built-in `erp` provider).
         token_body: TokenBody::Form,
         scopes: &["openid", "profile", "email"],
     },
@@ -1555,6 +1599,12 @@ mod tests {
         env.insert(PUBLIC_BASE_URL_ENV, "https://mail.example.test");
     }
 
+    fn celestia(env: &mut Env) {
+        env.insert(CELESTIA_CLIENT_ID_ENV, "cid-celestia");
+        env.insert(CELESTIA_CLIENT_SECRET_ENV, "s3cr3t-celestia");
+        env.insert(PUBLIC_BASE_URL_ENV, "https://mail.example.test");
+    }
+
     // ── the catalog and the policy ──────────────────────────────────────
 
     #[test]
@@ -1655,6 +1705,170 @@ mod tests {
             catalog.provider("github").unwrap().client,
             ClientAuth::Public { .. }
         ));
+    }
+
+    // ── the family IdP (celestia) ───────────────────────────────────────
+
+    #[test]
+    fn the_family_idp_derives_its_endpoints_from_one_issuer() {
+        // The three endpoints are the issuer's contract paths; each is
+        // spelled in the preset and every one must sit under the same
+        // origin as the issuer the identity is keyed on.
+        assert_eq!(
+            CELESTIA_AUTHORIZE_URL,
+            format!("{CELESTIA_ISSUER}/oauth/authorize")
+        );
+        assert_eq!(
+            CELESTIA_TOKEN_URL,
+            format!("{CELESTIA_ISSUER}/api/oauth/token")
+        );
+        assert_eq!(
+            CELESTIA_USERINFO_URL,
+            format!("{CELESTIA_ISSUER}/api/oauth/userinfo")
+        );
+        assert_eq!(CELESTIA_ISSUER, "https://auth.celestia.world");
+
+        let mut env = Env::new();
+        celestia(&mut env);
+        let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
+        let provider = catalog.provider("celestia").expect("configured");
+        assert_eq!(
+            provider.metadata.authorize_url.as_str(),
+            CELESTIA_AUTHORIZE_URL
+        );
+        assert_eq!(provider.metadata.token_url.as_str(), CELESTIA_TOKEN_URL);
+        assert_eq!(
+            provider.metadata.userinfo_url.as_ref().map(Url::as_str),
+            Some(CELESTIA_USERINFO_URL)
+        );
+        assert_eq!(provider.metadata.issuer.as_deref(), Some(CELESTIA_ISSUER));
+        assert_eq!(provider.metadata.provider, "celestia");
+        // A form token body: RFC 6749 §4.1.3, what the issuer accepts first.
+        assert_eq!(provider.metadata.token_body, TokenBody::Form);
+        assert_eq!(provider.metadata.scopes, ["openid", "profile", "email"]);
+        assert_eq!(
+            catalog.redirect_uri("celestia").unwrap().as_str(),
+            "https://mail.example.test/api/auth/oauth/celestia/callback"
+        );
+    }
+
+    #[test]
+    fn the_family_idp_is_a_confidential_client_or_a_public_one() {
+        // A configured secret: a confidential client, and the secret never
+        // reaches a log line.
+        let mut env = Env::new();
+        celestia(&mut env);
+        let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
+        assert!(matches!(
+            catalog.provider("celestia").unwrap().client,
+            ClientAuth::Confidential { .. }
+        ));
+        assert_eq!(
+            catalog.provider("celestia").unwrap().client.client_secret(),
+            Some("s3cr3t-celestia")
+        );
+        let shown = format!("{catalog:?}");
+        assert!(!shown.contains("s3cr3t-celestia"), "{shown}");
+
+        // No secret at all: a public client, PKCE the only proof.
+        let env = Env::from([
+            (CELESTIA_CLIENT_ID_ENV, "cid-celestia"),
+            (PUBLIC_BASE_URL_ENV, "https://mail.example.test"),
+        ]);
+        let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
+        let provider = catalog.provider("celestia").expect("configured");
+        assert!(matches!(provider.client, ClientAuth::Public { .. }));
+        assert_eq!(provider.client.client_secret(), None);
+
+        // A blank secret is "no secret" too, exactly like GitHub's.
+        let env = Env::from([
+            (CELESTIA_CLIENT_ID_ENV, "cid-celestia"),
+            (CELESTIA_CLIENT_SECRET_ENV, "   "),
+            (PUBLIC_BASE_URL_ENV, "https://mail.example.test"),
+        ]);
+        let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
+        assert!(matches!(
+            catalog.provider("celestia").unwrap().client,
+            ClientAuth::Public { .. }
+        ));
+    }
+
+    #[test]
+    fn the_family_idp_row_follows_its_client_id() {
+        // MUT:celestia-row-needs-client-id — with no client id the row is
+        // absent, exactly as for GitHub and Google: a deployment that
+        // registers nothing renders no dead button.
+        let env = Env::from([(PUBLIC_BASE_URL_ENV, "https://mail.example.test")]);
+        let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
+        let policy = catalog.login_policy();
+        assert!(policy.methods.is_empty(), "{policy:?}");
+        assert!(catalog.provider("celestia").is_none());
+
+        // Configured: one `oauth` row, labelled by id (the webui localises
+        // it to "Celestia ID"), pointing at this host's start route.
+        let mut env = Env::new();
+        celestia(&mut env);
+        let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
+        let policy = catalog.validated_login_policy().expect("policy");
+        assert_eq!(policy.mode, AuthMode::Federated);
+        assert!(policy.password);
+        assert_eq!(
+            serde_json::to_value(&policy).expect("json")["methods"][0],
+            serde_json::json!({
+                "kind": "oauth", "id": "celestia", "label": "celestia",
+                "href": "/api/auth/oauth/celestia",
+                "provider": "celestia"
+            })
+        );
+    }
+
+    #[test]
+    fn the_family_idp_sits_after_the_generic_providers() {
+        let mut env = Env::new();
+        github(&mut env);
+        env.insert(GOOGLE_CLIENT_ID_ENV, "cid-google");
+        env.insert(CELESTIA_CLIENT_ID_ENV, "cid-celestia");
+        let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
+        let ids: Vec<&str> = catalog.providers.iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["github", "google", "celestia"]);
+        // Every provider variable is listed, so a deployment can check its
+        // own environment against the closed set.
+        for name in [
+            CELESTIA_CLIENT_ID_ENV,
+            CELESTIA_CLIENT_SECRET_ENV,
+            GITHUB_CLIENT_ID_ENV,
+            GOOGLE_CLIENT_SECRET_ENV,
+        ] {
+            assert!(PROVIDER_ENV_VARS.contains(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_family_idp_fails_closed_on_its_own_variables() {
+        // A secret with no id names the id it needs.
+        let env = Env::from([
+            (CELESTIA_CLIENT_SECRET_ENV, "s3cr3t-celestia"),
+            (PUBLIC_BASE_URL_ENV, "https://mail.example.test"),
+        ]);
+        assert_eq!(
+            ProviderCatalog::from_env_with(read(&env)).err(),
+            Some(AuthConfigError::Missing(CELESTIA_CLIENT_ID_ENV))
+        );
+        // A blank id is not "unconfigured" either.
+        let env = Env::from([
+            (CELESTIA_CLIENT_ID_ENV, "   "),
+            (PUBLIC_BASE_URL_ENV, "https://mail.example.test"),
+        ]);
+        assert_eq!(
+            ProviderCatalog::from_env_with(read(&env)).err(),
+            Some(AuthConfigError::Missing(CELESTIA_CLIENT_ID_ENV))
+        );
+        // Configured without a public base: the base is what is missing.
+        let env = Env::from([(CELESTIA_CLIENT_ID_ENV, "cid-celestia")]);
+        assert_eq!(
+            ProviderCatalog::from_env_with(read(&env)).err(),
+            Some(AuthConfigError::Missing(PUBLIC_BASE_URL_ENV))
+        );
     }
 
     #[test]
