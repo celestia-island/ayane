@@ -99,7 +99,9 @@ pub const GOOGLE_CLIENT_ID_ENV: &str = "AUTH_PROVIDER_GOOGLE_CLIENT_ID";
 pub const GOOGLE_CLIENT_SECRET_ENV: &str = "AUTH_PROVIDER_GOOGLE_CLIENT_SECRET";
 /// `AUTH_PROVIDER_CELESTIA_CLIENT_ID`: the family IdP's client id.
 pub const CELESTIA_CLIENT_ID_ENV: &str = "AUTH_PROVIDER_CELESTIA_CLIENT_ID";
-/// `AUTH_PROVIDER_CELESTIA_CLIENT_SECRET`: optional; absent = public client.
+/// `AUTH_PROVIDER_CELESTIA_CLIENT_SECRET`: REQUIRED with the client id —
+/// the family IdP validates the secret on every exchange (no public-client
+/// lane).
 pub const CELESTIA_CLIENT_SECRET_ENV: &str = "AUTH_PROVIDER_CELESTIA_CLIENT_SECRET";
 /// `AUTH_PUBLIC_BASE_URL`: this service's public origin (`https://mail.example`).
 pub const PUBLIC_BASE_URL_ENV: &str = "AUTH_PUBLIC_BASE_URL";
@@ -318,6 +320,13 @@ impl ProviderCatalog {
             }
             let client_id = value(built_in.client_id_env)
                 .ok_or(AuthConfigError::Missing(built_in.client_id_env))?;
+            // The family IdP has no public-client lane: its token endpoint
+            // validates the client secret unconditionally, so a `celestia`
+            // row without a secret is a deployment that 401s at the
+            // exchange — refused here, at startup, where it is fixable.
+            if built_in.id == "celestia" && value(built_in.client_secret_env).is_none() {
+                return Err(AuthConfigError::Missing(CELESTIA_CLIENT_SECRET_ENV));
+            }
             let client = match value(built_in.client_secret_env) {
                 Some(secret) => ClientAuth::Confidential {
                     client_id,
@@ -1770,27 +1779,30 @@ mod tests {
         let shown = format!("{catalog:?}");
         assert!(!shown.contains("s3cr3t-celestia"), "{shown}");
 
-        // No secret at all: a public client, PKCE the only proof.
+        // No secret at all: REFUSED — erp's token endpoint validates the
+        // client secret on every exchange (no public-client lane), so the
+        // "public client" reading of an absent secret would 401 at the
+        // first exchange. Unlike GitHub's, this preset is confidential or
+        // it does not exist.
         let env = Env::from([
             (CELESTIA_CLIENT_ID_ENV, "cid-celestia"),
             (PUBLIC_BASE_URL_ENV, "https://mail.example.test"),
         ]);
-        let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
-        let provider = catalog.provider("celestia").expect("configured");
-        assert!(matches!(provider.client, ClientAuth::Public { .. }));
-        assert_eq!(provider.client.client_secret(), None);
+        assert_eq!(
+            ProviderCatalog::from_env_with(read(&env)).err(),
+            Some(AuthConfigError::Missing(CELESTIA_CLIENT_SECRET_ENV))
+        );
 
-        // A blank secret is "no secret" too, exactly like GitHub's.
+        // A blank secret is "no secret" too: the same refusal.
         let env = Env::from([
             (CELESTIA_CLIENT_ID_ENV, "cid-celestia"),
             (CELESTIA_CLIENT_SECRET_ENV, "   "),
             (PUBLIC_BASE_URL_ENV, "https://mail.example.test"),
         ]);
-        let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
-        assert!(matches!(
-            catalog.provider("celestia").unwrap().client,
-            ClientAuth::Public { .. }
-        ));
+        assert_eq!(
+            ProviderCatalog::from_env_with(read(&env)).err(),
+            Some(AuthConfigError::Missing(CELESTIA_CLIENT_SECRET_ENV))
+        );
     }
 
     #[test]
@@ -1828,6 +1840,7 @@ mod tests {
         github(&mut env);
         env.insert(GOOGLE_CLIENT_ID_ENV, "cid-google");
         env.insert(CELESTIA_CLIENT_ID_ENV, "cid-celestia");
+        env.insert(CELESTIA_CLIENT_SECRET_ENV, "s3cr3t-celestia");
         let catalog = ProviderCatalog::from_env_with(read(&env)).expect("catalog");
         let ids: Vec<&str> = catalog.providers.iter().map(|p| p.id).collect();
         assert_eq!(ids, ["github", "google", "celestia"]);
@@ -1841,6 +1854,26 @@ mod tests {
         ] {
             assert!(PROVIDER_ENV_VARS.contains(&name), "{name}");
         }
+    }
+
+    #[test]
+    fn the_family_idp_requires_its_secret_no_public_lane() {
+        // MUT:celestia-needs-secret — erp's token endpoint validates the
+        // client secret on every exchange (no public-client lane), so an
+        // id without a secret is a deployment that 401s at the first
+        // exchange. Refused at startup, with the variable named.
+        let env = Env::from([
+            (CELESTIA_CLIENT_ID_ENV, "cid-celestia"),
+            (PUBLIC_BASE_URL_ENV, "https://mail.example.test"),
+        ]);
+        assert_eq!(
+            ProviderCatalog::from_env_with(read(&env)).err(),
+            Some(AuthConfigError::Missing(CELESTIA_CLIENT_SECRET_ENV))
+        );
+        // The confidential row stays valid.
+        let mut full = Env::new();
+        celestia(&mut full);
+        assert!(ProviderCatalog::from_env_with(read(&full)).is_ok());
     }
 
     #[test]
@@ -1863,8 +1896,21 @@ mod tests {
             ProviderCatalog::from_env_with(read(&env)).err(),
             Some(AuthConfigError::Missing(CELESTIA_CLIENT_ID_ENV))
         );
-        // Configured without a public base: the base is what is missing.
+        // Configured without a secret: the family IdP preset is refused as
+        // a whole (id + secret are one unit — erp has no public-client
+        // lane), before the base URL is even considered.
         let env = Env::from([(CELESTIA_CLIENT_ID_ENV, "cid-celestia")]);
+        assert_eq!(
+            ProviderCatalog::from_env_with(read(&env)).err(),
+            Some(AuthConfigError::Missing(CELESTIA_CLIENT_SECRET_ENV))
+        );
+        // The same id WITH its secret: now the public base is what is
+        // missing (an explicit env without the base — `celestia()` carries
+        // it, so the base-missing case needs its own env here).
+        let env = Env::from([
+            (CELESTIA_CLIENT_ID_ENV, "cid-celestia"),
+            (CELESTIA_CLIENT_SECRET_ENV, "s3cr3t-celestia"),
+        ]);
         assert_eq!(
             ProviderCatalog::from_env_with(read(&env)).err(),
             Some(AuthConfigError::Missing(PUBLIC_BASE_URL_ENV))
