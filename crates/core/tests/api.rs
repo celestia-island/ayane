@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use axum::response::Response;
 use axum::Router;
 use tower::ServiceExt;
 
@@ -75,6 +76,29 @@ async fn get(app: &Router, uri: &str, token: Option<&str>) -> (StatusCode, serde
     (status, value)
 }
 
+/// One GET and the whole reply, headers included (`get` keeps only what
+/// a JSON body needs).
+async fn get_raw(app: &Router, uri: &str) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+}
+
+/// The reply's `content-type`, for when the body's kind is the point.
+fn content_type(response: &Response) -> &str {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
+
 async fn put_state(app: &Router, token: &str) -> (StatusCode, serde_json::Value) {
     let body = serde_json::json!({
         "domains": [
@@ -123,6 +147,43 @@ async fn health_is_open_and_reports_the_engine_stack() {
     assert_eq!(value["status"], "ok");
     assert_eq!(value["engine"]["mta"], "postfix");
     assert_eq!(value["engine"]["filter"], "rspamd");
+}
+
+// MUT:api-fallback-never-spa
+#[tokio::test]
+async fn an_unknown_api_route_is_a_json_404_never_the_spa() {
+    let fixture = fixture("fallback", None);
+
+    // A path under `/api/` that no route matched is a missing API route:
+    // the uniform error body with a 404 — never `index.html` with a 200.
+    for uri in ["/api/v1/does-not-exist", "/api/auth/nope"] {
+        let response = get_raw(&fixture.app, uri).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert!(
+            content_type(&response).starts_with("application/json"),
+            "{uri}: {}",
+            content_type(&response)
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(uri)),
+            "{uri}: {value}"
+        );
+    }
+
+    // A client route is still the SPA's document.
+    let response = get_raw(&fixture.app, "/inbox/x").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        content_type(&response).starts_with("text/html"),
+        "{}",
+        content_type(&response)
+    );
 }
 
 #[tokio::test]

@@ -4,7 +4,8 @@
 //! compiled into the binary (rust-embed), in debug it is served straight
 //! from disk so front-end iteration needs no rebuild. Unknown paths fall
 //! back to `index.html` — SPA routing owns everything under `/` that is
-//! not an API route (those are mounted before this fallback).
+//! not an API route, except a path under `/api/` that no API route
+//! matched: that one is the API's own 404, never the SPA.
 
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -16,11 +17,21 @@ struct Assets;
 
 /// Serve one static asset, or `index.html` for SPA routes.
 ///
+/// A path under `/api/` that reached this fallback matched no API route
+/// and is no client route either: it is answered with the API's uniform
+/// error body, never with the SPA (a caller that asked for JSON must not
+/// be handed `index.html` with a 200).
+///
 /// # Errors
 ///
 /// Returns a 404 response (never a Rust error) when the path resolves to
 /// nothing and `index.html` itself is missing (front-end not built).
 pub async fn serve(uri: Uri) -> Response {
+    // MUT:api-fallback-never-spa — checked before any asset is looked
+    // up, so nothing under `/api/` is ever served from here.
+    if uri.path().starts_with("/api/") {
+        return crate::api::ApiError::not_found(uri.path()).into_response();
+    }
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 

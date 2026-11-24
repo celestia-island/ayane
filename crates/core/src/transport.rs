@@ -82,6 +82,11 @@ fn same_origin_or_no_origin(headers: &HeaderMap) -> bool {
 /// `Host` header `host`: same name and same port. Only the authority is
 /// compared — the scheme is the reverse proxy's business (it terminates
 /// TLS in front of this service), so it is not seen here and not asked.
+/// The `Host` is compared as received, so a reverse proxy in front must
+/// pass the original `Host` through to ayane (Caddy's default for
+/// `reverse_proxy`; nginx needs `proxy_set_header Host $host;`) —
+/// otherwise every browser WebSocket upgrade is refused with 403;
+/// non-browser clients without an `Origin` header are unaffected.
 fn is_same_origin(origin: &str, host: &str) -> bool {
     let Ok(parsed) = Url::parse(origin) else {
         return false;

@@ -326,14 +326,15 @@ async fn the_websocket_refuses_a_foreign_origin() {
     assert!(accepted(&head), "{head}");
 
     // Any other origin is refused before the handshake: another host,
-    // another port, the `null` origin, a host that merely starts with
-    // ours, ours on another port, a scheme no page has — and an origin
-    // with no `Host` to vouch for it.
+    // another port, the `null` origin, a host that merely starts or ends
+    // with ours, ours on another port, a scheme no page has — and an
+    // origin with no `Host` to vouch for it.
     for (host, origin) in [
         (own, "https://evil.example"),
         (own, "https://mail.example.test:8443"),
         (own, "null"),
         (own, "https://mail.example.test.evil.example"),
+        (own, "https://evil-mail.example.test"),
         (own, "ws://mail.example.test"),
         ("127.0.0.1:3023", "https://mail.example.test"),
         ("", "https://mail.example.test"),

@@ -99,6 +99,16 @@ impl ApiError {
     pub fn prose(&self) -> &str {
         &self.error
     }
+
+    /// The 404 for a request under `/api/` that no route matched: what
+    /// the router's fallback answers with instead of the SPA.
+    #[must_use]
+    pub fn not_found(path: &str) -> Self {
+        Self {
+            error: format!("no such API route: {path}"),
+            status: StatusCode::NOT_FOUND,
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -117,6 +127,8 @@ pub fn router(state: AppState) -> Router {
         // The family login contract's browser face: the discovery document
         // and the provider sign-in routes (same origin, beside health).
         .merge(crate::auth::router())
+        // The fallback sorts what no route matched: a path under `/api/`
+        // gets the API's own 404, anything else is the SPA's.
         .fallback(crate::webui::serve)
         .nest(
             "/api/v1",
