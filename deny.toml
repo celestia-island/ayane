@@ -20,8 +20,8 @@ ignore = [
     # keys, so neither the RSA decrypt/unpadding path nor the ECDSA scalar
     # arithmetic these advisories apply to ever runs here. Same chain and
     # disposition as kirino's own deny.toml. RE-REVIEW: 2026-12-01.
-    { id = "RUSTSEC-2023-0071", reason = "no patched rsa release; transitive-only via kirino auth-oauth, and ayane verifies no ID tokens" },
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 via jsonwebtoken's rust_crypto backend; ayane verifies no ID tokens, so the affected ECDSA arithmetic never runs" },
+    { id = "RUSTSEC-2023-0071", reason = "no patched rsa release; transitive-only via kirino auth-oauth, and ayane verifies no ID tokens. RE-REVIEW: 2026-12-01." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 via jsonwebtoken's rust_crypto backend; ayane verifies no ID tokens, so the affected ECDSA arithmetic never runs. RE-REVIEW: 2026-12-01." },
 ]
 
 [licenses]
