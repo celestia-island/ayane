@@ -1,10 +1,13 @@
 //! JSON-RPC surface contract tests: envelope shape, error paths, session
 //! gates. These drive `handle_one` directly — the socket plumbing is thin
-//! frame in/out and needs no test doubles.
+//! frame in/out and needs no test doubles — except for the handshake gate,
+//! which is the HTTP layer's own: that one opens a real socket.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::Router;
 use serde_json::{json, Value};
 
 use ayane::state::AppState;
@@ -226,4 +229,117 @@ async fn admin_methods_require_an_admin_session() {
 
 fn rpc_request(method: &str, params: Value, id: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+/// The full application on a loopback socket of its own: the address to
+/// reach it at. (A WebSocket handshake only survives a real server: the
+/// upgrade extractor takes an extension the HTTP connection itself
+/// inserts, so `tower::oneshot` answers 426 to every handshake.)
+async fn serve(app: Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    addr
+}
+
+/// One WebSocket handshake at `addr`, as a browser would open it: a raw
+/// HTTP/1.1 upgrade request with every header the upgrade needs, the
+/// `Host` given and the `Origin` given (`None` = the header is not sent
+/// at all). Answers the head of the reply — status line and headers.
+async fn upgrade_head(addr: SocketAddr, host: &str, origin: Option<&str>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut request = format!(
+        "GET /api/ws HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    );
+    if let Some(origin) = origin {
+        request.push_str(&format!("Origin: {origin}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await.expect("send");
+    // The head ends at the first empty line; the body (for an accepted
+    // upgrade, the socket itself) is never read.
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).await.expect("read");
+        assert!(
+            read > 0,
+            "closed before the head ended: {:?}",
+            String::from_utf8_lossy(&head)
+        );
+        head.extend_from_slice(&chunk[..read]);
+        if let Ok(text) = std::str::from_utf8(&head) {
+            if let Some(end) = text.find("\r\n\r\n") {
+                return text[..end].to_owned();
+            }
+        }
+    }
+}
+
+/// The status code of a reply's head.
+fn status_of(head: &str) -> u16 {
+    head.split_whitespace()
+        .nth(1)
+        .expect("status code")
+        .parse()
+        .expect("numeric status")
+}
+
+/// Whether the head carries the handshake's own acceptance header.
+fn accepted(head: &str) -> bool {
+    head.to_ascii_lowercase().contains("sec-websocket-accept:")
+}
+
+#[tokio::test]
+async fn the_websocket_refuses_a_foreign_origin() {
+    let (surface, _root) = surface("ws-origin").await;
+    let addr = serve(ayane::api::full_router(surface)).await;
+    let own = "mail.example.test";
+
+    // MUT:ws-same-origin — the socket is upgraded only for this origin:
+    // the `Origin` the browser names is the `Host` its request came to
+    // (name and port; the case of the name is nobody's, and a port the
+    // scheme makes the default goes unnamed on either side). The SPA's
+    // page.
+    for (host, origin) in [
+        (own, "https://mail.example.test"),
+        (own, "https://Mail.Example.Test"),
+        ("127.0.0.1:3023", "http://127.0.0.1:3023"),
+        ("mail.example.test:443", "https://mail.example.test"),
+        ("mail.example.test:8443", "https://mail.example.test:8443"),
+        ("[::1]:3023", "http://[::1]:3023"),
+    ] {
+        let head = upgrade_head(addr, host, Some(origin)).await;
+        assert_eq!(status_of(&head), 101, "{origin} on {host}: {head}");
+        assert!(accepted(&head), "{origin} on {host}: {head}");
+    }
+    // No `Origin` at all is not a browser: the MCP/WS tooling.
+    let head = upgrade_head(addr, own, None).await;
+    assert_eq!(status_of(&head), 101, "{head}");
+    assert!(accepted(&head), "{head}");
+
+    // Any other origin is refused before the handshake: another host,
+    // another port, the `null` origin, a host that merely starts with
+    // ours, ours on another port, a scheme no page has — and an origin
+    // with no `Host` to vouch for it.
+    for (host, origin) in [
+        (own, "https://evil.example"),
+        (own, "https://mail.example.test:8443"),
+        (own, "null"),
+        (own, "https://mail.example.test.evil.example"),
+        (own, "ws://mail.example.test"),
+        ("127.0.0.1:3023", "https://mail.example.test"),
+        ("", "https://mail.example.test"),
+    ] {
+        let head = upgrade_head(addr, host, Some(origin)).await;
+        assert_eq!(status_of(&head), 403, "{origin} on {host:?}: {head}");
+        assert!(!accepted(&head), "{origin} on {host:?}: {head}");
+    }
 }

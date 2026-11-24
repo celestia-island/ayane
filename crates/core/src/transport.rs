@@ -2,6 +2,8 @@
 //!
 //! `/api/ws` — the webmail's streaming socket (one JSON-RPC request per
 //! text frame, one response frame back, notifications produce nothing).
+//! Upgraded for this origin only (`same_origin_or_no_origin`): a page
+//! on another origin gets no socket.
 //! `/api/mcp` — HTTP POST for agents: the same dispatch, one shot, the
 //! MCP tool vocabulary (`tools/list`, `tools/call`) mapped onto it.
 
@@ -9,9 +11,10 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::{json, Value};
+use url::Url;
 
 use crate::rpc::{self, ProtocolError, RpcOutcome, WsContext};
 use crate::session::SessionStore;
@@ -28,12 +31,100 @@ pub struct RpcSurface {
 
 /// The WebSocket upgrade handler.
 ///
+/// The upgrade is granted to this origin only (`same_origin_or_no_origin`):
+/// a WebSocket is not covered by CORS, so without the check a page on any
+/// other origin could open one here and speak into the dispatch table.
+///
 /// # Errors
 ///
 /// Returns an axum response (never a Rust error): the upgrade either
-/// proceeds or the handshake failed at the HTTP layer before this returns.
-pub async fn ws_handler(State(surface): State<RpcSurface>, ws: WebSocketUpgrade) -> Response {
+/// proceeds, is refused with 403 before the handshake, or the handshake
+/// failed at the HTTP layer before this returns.
+pub async fn ws_handler(
+    State(surface): State<RpcSurface>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+) -> Response {
+    // MUT:ws-same-origin — a browser page on another origin must not get
+    // a socket here: checked before the handshake, from the request's own
+    // `Origin` and `Host`.
+    if !same_origin_or_no_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin websocket refused").into_response();
+    }
     ws.on_upgrade(move |socket| ws_loop(surface, socket))
+}
+
+/// Whether a browser may upgrade this connection: every `Origin` the
+/// request names is the `Host` it was sent to (the SPA, same origin), or
+/// there is none — a non-browser client (the MCP/WS tooling) sends no
+/// `Origin` at all. `Origin: null` is a named origin like any other and
+/// never matches; an `Origin` without a `Host` to compare against is
+/// refused too (nothing proves it is ours).
+fn same_origin_or_no_origin(headers: &HeaderMap) -> bool {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let Some(first) = origins.next() else {
+        return true;
+    };
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    std::iter::once(first).chain(origins).all(|origin| {
+        origin
+            .to_str()
+            .is_ok_and(|origin| is_same_origin(origin, host))
+    })
+}
+
+/// Whether `origin` (an `Origin` header value) is the origin of the
+/// `Host` header `host`: same name and same port. Only the authority is
+/// compared — the scheme is the reverse proxy's business (it terminates
+/// TLS in front of this service), so it is not seen here and not asked.
+fn is_same_origin(origin: &str, host: &str) -> bool {
+    let Ok(parsed) = Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some((host_name, host_port)) = split_host(host) else {
+        return false;
+    };
+    // A port the scheme makes the default goes unnamed on both sides.
+    let default_port = match parsed.scheme() {
+        "https" => Some(443),
+        _ => Some(80),
+    };
+    parsed.host_str().is_some_and(|name| {
+        name.eq_ignore_ascii_case(&host_name)
+            && parsed.port() == host_port.filter(|port| Some(*port) != default_port)
+    })
+}
+
+/// The name and port a `Host` header names (`mail.example`,
+/// `mail.example:3023`, `[::1]:3023`), spelled the way `url` spells a
+/// host (an IPv6 literal keeps its brackets); `None` when it names no
+/// host.
+fn split_host(raw: &str) -> Option<(String, Option<u16>)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(bracketed) = raw.strip_prefix('[') {
+        let end = bracketed.find(']')?;
+        let name = format!("[{}]", bracketed[..end].to_ascii_lowercase());
+        let port = bracketed[end + 1..]
+            .strip_prefix(':')
+            .and_then(|port| port.parse().ok());
+        return Some((name, port));
+    }
+    // `name:port`; a port that is not one names no host at all.
+    Some(match raw.rsplit_once(':') {
+        Some((name, port)) => (name.to_ascii_lowercase(), Some(port.parse().ok()?)),
+        None => (raw.to_ascii_lowercase(), None),
+    })
 }
 
 async fn ws_loop(surface: RpcSurface, mut socket: WebSocket) {
