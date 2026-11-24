@@ -252,9 +252,12 @@ impl SessionStore {
 
     /// Prove the mailbox password of a locked session and unlock it.
     ///
-    /// Verifies against the store's hash (the server never keeps the
-    /// plaintext), then sets the session's password and clears the lock
-    /// for the rest of the session's lifetime.
+    /// The password is verified against the hash of the SESSION's own
+    /// address — the one mailbox this method can be asked about, since it
+    /// is given no address (the server never keeps the plaintext) — then
+    /// sets the session's password and clears the lock for the rest of
+    /// the session's lifetime. A password that belongs to any other
+    /// mailbox fails that verification exactly as a wrong one does.
     ///
     /// # Errors
     ///
@@ -266,7 +269,7 @@ impl SessionStore {
         store: &dyn StateStore,
         token: &str,
         password_raw: &str,
-    ) -> Result<(), LoginError> {
+    ) -> Result<Session, LoginError> {
         let session = {
             let mut inner = self.inner.lock().expect("sessions mutex");
             inner.retain(|_, session| session.expires > Instant::now());
@@ -290,9 +293,10 @@ impl SessionStore {
         let session = inner.get_mut(token).ok_or(LoginError::InvalidCredentials)?;
         session.password = Some(password_raw.to_owned());
         session.needs_mailbox_password = false;
+        let unlocked = session.clone();
         drop(inner);
         self.persist();
-        Ok(())
+        Ok(unlocked)
     }
 
     /// Mint an admin session after the admin token matched.

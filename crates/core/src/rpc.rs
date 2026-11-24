@@ -15,10 +15,12 @@
 //! surface: a provider-minted session that still owes it
 //! (`needs_mailbox_password`) is refused by EVERY `admin.*` method with
 //! `Session.MailboxLocked`, the same words the mail methods answer, until
-//! `session.unlockMailbox` proves it once. And every handler that edits a
-//! slice of the snapshot does so under the store's lock
-//! ([`update_state`]): an unlocked read-edit-write writes back a moment
-//! that has already passed.
+//! `session.unlockMailbox` proves it once — and by the two methods that
+//! change the account's linked sign-ins, since those are ways into the
+//! account exactly as administration is a way to change it. And every
+//! handler that edits a slice of the snapshot does so under the store's
+//! lock ([`update_state`]): an unlocked read-edit-write writes back a
+//! moment that has already passed.
 
 use serde_json::{json, Value};
 
@@ -113,24 +115,48 @@ pub async fn dispatch(
         "session.adminLogin" => wrap(admin_login(app, sessions, ctx, &params)),
         // Provider sign-in: start (ticket → href), claim the callback's
         // handoff, prove the mailbox password of a locked session.
-        "session.oauthBegin" => wrap(oauth_begin(app, &params).await),
+        //
+        // `oauthBegin` and `unlockMailbox` never see the params object:
+        // the few fields each one reads are taken by name HERE, so
+        // neither handler can be handed an address — a sign-in aims at no
+        // mailbox, and a password is proven for the session's own.
+        "session.oauthBegin" => wrap(match required(&params, "provider") {
+            Ok(provider) => oauth_begin(app, &provider, str_param(&params, "returnTo")).await,
+            Err(refused) => Err(refused),
+        }),
         "session.claimHandoff" => wrap(claim_handoff(app, sessions, ctx, &params)),
-        "session.unlockMailbox" => wrap(unlock_mailbox(app, sessions, ctx, &params)),
-        // Linked sign-ins of the authenticated mailbox.
+        "session.unlockMailbox" => wrap(match required(&params, "password") {
+            Ok(password) => unlock_mailbox(app, sessions, ctx, token_of(&params), &password),
+            Err(refused) => Err(refused),
+        }),
+        // Linked sign-ins of the authenticated mailbox. Listing is a
+        // read; linking and unlinking change the ways into the account
+        // and are gated on the mailbox password like every privileged
+        // surface.
         "session.identities" => match session_of(sessions, ctx, &params) {
             Ok(session) => wrap_result(list_identities(app, &session).await),
             Err(e) => RpcOutcome::App(e),
         },
-        "session.unlinkIdentity" => match session_of(sessions, ctx, &params) {
-            Ok(session) => wrap_result(unlink_identity(app, &session, &params).await),
-            Err(e) => RpcOutcome::App(e),
-        },
-        "session.linkIdentity" => match session_of(sessions, ctx, &params) {
-            Ok(session) => wrap_result(link_identity(app, &session, &params).await),
-            Err(e) => RpcOutcome::App(e),
-        },
+        // MUT:locked-no-link-changes
+        "session.unlinkIdentity" => {
+            match session_of(sessions, ctx, &params).and_then(require_mailbox_unlocked) {
+                Ok(session) => wrap_result(unlink_identity(app, &session, &params).await),
+                Err(e) => RpcOutcome::App(e),
+            }
+        }
+        // MUT:locked-no-link-changes
+        "session.linkIdentity" => {
+            match session_of(sessions, ctx, &params).and_then(require_mailbox_unlocked) {
+                Ok(session) => wrap_result(link_identity(app, &session, &params).await),
+                Err(e) => RpcOutcome::App(e),
+            }
+        }
         "session.whoami" => match session_of(sessions, ctx, &params) {
             Ok(session) => {
+                // MUT:whoami-authority-held — `admin` is the authority the
+                // session holds right now (none while the mailbox is
+                // locked, the live account table afterwards), never the
+                // flag as it stood at mint time.
                 let admin = sessions.is_admin(app.store.as_ref(), &session);
                 RpcOutcome::Result(json!({
                     "address": session.address.as_str(),
@@ -230,8 +256,9 @@ fn wrap_result(result: Result<Value, AppError>) -> RpcOutcome {
 }
 
 /// The refusal every privileged surface answers while the session owes
-/// the mailbox password — the mail methods, the admin gate, the audit leg
-/// — in the same words, so the SPA has one path to act on.
+/// the mailbox password — the mail methods, the admin gate, the audit leg,
+/// the linked sign-ins — in the same words, so the SPA has one path to
+/// act on.
 fn mailbox_locked() -> AppError {
     AppError::new(
         "Session.MailboxLocked",
@@ -279,32 +306,38 @@ fn login_policy(app: &AppState) -> Value {
 /// `session.oauthBegin {provider, returnTo?}`: start a provider SIGN-IN
 /// and answer the same-origin `href` the browser navigates to.
 ///
-/// Always the login purpose. No token is read — not from the params, not
-/// from the connection — so the method means the same thing on the login
-/// page, on a connection that happens to hold a session, and on the agent
-/// surface. The sign-in lands on `returnTo`, sanitised to a same-origin
-/// path; a foreign address is dropped, never forwarded. Linking an
-/// identity to the signed-in mailbox is [`link_identity`]'s job alone.
-async fn oauth_begin(app: &AppState, params: &Value) -> Result<Value, AppError> {
-    let provider = required(params, "provider")?;
+/// Always the login purpose. The handler is handed the provider and the
+/// landing path and nothing else — it never sees the params object, so it
+/// reads no token (not from the params, not from the connection) and no
+/// address — and the method means the same thing on the login page, on a
+/// connection that happens to hold a session, and on the agent surface.
+/// The sign-in lands on `returnTo`, sanitised to a same-origin path; a
+/// foreign address is dropped, never forwarded. Linking an identity to
+/// the signed-in mailbox is [`link_identity`]'s job alone.
+async fn oauth_begin(
+    app: &AppState,
+    provider: &str,
+    return_to: Option<String>,
+) -> Result<Value, AppError> {
     // MUT:oauth-begin-always-login — the purpose is this method's, never
     // inferred from a token that may be lying around: a session on the
     // connection (or in the params) does not turn a sign-in into a link.
+    // MUT:oauth-begin-no-address-channel — nor from an address in the
+    // params: it names no mailbox to link the identity to. The dispatcher
+    // reads `provider` and `returnTo` and passes this function nothing
+    // else, so there is no such channel left to read.
     let purpose = AttemptPurpose::Login {
-        return_to: auth::safe_return_to(
-            &app.auth.catalog,
-            params.get("returnTo").and_then(Value::as_str),
-        ),
+        return_to: auth::safe_return_to(&app.auth.catalog, return_to.as_deref()),
     };
-    let href = auth::begin(app, &provider, purpose)
+    let href = auth::begin(app, provider, purpose)
         .await
-        .map_err(|e| oauth_error(&provider, e))?;
+        .map_err(|e| oauth_error(provider, e))?;
     Ok(json!({ "href": href }))
 }
 
-/// `session.linkIdentity {provider}` (authenticated only): start a link
-/// sign-in for the session's mailbox; answers the `href` to navigate to.
-/// The one door into `AttemptPurpose::Link`.
+/// `session.linkIdentity {provider}` (authenticated, mailbox unlocked):
+/// start a link sign-in for the session's mailbox; answers the `href` to
+/// navigate to. The one door into `AttemptPurpose::Link`.
 async fn link_identity(
     app: &AppState,
     session: &Session,
@@ -368,6 +401,9 @@ fn claim_handoff(
         )
         .map_err(|_| AppError::new("Session.InvalidCredentials", "session could not be minted"))?;
     ctx.token = Some(token.clone());
+    // MUT:whoami-authority-held — the authority the session holds, as
+    // `session.whoami` answers it: none while the mailbox password is
+    // still owed, whatever the account's flag says.
     let admin = sessions.is_admin(app.store.as_ref(), &session);
     Ok(json!({
         "token": token,
@@ -382,31 +418,49 @@ fn claim_handoff(
 /// `session.unlockMailbox {password}` — prove the mailbox password of a
 /// locked (provider-minted) session; wrong passwords are refused and leave
 /// it locked.
+///
+/// MUT:unlock-own-address — the password is verified against the hash of
+/// the SESSION's own mailbox (inside [`SessionStore::unlock_mailbox`]).
+/// The dispatcher hands this handler a password and a token and nothing
+/// else: there is no address here to read, so no other mailbox's password
+/// can ever be the thing that is proven, and a password that belongs to
+/// somebody else answers exactly as a wrong one does.
 fn unlock_mailbox(
     app: &AppState,
     sessions: &SessionStore,
     ctx: &mut WsContext,
-    params: &Value,
+    token: Option<String>,
+    password: &str,
 ) -> Result<Value, AppError> {
-    let password = required(params, "password")?;
-    let session = session_of(sessions, ctx, params)?;
-    let token = ctx.token.clone().expect("set by session_of");
-    match sessions.unlock_mailbox(app.store.as_ref(), &token, &password) {
-        Ok(()) => Ok(json!({
-            "ok": true,
-            "address": session.address.as_str(),
-            "display_name": session.display_name,
-            "admin": session.admin,
-        })),
-        Err(LoginError::NotLocked) => Err(AppError::new(
-            "Session.MailboxNotLocked",
-            "this session owes no mailbox password",
-        )),
-        Err(LoginError::UnknownAccount | LoginError::InvalidCredentials) => Err(AppError::new(
-            "Session.InvalidCredentials",
-            "mailbox password is wrong",
-        )),
-    }
+    // The token of the params, else the connection's; pinned on the
+    // connection from here on.
+    session_for(sessions, ctx, token)?;
+    let token = ctx.token.clone().expect("set by session_for");
+    let unlocked = match sessions.unlock_mailbox(app.store.as_ref(), &token, password) {
+        Ok(unlocked) => unlocked,
+        Err(LoginError::NotLocked) => {
+            return Err(AppError::new(
+                "Session.MailboxNotLocked",
+                "this session owes no mailbox password",
+            ));
+        }
+        Err(LoginError::UnknownAccount | LoginError::InvalidCredentials) => {
+            return Err(AppError::new(
+                "Session.InvalidCredentials",
+                "mailbox password is wrong",
+            ));
+        }
+    };
+    Ok(json!({
+        "ok": true,
+        "address": unlocked.address.as_str(),
+        "display_name": unlocked.display_name,
+        // MUT:whoami-authority-held — what the unlock bought, in the same
+        // words as every other reply that carries `admin`: the authority
+        // the session holds now (read live), not the flag as it stood
+        // when the session was minted.
+        "admin": sessions.is_admin(app.store.as_ref(), &unlocked),
+    }))
 }
 
 /// The live account id behind a session, or the error that ends the call.
@@ -443,7 +497,8 @@ async fn list_identities(app: &AppState, session: &Session) -> Result<Value, App
 }
 
 /// `session.unlinkIdentity {provider}` — remove one linked sign-in from
-/// the authenticated mailbox. Always allowed for the owner: an own-domain
+/// the authenticated mailbox. Always allowed for the owner once the
+/// mailbox is unlocked (the dispatcher saw to that): an own-domain
 /// account keeps its password whatever is linked.
 async fn unlink_identity(
     app: &AppState,
@@ -521,13 +576,39 @@ fn session_of(
     ctx: &mut WsContext,
     params: &Value,
 ) -> Result<Session, AppError> {
-    let token = token_of(params)
+    session_for(sessions, ctx, token_of(params))
+}
+
+/// The session of `token` — of the connection's when `None` — pinned on
+/// the connection from here on. For the handlers that are handed their
+/// params field by field and so have no params object to resolve against.
+fn session_for(
+    sessions: &SessionStore,
+    ctx: &mut WsContext,
+    token: Option<String>,
+) -> Result<Session, AppError> {
+    let token = token
         .or_else(|| ctx.token.clone())
         .ok_or_else(|| AppError::new("Session.Required", "login first"))?;
     let session = sessions
         .resolve(&token)
         .map_err(|_| AppError::new("Session.Required", "session expired or unknown"))?;
     ctx.token = Some(token);
+    Ok(session)
+}
+
+/// The gate of the methods that CHANGE an account's linked sign-ins.
+///
+/// MUT:locked-no-link-changes — the mailbox password is the account's
+/// second factor for its sign-ins exactly as it is for every privileged
+/// surface: while a provider-minted session still owes it, nothing can be
+/// linked to the mailbox and nothing unlinked from it. Refused by name,
+/// before the store is touched, with the words the mail and admin
+/// refusals use.
+fn require_mailbox_unlocked(session: Session) -> Result<Session, AppError> {
+    if session.mailbox_locked() {
+        return Err(mailbox_locked());
+    }
     Ok(session)
 }
 

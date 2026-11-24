@@ -1148,6 +1148,346 @@ async fn a_locked_provider_session_administers_nothing_until_the_mailbox_passwor
     assert_eq!(status, StatusCode::OK);
 }
 
+// ── the second factor is the session's own ──────────────────────────────
+
+/// The account id of `address` in the fixture's store.
+fn account_id(fx: &Fixture, address: &str) -> uuid::Uuid {
+    fx.store
+        .load()
+        .expect("load")
+        .desired
+        .accounts
+        .iter()
+        .find(|account| account.address.as_str() == address)
+        .expect("account")
+        .id
+}
+
+/// `address` signs in through the provider: its identity (`subject`) is
+/// linked, the round trip runs, the handoff is claimed. The session token
+/// — LOCKED, the mailbox password still owed.
+async fn locked_provider_session(fx: &Fixture, address: &str, subject: u64) -> String {
+    IdentityLinks::new(fx.store.clone())
+        .link(
+            &ExternalIdentity::opaque("github", subject.to_string()),
+            account_id(fx, address),
+        )
+        .await
+        .expect("pre-link");
+    fx.http.subject.store(subject, Ordering::SeqCst);
+    let landed = round_trip(fx, json!({ "provider": "github" }), "code=code-1").await;
+    let code = landed
+        .strip_prefix("/login?handoff=")
+        .unwrap_or_else(|| panic!("{landed}"))
+        .to_owned();
+    let claim = call(&fx.surface, "session.claimHandoff", json!({ "code": code })).await;
+    assert_eq!(claim["result"]["address"], address, "{claim}");
+    assert_eq!(claim["result"]["needs_mailbox_password"], true, "{claim}");
+    claim["result"]["token"].as_str().expect("token").to_owned()
+}
+
+/// Whether `address` is an administrator in the store, set and saved.
+fn set_admin(fx: &Fixture, address: &str, admin: bool) {
+    let mut stored = fx.store.load().expect("load");
+    stored
+        .desired
+        .accounts
+        .iter_mut()
+        .find(|account| account.address.as_str() == address)
+        .expect("account")
+        .admin = admin;
+    fx.store.save(&stored).expect("save");
+}
+
+/// The provider's redirect back for a link attempt started by
+/// `session.linkIdentity`: the `Location` the browser lands on.
+async fn link_round_trip(fx: &Fixture, href: &str) -> String {
+    let (authorize, binding) = navigate(fx, href).await;
+    callback(fx, &authorize, "code=code-1", Some(&binding)).await
+}
+
+#[tokio::test]
+async fn the_mailbox_password_is_proven_for_the_sessions_own_address() {
+    const BOB_PASSWORD: &str = "bob-keeps-a-password-of-his-own";
+    let fx = fixture("own-address");
+    // Bob's password is his own: the two mailboxes share no secret.
+    let mut stored = fx.store.load().expect("load");
+    stored.password_hashes.insert(
+        "bob@example.test".to_owned(),
+        password::hash_password(BOB_PASSWORD).expect("hash"),
+    );
+    fx.store.save(&stored).expect("save");
+    let alice = locked_provider_session(&fx, "alice@example.test", SUBJECT).await;
+    let bob = locked_provider_session(&fx, "bob@example.test", 678).await;
+    let refused = "Session.InvalidCredentials: mailbox password is wrong";
+
+    // MUT:unlock-own-address — the password is verified against the hash
+    // of the SESSION's own mailbox and of no other. Bob's CORRECT password
+    // — naming his address or not — opens nothing on alice's session, and
+    // alice's opens nothing on bob's; each answers exactly what a wrong
+    // password answers, with no hint that another address was involved.
+    for params in [
+        json!({ "token": alice, "password": BOB_PASSWORD }),
+        json!({ "token": alice, "password": BOB_PASSWORD, "address": "bob@example.test" }),
+        json!({ "token": bob, "password": PASSWORD }),
+        json!({ "token": bob, "password": PASSWORD, "address": "alice@example.test" }),
+        json!({ "token": alice, "password": "nope" }),
+    ] {
+        let reply = call(&fx.surface, "session.unlockMailbox", params.clone()).await;
+        assert_eq!(reply["error"]["message"], refused, "{params}");
+        assert!(reply.get("result").is_none(), "{params}: {reply}");
+    }
+    // Both sessions are exactly as locked as before, and still their own.
+    for (token, address) in [(&alice, "alice@example.test"), (&bob, "bob@example.test")] {
+        let who = call(&fx.surface, "session.whoami", json!({ "token": token })).await;
+        assert_eq!(who["result"]["address"], address);
+        assert_eq!(who["result"]["needs_mailbox_password"], true, "{address}");
+    }
+    let mail = call(&fx.surface, "mail.list", json!({ "token": alice })).await;
+    assert!(mail["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .starts_with("Session.MailboxLocked:"));
+
+    // The dispatcher reads the two fields by name and in the same order
+    // as before: a missing password is malformed before any session is
+    // consulted, and a password alone has no session to prove anything of.
+    let reply = call(
+        &fx.surface,
+        "session.unlockMailbox",
+        json!({ "token": alice }),
+    )
+    .await;
+    assert_eq!(
+        reply["error"]["message"],
+        "Session.MalformedParams: password is required"
+    );
+    let reply = call(
+        &fx.surface,
+        "session.unlockMailbox",
+        json!({ "password": "x" }),
+    )
+    .await;
+    assert_eq!(reply["error"]["message"], "Session.Required: login first");
+
+    // Each mailbox's own password opens its own session, and only it.
+    for (token, address, own) in [
+        (&alice, "alice@example.test", PASSWORD),
+        (&bob, "bob@example.test", BOB_PASSWORD),
+    ] {
+        let unlocked = call(
+            &fx.surface,
+            "session.unlockMailbox",
+            json!({ "token": token, "password": own }),
+        )
+        .await;
+        assert_eq!(unlocked["result"]["ok"], true, "{address}: {unlocked}");
+        assert_eq!(unlocked["result"]["address"], address);
+        let who = call(&fx.surface, "session.whoami", json!({ "token": token })).await;
+        assert_eq!(who["result"]["needs_mailbox_password"], false, "{address}");
+    }
+}
+
+#[tokio::test]
+async fn every_session_reply_reports_the_authority_the_session_holds() {
+    let fx = fixture("authority-held");
+    // alice administers the service and links GitHub.
+    let links = IdentityLinks::new(fx.store.clone());
+    links
+        .link(
+            &ExternalIdentity::opaque("github", SUBJECT.to_string()),
+            account_id(&fx, "alice@example.test"),
+        )
+        .await
+        .expect("pre-link");
+    let landed = round_trip(&fx, json!({ "provider": "github" }), "code=code-1").await;
+    let code = landed
+        .strip_prefix("/login?handoff=")
+        .unwrap_or_else(|| panic!("{landed}"))
+        .to_owned();
+    // The callback recorded alice as an administrator. Her grant is then
+    // withdrawn while the handoff waits: every reply from here on must
+    // read the authority LIVE.
+    set_admin(&fx, "alice@example.test", false);
+    let claim = call(&fx.surface, "session.claimHandoff", json!({ "code": code })).await;
+    let token = claim["result"]["token"].as_str().expect("token").to_owned();
+    // MUT:whoami-authority-held — `admin` is the authority the session
+    // HOLDS, as `sessions.is_admin` reads it: none while the mailbox
+    // password is owed, and afterwards the live account table's answer —
+    // never the flag as it stood when the session was minted. The same
+    // in `claimHandoff`, `whoami` and the reply of the unlock itself.
+    assert_eq!(claim["result"]["admin"], false, "{claim}");
+    assert_eq!(claim["result"]["needs_mailbox_password"], true);
+    let who = call(&fx.surface, "session.whoami", json!({ "token": token })).await;
+    assert_eq!(who["result"]["admin"], false);
+
+    let unlocked = call(
+        &fx.surface,
+        "session.unlockMailbox",
+        json!({ "token": token, "password": PASSWORD }),
+    )
+    .await;
+    assert_eq!(unlocked["result"]["ok"], true, "{unlocked}");
+    // The record minted with the session says administrator; the unlock
+    // bought none of it back.
+    assert_eq!(unlocked["result"]["admin"], false, "{unlocked}");
+    let who = call(&fx.surface, "session.whoami", json!({ "token": token })).await;
+    assert_eq!(who["result"]["admin"], false);
+    assert_eq!(who["result"]["needs_mailbox_password"], false);
+
+    // Granted again, the next reply already carries it.
+    set_admin(&fx, "alice@example.test", true);
+    let who = call(&fx.surface, "session.whoami", json!({ "token": token })).await;
+    assert_eq!(who["result"]["admin"], true);
+}
+
+#[tokio::test]
+async fn oauth_begin_ignores_an_address_in_the_params() {
+    let fx = fixture("begin-address");
+    // alice is linked; bob is signed in with his password, so a token of
+    // his lies around too.
+    let links = IdentityLinks::new(fx.store.clone());
+    links
+        .link(
+            &ExternalIdentity::opaque("github", SUBJECT.to_string()),
+            account_id(&fx, "alice@example.test"),
+        )
+        .await
+        .expect("pre-link");
+    let login = call(
+        &fx.surface,
+        "session.login",
+        json!({ "address": "bob@example.test", "password": PASSWORD }),
+    )
+    .await;
+    let token = login["result"]["token"].as_str().expect("token").to_owned();
+    let only_alices = |fx: &Fixture| {
+        let links = fx.store.load().expect("load").external_identities;
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].address.as_str(), "alice@example.test");
+        assert_eq!(links[0].subject, SUBJECT.to_string());
+    };
+
+    // MUT:oauth-begin-no-address-channel — an `address` in the params
+    // names no mailbox: the ticket is a sign-in's, whatever else rides
+    // along. Completed, it signs the identity's LINKED mailbox in (alice)
+    // — it never links the identity to the address it was handed (bob) —
+    // and stores nothing.
+    for params in [
+        json!({ "provider": "github", "address": "bob@example.test" }),
+        json!({ "provider": "github", "address": "bob@example.test", "token": token }),
+    ] {
+        let landed = round_trip(&fx, params.clone(), "code=code-1").await;
+        assert!(landed.starts_with("/login?handoff="), "{params}: {landed}");
+        let code = landed.split("handoff=").nth(1).expect("handoff").to_owned();
+        let claim = call(&fx.surface, "session.claimHandoff", json!({ "code": code })).await;
+        assert_eq!(
+            claim["result"]["address"], "alice@example.test",
+            "{params}: {claim}"
+        );
+        assert_eq!(claim["result"]["needs_mailbox_password"], true);
+        only_alices(&fx);
+    }
+
+    // Nobody linked (another subject at the provider): the same params
+    // are still a sign-in — refused as unlinked, never turned into a link
+    // for the address they name.
+    fx.http.subject.store(999, Ordering::SeqCst);
+    let landed = round_trip(
+        &fx,
+        json!({ "provider": "github", "address": "bob@example.test", "token": token }),
+        "code=code-1",
+    )
+    .await;
+    assert_eq!(landed, "/login?oauth_error=unlinked");
+    only_alices(&fx);
+    // …and the address is not required either: the method's own params.
+    let begun = call(
+        &fx.surface,
+        "session.oauthBegin",
+        json!({ "provider": "github", "returnTo": "/inbox" }),
+    )
+    .await;
+    assert!(begun["result"]["href"]
+        .as_str()
+        .unwrap_or("")
+        .starts_with("/api/auth/oauth/github?ticket="));
+    let begun = call(&fx.surface, "session.oauthBegin", json!({})).await;
+    assert_eq!(
+        begun["error"]["message"],
+        "Session.MalformedParams: provider is required"
+    );
+}
+
+#[tokio::test]
+async fn a_locked_provider_session_cannot_change_its_linked_sign_ins() {
+    let fx = fixture("locked-links");
+    // alice signed in through GitHub: the one link is what let her in,
+    // and her session owes the mailbox password.
+    let token = locked_provider_session(&fx, "alice@example.test", SUBJECT).await;
+    let locked = "Session.MailboxLocked: the mailbox is locked: enter the mailbox password";
+
+    // MUT:locked-no-link-changes — the mailbox password is the account's
+    // second factor for changing its ways in, exactly as for admin: while
+    // it is owed, neither linking nor unlinking runs.
+    for method in ["session.linkIdentity", "session.unlinkIdentity"] {
+        let reply = call(
+            &fx.surface,
+            method,
+            json!({ "token": token, "provider": "github" }),
+        )
+        .await;
+        assert_eq!(reply["error"]["message"], locked, "{method}");
+        assert!(reply.get("result").is_none(), "{method}: {reply}");
+    }
+    // Nothing moved: the link is alice's still.
+    let links = fx.store.load().expect("load").external_identities;
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].address.as_str(), "alice@example.test");
+    // Listing is a read; the locked mailbox can still see what is linked.
+    let listed = call(&fx.surface, "session.identities", json!({ "token": token })).await;
+    assert_eq!(listed["result"]["identities"][0]["provider"], "github");
+
+    // The second factor: the mailbox password, proven once.
+    let unlocked = call(
+        &fx.surface,
+        "session.unlockMailbox",
+        json!({ "token": token, "password": PASSWORD }),
+    )
+    .await;
+    assert_eq!(unlocked["result"]["ok"], true, "{unlocked}");
+    // Unlinked…
+    let removed = call(
+        &fx.surface,
+        "session.unlinkIdentity",
+        json!({ "token": token, "provider": "github" }),
+    )
+    .await;
+    assert_eq!(removed["result"]["removed"], true, "{removed}");
+    assert!(fx
+        .store
+        .load()
+        .expect("load")
+        .external_identities
+        .is_empty());
+    // …and linked again, the whole way to the provider and back.
+    let begun = call(
+        &fx.surface,
+        "session.linkIdentity",
+        json!({ "token": token, "provider": "github" }),
+    )
+    .await;
+    let href = begun["result"]["href"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{begun}"))
+        .to_owned();
+    let landed = link_round_trip(&fx, &href).await;
+    assert_eq!(landed, "/account?linked=github");
+    let links = fx.store.load().expect("load").external_identities;
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].address.as_str(), "alice@example.test");
+}
+
 // ── slice writes under the store's lock ──────────────────────────────────
 
 /// A store that lands a prepared link in the real store at the moment of
