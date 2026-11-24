@@ -226,6 +226,8 @@ const en: Table = {
   "login.methodsDivider": "or continue with",
   "login.provider.github": "GitHub",
   "login.provider.google": "Google",
+  // The family IdP's brand name: the same in every locale, never translated.
+  "login.provider.celestia": "Celestia ID",
   "login.unlock.title": "Unlock your mailbox",
   "login.unlock.subtitle": "{name}: enter your mailbox password once to read your mail.",
   "login.error.denied": "The sign-in was cancelled at the provider.",
@@ -444,6 +446,8 @@ const zhHans: Table = {
   "login.methodsDivider": "或使用以下方式登录",
   "login.provider.github": "GitHub",
   "login.provider.google": "Google",
+  // The family IdP's brand name: the same in every locale, never translated.
+  "login.provider.celestia": "Celestia ID",
   "login.unlock.title": "解锁邮箱",
   "login.unlock.subtitle": "{name}：输入一次邮箱密码即可读取邮件。",
   "login.error.denied": "登录已在提供方处取消。",
@@ -662,6 +666,8 @@ const zhHant: Table = {
   "login.methodsDivider": "或使用以下方式登入",
   "login.provider.github": "GitHub",
   "login.provider.google": "Google",
+  // The family IdP's brand name: the same in every locale, never translated.
+  "login.provider.celestia": "Celestia ID",
   "login.unlock.title": "解鎖信箱",
   "login.unlock.subtitle": "{name}：輸入一次信箱密碼即可讀取郵件。",
   "login.error.denied": "登入已在提供者處取消。",
@@ -880,6 +886,8 @@ const ja: Table = {
   "login.methodsDivider": "または次の方法で続行",
   "login.provider.github": "GitHub",
   "login.provider.google": "Google",
+  // The family IdP's brand name: the same in every locale, never translated.
+  "login.provider.celestia": "Celestia ID",
   "login.unlock.title": "メールボックスのロックを解除",
   "login.unlock.subtitle": "{name}：メールボックスのパスワードを一度入力するとメールを読めます。",
   "login.error.denied": "プロバイダー側でサインインがキャンセルされました。",
@@ -1098,6 +1106,8 @@ const ko: Table = {
   "login.methodsDivider": "또는 다음으로 계속",
   "login.provider.github": "GitHub",
   "login.provider.google": "Google",
+  // The family IdP's brand name: the same in every locale, never translated.
+  "login.provider.celestia": "Celestia ID",
   "login.unlock.title": "메일함 잠금 해제",
   "login.unlock.subtitle": "{name}: 메일함 비밀번호를 한 번 입력하면 메일을 읽을 수 있습니다.",
   "login.error.denied": "제공업체에서 로그인이 취소되었습니다.",
@@ -1316,6 +1326,8 @@ const de: Table = {
   "login.methodsDivider": "oder fortfahren mit",
   "login.provider.github": "GitHub",
   "login.provider.google": "Google",
+  // The family IdP's brand name: the same in every locale, never translated.
+  "login.provider.celestia": "Celestia ID",
   "login.unlock.title": "Postfach entsperren",
   "login.unlock.subtitle": "{name}: Gib einmal das Postfach-Passwort ein, um deine Mails zu lesen.",
   "login.error.denied": "Die Anmeldung wurde beim Anbieter abgebrochen.",
@@ -1534,6 +1546,8 @@ const fr: Table = {
   "login.methodsDivider": "ou continuer avec",
   "login.provider.github": "GitHub",
   "login.provider.google": "Google",
+  // The family IdP's brand name: the same in every locale, never translated.
+  "login.provider.celestia": "Celestia ID",
   "login.unlock.title": "Déverrouiller votre boîte",
   "login.unlock.subtitle": "{name} : saisissez une fois le mot de passe de votre boîte pour lire vos messages.",
   "login.error.denied": "La connexion a été annulée chez le fournisseur.",
@@ -1752,6 +1766,8 @@ const es: Table = {
   "login.methodsDivider": "o continuar con",
   "login.provider.github": "GitHub",
   "login.provider.google": "Google",
+  // The family IdP's brand name: the same in every locale, never translated.
+  "login.provider.celestia": "Celestia ID",
   "login.unlock.title": "Desbloquear tu buzón",
   "login.unlock.subtitle": "{name}: introduce una vez la contraseña del buzón para leer tu correo.",
   "login.error.denied": "El inicio de sesión se canceló en el proveedor.",
@@ -1970,6 +1986,8 @@ const ru: Table = {
   "login.methodsDivider": "или продолжить через",
   "login.provider.github": "GitHub",
   "login.provider.google": "Google",
+  // The family IdP's brand name: the same in every locale, never translated.
+  "login.provider.celestia": "Celestia ID",
   "login.unlock.title": "Разблокировать ящик",
   "login.unlock.subtitle": "{name}: один раз введите пароль ящика, чтобы читать почту.",
   "login.error.denied": "Вход был отменён у провайдера.",
