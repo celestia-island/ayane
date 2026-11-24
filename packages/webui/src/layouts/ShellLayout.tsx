@@ -93,7 +93,8 @@ const ABOUT_LICENSES: HAboutLink[] = [
  *  logout) + the 224px sidebar nav (HkMenu) + the full footer status bar.
  *  Settings ride the family HkSettingsDialog (language select / theme
  *  panel / the shared HkAboutBody about page) from the header gear. A
- *  stale session anywhere returns to the login page silently. */
+ *  stale session anywhere returns to the login page silently; a locked
+ *  one is sent to the verify card by the mount that finds it. */
 export default defineComponent({
   name: "ShellLayout",
   setup() {
@@ -110,6 +111,16 @@ export default defineComponent({
     const address = ref(localStorage.getItem("ayane.address") || "");
     const admin = ref(false);
     const avatarUrl = ref(localStorage.getItem("ayane.avatar") || "");
+    /**
+     * Whether this mount's `session.whoami` has settled. No page of the
+     * shell renders before it has: a session that still owes the mailbox
+     * password (a provider proved the identity, not the mailbox) leaves
+     * for the verify card on THIS mount, so not one frame of a page — the
+     * account page and its sign-in actions included — is ever shown to it
+     * first. When the probe fails, the pages render and decide for
+     * themselves: every privileged surface is the server's.
+     */
+    const sessionKnown = ref(false);
 
     const info: HkConnectionInfo = {
       state: "connected",
@@ -335,12 +346,18 @@ export default defineComponent({
           localStorage.setItem("ayane.address", who.address);
           // A provider-minted session owes the mailbox password: the shell
           // cannot read mail until the verify card proves it once (the
-          // token stays; only the page changes).
+          // token stays; only the page changes). It goes there on this
+          // very mount — the content below is still withheld, and stays
+          // so: `sessionKnown` is never set for a locked session.
           if (who.needs_mailbox_password) {
             void router.replace("/login?unlock=1");
+            return;
           }
+          sessionKnown.value = true;
         })
-        .catch(() => undefined);
+        .catch(() => {
+          sessionKnown.value = true;
+        });
     });
 
     /** Pick a local image, cover-crop to 128px and store the data URL.
@@ -536,7 +553,7 @@ export default defineComponent({
                 }}
               </HSidebar>
             ),
-            content: () => <RouterView />,
+            content: () => (sessionKnown.value ? <RouterView /> : null),
             footer: () => (
               <HkStatusBar
                 version={__AYANE_VERSION__}

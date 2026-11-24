@@ -4,6 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 import { Link2, Link2Off } from "lucide-vue-next";
 
 import {
+  HkAlert,
   HkButton,
   HkConfirmDialog,
   HkSectionCard,
@@ -40,6 +41,19 @@ const loading = ref(true);
 const busy = ref<string | null>(null);
 /** The row the unlink confirm is armed on (the dialog owns the rest). */
 const unlinkTarget = ref<LinkedIdentity | null>(null);
+/**
+ * Whether the mailbox is still locked, as this page last PROVED it with
+ * `session.whoami`: `null` until then. The mailbox password is the
+ * account's second factor for changing its ways in — the server refuses
+ * both actions on a locked session — so they stay disabled while the lock
+ * is unknown or set, and are enabled by an answer alone, never by default.
+ */
+const locked = ref<boolean | null>(null);
+/** A closed-vocabulary reason of a link attempt that landed back here. */
+const linkFailure = ref("");
+
+/** Link and unlink are offered only to a session proven unlocked and idle. */
+const canChange = computed(() => locked.value === false && busy.value === null);
 
 /** The server localises nothing: a provider is named by its id, here. */
 function providerLabel(id: string): string {
@@ -62,15 +76,20 @@ function formatDate(iso: string | null): string {
 
 async function load(): Promise<void> {
   loading.value = true;
+  // Unknown until this load's own answer: a refresh never keeps an older
+  // "unlocked" on file.
+  locked.value = null;
   try {
-    const [linked, policy] = await Promise.all([
+    const [linked, policy, who] = await Promise.all([
       rpc.call<{ identities: LinkedIdentity[] }>("session.identities"),
       rpc.call<HkLoginDiscovery>("session.loginPolicy"),
+      rpc.call<{ needs_mailbox_password: boolean }>("session.whoami"),
     ]);
     identities.value = linked.identities;
     providers.value = (policy.methods ?? [])
       .filter((method) => method.kind === "oauth")
       .map((method) => method.id);
+    locked.value = who.needs_mailbox_password;
   } catch (e) {
     toastError(e);
   } finally {
@@ -81,7 +100,7 @@ async function load(): Promise<void> {
 /** Leave for the provider: the server issues a one-time ticket and the
  *  browser carries this session's mailbox through the round trip. */
 async function link(provider: string): Promise<void> {
-  if (busy.value !== null) return;
+  if (!canChange.value) return;
   busy.value = provider;
   try {
     const result = await rpc.call<{ href: string }>("session.linkIdentity", { provider });
@@ -100,7 +119,7 @@ async function link(provider: string): Promise<void> {
 
 async function confirmUnlink(): Promise<void> {
   const row = unlinkTarget.value;
-  if (!row) return;
+  if (!row || !canChange.value) return;
   busy.value = row.provider;
   try {
     await rpc.call("session.unlinkIdentity", { provider: row.provider });
@@ -122,7 +141,12 @@ onMounted(async () => {
   if (linked || failed) {
     void router.replace("/account");
     if (linked) toastSuccess(t("account.linked.linked", { provider: providerLabel(linked) }));
-    if (failed) toastWarning(t(oauthErrorKey(failed)));
+    // A failure also stays on the page as a notice: the toast is gone in
+    // a few seconds, and the list below shows nothing changed.
+    if (failed) {
+      linkFailure.value = failed;
+      toastWarning(t(oauthErrorKey(failed)));
+    }
   }
   await load();
 });
@@ -130,6 +154,22 @@ onMounted(async () => {
 
 <template>
   <div class="ay-account-page">
+    <HkAlert
+      v-if="linkFailure"
+      variant="warning"
+      :message="t(oauthErrorKey(linkFailure))"
+      closable
+      @close="linkFailure = ''"
+    />
+    <!-- A provider-minted session owes the mailbox password: the second
+         factor for the account's ways in. The shell sends such a session
+         to the verify card; the actions are disabled here regardless. -->
+    <div v-if="locked === true" class="ay-linked-locked">
+      <HkAlert variant="warning" :message="t('account.linked.locked')" />
+      <HkButton size="sm" variant="secondary" @click="router.push('/login?unlock=1')">
+        {{ t("login.unlock.title") }}
+      </HkButton>
+    </div>
     <HkSectionCard :title="t('account.linked.title')" :icon="Link2" :loading="loading" padded>
       <p class="muted ay-linked-hint">{{ t("account.linked.hint") }}</p>
       <ul v-if="identities.length || unlinkedProviders.length" class="ay-linked-list">
@@ -143,7 +183,7 @@ onMounted(async () => {
           <HkButton
             variant="ghost"
             size="sm"
-            :disabled="busy !== null"
+            :disabled="!canChange"
             @click="unlinkTarget = identity"
           >
             <Link2Off :size="14" /> {{ t("account.linked.unlink") }}
@@ -153,7 +193,7 @@ onMounted(async () => {
           <div class="ay-linked-name">
             <HkTag>{{ providerLabel(provider) }}</HkTag>
           </div>
-          <HkButton size="sm" :disabled="busy !== null" @click="link(provider)">
+          <HkButton size="sm" :disabled="!canChange" @click="link(provider)">
             <Link2 :size="14" /> {{ t("account.linked.link", { provider: providerLabel(provider) }) }}
           </HkButton>
         </li>
@@ -178,6 +218,8 @@ onMounted(async () => {
 <style scoped>
 .ay-account-page { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
 .ay-linked-hint { margin: 0 0 12px; }
+.ay-linked-locked { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.ay-linked-locked > :first-child { align-self: stretch; }
 .ay-linked-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .ay-linked-row {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;

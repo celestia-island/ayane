@@ -256,6 +256,7 @@ const en: Table = {
   "account.linked.linked": "{provider} is now linked",
   "account.linked.unlinked": "{provider} was unlinked",
   "account.linked.since": "Linked {date}",
+  "account.linked.locked": "Unlock your mailbox to change its linked sign-ins.",
 };
 
 const zhHans: Table = {
@@ -473,6 +474,7 @@ const zhHans: Table = {
   "account.linked.linked": "已关联 {provider}",
   "account.linked.unlinked": "已取消关联 {provider}",
   "account.linked.since": "关联于 {date}",
+  "account.linked.locked": "请先解锁邮箱，再更改关联登录。",
 };
 
 const zhHant: Table = {
@@ -690,6 +692,7 @@ const zhHant: Table = {
   "account.linked.linked": "已連結 {provider}",
   "account.linked.unlinked": "已取消連結 {provider}",
   "account.linked.since": "連結於 {date}",
+  "account.linked.locked": "請先解鎖信箱，再更改關聯登入。",
 };
 
 const ja: Table = {
@@ -907,6 +910,7 @@ const ja: Table = {
   "account.linked.linked": "{provider} を連結しました",
   "account.linked.unlinked": "{provider} の連結を解除しました",
   "account.linked.since": "{date} に連結",
+  "account.linked.locked": "連結されたサインインを変更するには、先にメールボックスのロックを解除してください。",
 };
 
 const ko: Table = {
@@ -1124,6 +1128,7 @@ const ko: Table = {
   "account.linked.linked": "{provider} 연결됨",
   "account.linked.unlinked": "{provider} 연결이 해제됨",
   "account.linked.since": "{date}에 연결됨",
+  "account.linked.locked": "연결된 로그인을 변경하려면 먼저 메일함 잠금을 해제하세요.",
 };
 
 const de: Table = {
@@ -1341,6 +1346,7 @@ const de: Table = {
   "account.linked.linked": "{provider} ist jetzt verknüpft",
   "account.linked.unlinked": "Verknüpfung mit {provider} gelöst",
   "account.linked.since": "Verknüpft am {date}",
+  "account.linked.locked": "Entsperre dein Postfach, um seine verknüpften Anmeldungen zu ändern.",
 };
 
 const fr: Table = {
@@ -1558,6 +1564,7 @@ const fr: Table = {
   "account.linked.linked": "{provider} est maintenant lié",
   "account.linked.unlinked": "{provider} a été délié",
   "account.linked.since": "Lié le {date}",
+  "account.linked.locked": "Déverrouillez votre boîte pour modifier ses connexions liées.",
 };
 
 const es: Table = {
@@ -1775,6 +1782,7 @@ const es: Table = {
   "account.linked.linked": "{provider} se ha vinculado",
   "account.linked.unlinked": "{provider} se ha desvinculado",
   "account.linked.since": "Vinculado el {date}",
+  "account.linked.locked": "Desbloquea tu buzón para cambiar sus inicios de sesión vinculados.",
 };
 
 const ru: Table = {
@@ -1992,6 +2000,7 @@ const ru: Table = {
   "account.linked.linked": "{provider} привязан",
   "account.linked.unlinked": "{provider} отвязан",
   "account.linked.since": "Привязан {date}",
+  "account.linked.locked": "Разблокируйте ящик, чтобы менять привязанные способы входа.",
 };
 
 const TABLES: Record<Locale, Table> = {
