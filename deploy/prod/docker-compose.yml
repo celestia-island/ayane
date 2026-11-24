@@ -1,0 +1,70 @@
+# ayane engine — production rig (public internet, TLS).
+#
+# Differences from the dev compose:
+#   · TLS certificates volume-mounted from the host's certbot live tree
+#   · 25 / 587 / 465 / 993 published publicly; 143 bound to host loopback
+#     only (plaintext AUTH is allowed on it for on-host smoke tests)
+#   · DKIM signing keys persisted for rspamd
+#   · services restart unless stopped
+name: ayane
+
+services:
+  valkey:
+    image: ${VALKEY_IMAGE:-valkey/valkey:8-alpine}
+    restart: unless-stopped
+
+  rspamd:
+    image: ${RSPAMD_IMAGE:-rspamd/rspamd:latest}
+    restart: unless-stopped
+    volumes:
+      - ../../state/rspamd:/var/lib/rspamd
+      - ./rspamd/local.d:/etc/rspamd/local.d:ro
+      - ../../state/config/rspamd/options.inc:/etc/rspamd/override.d/options.inc:ro
+    depends_on:
+      - valkey
+
+  dovecot:
+    build:
+      context: ../images/dovecot
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE:-debian:bookworm-slim}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:143:143"
+      - "993:993"
+    volumes:
+      - ayane-mail:/var/mail/vhosts
+      - ../../state/config/dovecot/passwd:/run/ayane/passwd:ro
+      - ./dovecot/dovecot.conf:/run/ayane/dovecot.conf:ro
+      # TLS: host certbot live tree (live/ symlinks into archive/)
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+
+  postfix:
+    build:
+      context: ../images/postfix
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE:-debian:bookworm-slim}
+    restart: unless-stopped
+    ports:
+      - "25:25"
+      - "587:587"
+      - "465:465"
+      # Internal submission for the control plane (loopback only).
+      - "127.0.0.1:10587:10587"
+    volumes:
+      - ../../state/config/postfix:/etc/postfix/maps:ro
+      - ./postfix/main.cf:/run/ayane/main.cf:ro
+      - ./postfix/master.cf:/run/ayane/master.cf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # The queue lives in a named volume so container recreation cannot
+      # silently discard deferred mail (a queued Gmail message was lost to
+      # exactly this). Empty named volumes copy the image's spool skeleton
+      # on first use, so the queue directory structure is preserved.
+      - ayane-spool:/var/spool/postfix
+    depends_on:
+      - dovecot
+      - rspamd
+
+volumes:
+  ayane-mail:
+  ayane-spool:

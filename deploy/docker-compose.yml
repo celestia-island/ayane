@@ -1,0 +1,64 @@
+# ayane engine — dev rig (single host, loopback-only publishing).
+#
+# The control plane (cargo run -p ayane) runs on the host and talks to:
+#   - submission 127.0.0.1:30587 (Postfix :587, AUTH via Dovecot SASL)
+#   - imap       127.0.0.1:3043   (Dovecot :143)
+# Rendered configuration is mounted read-only from ../state/config.
+name: ayane
+
+services:
+  valkey:
+    image: ${VALKEY_IMAGE:-valkey/valkey:8-alpine}
+    restart: "no"
+
+  rspamd:
+    image: ${RSPAMD_IMAGE:-rspamd/rspamd:latest}
+    restart: "no"
+    volumes:
+      - ../state/rspamd:/var/lib/rspamd
+      - ./rspamd/local.d:/etc/rspamd/local.d:ro
+      # Generated file lives in override.d (highest precedence) because
+      # local.d itself is a read-only bind that cannot host a nested mount.
+      - ../state/config/rspamd/options.inc:/etc/rspamd/override.d/options.inc:ro
+    depends_on:
+      - valkey
+
+  dovecot:
+    build:
+      context: ./images/dovecot
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE:-debian:bookworm-slim}
+    restart: "no"
+    ports:
+      - "127.0.0.1:3043:143"
+    volumes:
+      # Named volume: the maildir must be owned by vmail(5000) inside the
+      # container; a host bind mount would inherit the host uid and the
+      # user could not write to it.
+      - ayane-mail:/var/mail/vhosts
+      - ../state/config/dovecot/passwd:/run/ayane/passwd:ro
+
+  postfix:
+    build:
+      context: ./images/postfix
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE:-debian:bookworm-slim}
+    restart: "no"
+    ports:
+      - "127.0.0.1:3025:25"
+      - "127.0.0.1:30587:587"
+    volumes:
+      - ../state/config/postfix:/etc/postfix/maps:ro
+    depends_on:
+      - dovecot
+      - rspamd
+
+  # Optional antivirus: `docker compose --profile av up -d` and mount
+  # local.d/antivirus.conf (see deploy/rspamd/README notes in deploy/README.md).
+  clamav:
+    image: ${CLAMAV_IMAGE:-clamav/clamav:latest}
+    restart: "no"
+    profiles: ["av"]
+
+volumes:
+  ayane-mail:

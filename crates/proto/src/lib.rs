@@ -119,6 +119,18 @@ impl Address {
     }
 }
 
+/// Validate a standalone domain name (policy rules, hosted domains).
+///
+/// # Errors
+///
+/// Returns [`AddressError::MalformedDomain`] on empty/oversized/mislabelled
+/// input and [`AddressError::IllegalCharacter`] on anything outside ASCII
+/// alphanumerics, hyphens and dots — the exact character set the postfix
+/// access-map renderer interpolates, so a rule can never inject a line.
+pub fn check_domain(domain: &str) -> Result<(), AddressError> {
+    validate_domain(domain)
+}
+
 fn validate_domain(domain: &str) -> Result<(), AddressError> {
     if domain.len() > 253 || domain.starts_with('.') || domain.ends_with('.') {
         return Err(AddressError::MalformedDomain);
@@ -199,6 +211,55 @@ pub enum DefaultAction {
     Reject,
 }
 
+/// Message audit configuration: fixed keyword matches plus an optional AI
+/// pass. The AI leg speaks ONLY the org's arona panel — no other provider
+/// is wired, on purpose (the mail service stays inside the family's AI
+/// perimeter).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Master switch for the whole audit surface.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Literal keywords (matched case-insensitively against subject and
+    /// body) that flag a message.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// The AI pass through arona.
+    #[serde(default)]
+    pub ai: AuditAiConfig,
+}
+
+/// The arona-backed AI audit leg.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditAiConfig {
+    /// Master switch for the AI leg (still gated by `audit.enabled`).
+    #[serde(default)]
+    pub enabled: bool,
+    /// arona base URL, e.g. `https://arona.example.org`.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Model id requested from arona.
+    #[serde(default)]
+    pub model: String,
+    /// Bearer token for arona. Lives only in the server's state store
+    /// (0600 redb); never enters a git tree.
+    #[serde(default)]
+    pub api_token: String,
+}
+
+/// MCP tool-surface configuration: which JSON-RPC methods the `/api/mcp`
+/// proxy exposes, and the bearer token callers must present.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// Methods exposed on `/api/mcp` (absent = none exposed).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Bearer token for MCP callers; regenerated only through the admin
+    /// surface (shown once). Empty disables the proxy entirely.
+    #[serde(default)]
+    pub token: String,
+}
+
 /// Recipient policy for unknown recipients.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
@@ -234,6 +295,10 @@ pub struct Account {
     pub display_name: String,
     /// Mailbox quota in bytes; `0` means unlimited.
     pub quota_bytes: u64,
+    /// Whether this account may administer the service (admin sessions).
+    /// Defaults false for states stored before the field existed.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 /// A forwarding rule that does not keep a local copy.
@@ -274,7 +339,7 @@ pub enum StateError {
 }
 
 /// The full desired configuration of one instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredState {
     /// Hosted domains.
     pub domains: Vec<MailDomain>,
@@ -286,6 +351,12 @@ pub struct DesiredState {
     pub shared: Vec<SharedMailbox>,
     /// Recipient policy.
     pub policy: Policy,
+    /// Message audit configuration (keyword + AI through arona).
+    #[serde(default)]
+    pub audit: AuditConfig,
+    /// MCP tool-surface configuration.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 impl DesiredState {
@@ -297,6 +368,23 @@ impl DesiredState {
     /// unusable catch-all / shared mailbox.
     pub fn validate(&self) -> Result<(), StateError> {
         let mut seen = std::collections::HashSet::new();
+        // Policy rule domains reach the postfix access-map renderer raw;
+        // validate() is the REST path's only guard, so it enforces the
+        // same DNS character law the ws policy editor does.
+        for rule in self
+            .policy
+            .allowlist
+            .iter()
+            .chain(self.policy.denylist.iter())
+        {
+            if let SenderRule::Domain(domain) = rule {
+                if let Err(error) = check_domain(domain) {
+                    return Err(StateError::DuplicateAddress(format!(
+                        "policy domain rule rejected: {error}"
+                    )));
+                }
+            }
+        }
         for domain in &self.domains {
             if !seen.insert(format!("@{}", domain.name)) {
                 return Err(StateError::DuplicateAddress(domain.name.clone()));
@@ -425,6 +513,7 @@ mod tests {
                 address: address("inbox@example.com"),
                 display_name: "Inbox".to_owned(),
                 quota_bytes: 0,
+                admin: false,
             }],
             aliases: vec![Alias {
                 source: address("sales@example.com"),
@@ -436,6 +525,9 @@ mod tests {
                 members: vec![Uuid::nil()],
             }],
             policy: Policy::default(),
+
+            audit: Default::default(),
+            mcp: Default::default(),
         }
     }
 
@@ -452,6 +544,7 @@ mod tests {
             address: address("inbox@example.com"),
             display_name: "Dup".to_owned(),
             quota_bytes: 0,
+            admin: false,
         });
         assert!(matches!(
             state.validate(),

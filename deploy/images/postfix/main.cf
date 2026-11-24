@@ -1,0 +1,57 @@
+# ayane dev Postfix — virtual domains via Dovecot LMTP, rspamd milter.
+# Rendered maps (virtual_*) are mounted at /etc/postfix/maps by compose;
+# only this file and master.cf are baked into the image.
+compatibility_level = 3.6
+
+# Container has no syslog: log to stdout so `docker logs` shows everything.
+maillog_file = /dev/stdout
+
+myhostname = mail.ayane.invalid
+myorigin = $myhostname
+mydestination = localhost.$mydomain, localhost
+inet_interfaces = all
+inet_protocols = ipv4
+
+# Never trust the docker bridge: an unauthenticated connection from another
+# container (or the host) must go through the policy checks below, otherwise
+# permit_mynetworks would wave it past the sender deny list.
+mynetworks = 127.0.0.0/8
+
+# Virtual mailbox domains (rendered by the control plane).
+virtual_mailbox_domains = texthash:/etc/postfix/maps/virtual_domains
+virtual_mailbox_maps = texthash:/etc/postfix/maps/virtual_mailboxes
+virtual_alias_maps = texthash:/etc/postfix/maps/virtual_aliases, pcre:/etc/postfix/subaddress.pcre
+# Do not derive the alias-domain list from the alias maps (the default):
+# every hosted domain is a mailbox domain here, and deriving it would make a
+# single unreadable map poison recipient lookups for all of them.
+virtual_alias_domains =
+virtual_uid_maps = static:5000
+virtual_gid_maps = static:5000
+virtual_transport = lmtp:dovecot:24
+
+# Subaddress folding happens in the pcre map above.
+recipient_delimiter = +
+
+# Submission auth is delegated to Dovecot SASL.
+smtpd_sasl_type = dovecot
+smtpd_sasl_path = inet:dovecot:12345
+smtpd_sasl_auth_enable = yes
+smtpd_sasl_security_options = noanonymous
+# Dev rig only: plaintext AUTH inside the compose network; a real edge
+# terminates TLS in front of this.
+smtpd_tls_auth_only = no
+smtpd_tls_security_level = none
+
+# Order matters: the sender deny list (rendered by the control plane) is
+# consulted for unauthenticated inbound mail only — an authenticated user is
+# our own account and must be able to send anywhere.
+smtpd_recipient_restrictions = permit_mynetworks, check_sender_access texthash:/etc/postfix/maps/sender_denylist, permit_sasl_authenticated, reject_unauth_destination
+
+# Content filter (spam / DKIM / headers) via milter; accept mail when the
+# filter is down so a missing rspamd never blocks delivery in the dev rig.
+smtpd_milters = inet:rspamd:11332
+milter_default_action = accept
+milter_protocol = 6
+
+message_size_limit = 26214400
+mailbox_size_limit = 0

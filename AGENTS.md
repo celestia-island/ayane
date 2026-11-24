@@ -36,8 +36,13 @@ CI 不在 PR 上跑（工作区口径）：`ci.yml` 仅 `workflow_dispatch`；`d
 - `ayane-proto`：纯数据 + 校验，无 I/O、无时钟。
 - `ayane-mail`：纯路由 / 收件人策略 / MIME 构造（`lettre` 只做**客户端**）。
 - `ayane-engine`：纯渲染，输出 Postfix / Dovecot / rspamd 配置文本。
-- `ayane`（core）：HTTP 面 + 进程生命周期；不直接解析邮件。
+- `ayane-store`：redb 持久化（经 lacrymira KV 面）+ 密码哈希；快照式存取，无部分态。
+- `ayane`（core）：HTTP 面 + apply 循环 + 进程生命周期；不直接解析邮件。
 - 渲染必须确定性：同一状态两次输出逐字节相同，**先 diff 再写盘再 reload**。
+- `crates/core/tests/smoke.rs` 是 `#[ignore]` 的端到端冒烟（要引擎 rig 在跑）：
+  `just engine-up && just serve` 后 `cargo test -p ayane --test smoke -- --ignored --nocapture`。
+- 引擎 rig 端口（node-1 本机回环，登记在 `_ledger/ports-and-domains.md`）：
+  3023 ayane API / 3043 IMAP / 30587 submission / 3025 MTA（调试用）。
 - 版本声明两段式（`^1` / `^0.8`）；禁三段式、`^*`、`^0.*`、裸 `*`、`latest`。
 
 ## 凭据与部署参数

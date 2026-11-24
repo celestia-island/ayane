@@ -1,0 +1,25 @@
+{
+  "name": "@celestia-island/ayane-webui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@celestia-island/hikari": "^0.55.474",
+    "lucide-vue-next": "^1",
+    "vue": "^3",
+    "vue-router": "^5"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "@vitejs/plugin-vue": "^6",
+    "@vitejs/plugin-vue-jsx": "^5",
+    "sass": "^1",
+    "typescript": "^5",
+    "vite": "^8",
+    "vue-tsc": "^3"
+  }
+}

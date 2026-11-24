@@ -8,7 +8,11 @@
 
 use ayane_proto::{Address, DefaultAction, DesiredState};
 
+pub mod client;
 pub mod compose;
+pub mod mime;
+pub mod phishing;
+pub mod smtp;
 
 /// Where a message for `recipient` should go.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,12 +143,14 @@ mod tests {
                     address: addr("inbox@example.com"),
                     display_name: "Inbox".to_owned(),
                     quota_bytes: 0,
+                    admin: false,
                 },
                 Account {
                     id: Uuid::new_v4(),
                     address: addr("ops@example.com"),
                     display_name: "Ops".to_owned(),
                     quota_bytes: 0,
+                    admin: false,
                 },
             ],
             aliases: vec![Alias {
@@ -161,6 +167,8 @@ mod tests {
                 allowlist,
                 denylist: vec![SenderRule::Domain("spam.example".to_owned())],
             },
+            audit: Default::default(),
+            mcp: Default::default(),
         }
     }
 

@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="https://raw.githubusercontent.com/celestia-island/celestia-island.github.io/main/res/logos/ayane.webp" alt="ayane" width="180" />
+</div>
+
 <h1 align="center">Ayane</h1>
 
 <div align="center">
@@ -29,6 +33,12 @@ communications officer of the Abydos Countermeasures Committee, a principled
 rule-keeper who maintains the committee's ledger. Secretary → mailbox
 administration, communications officer → routing, rule-keeper → policy and
 audit, ledger → the audit trail.
+
+The emblem — a hand-drawn colored-pencil mark in the lacrymira house style,
+served from the org site — encodes the same reading: her reticle-shaped halo
+(the precise ledger-keeper), the headset with boom mic (the communications
+officer), the envelope (the mail), and one red accent for her red-framed
+glasses.
 
 ## Architecture
 
