@@ -202,8 +202,10 @@ async function startProvider(_channel: string, provider: string): Promise<void> 
   if (starting.value !== null) return;
   starting.value = provider;
   try {
-    // `token: null` says "sign in", never "link": the login page has no
-    // session to link to, and the server must not read a stale one.
+    // `token: null` keeps the client from attaching a stored bearer to a
+    // sign-in. The server reads no token here either way:
+    // `session.oauthBegin` is always the login purpose; linking is
+    // `session.linkIdentity`, from the account page alone.
     const result = await rpc.call<{ href: string }>("session.oauthBegin", {
       provider,
       token: null,

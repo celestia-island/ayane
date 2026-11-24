@@ -32,8 +32,10 @@
 //! # Browser flow
 //!
 //! ```text
-//! SPA  session.oauthBegin {provider, returnTo?}  ──► ticket (one-time, 10 min)
+//! SPA  session.oauthBegin {provider, returnTo?}  ──► ticket (one-time, 10 min) — a SIGN-IN, always
+//! SPA  session.linkIdentity {provider}           ──► the same ticket — to LINK, authenticated alone
 //! GET  /api/auth/oauth/{provider}?ticket=…       ──► Set-Cookie binding; 302 authorize
+//!                                                 (spent here, on its own provider's route only)
 //! GET  /api/auth/oauth/{provider}/callback?code&state
 //!                                                 ──► finish(…) → identity
 //!      linked   → handoff code → 302 {base}/login?handoff=…
@@ -41,6 +43,14 @@
 //!      link purpose → link() →  302 {base}/account?linked={provider}
 //! SPA  session.claimHandoff {code} ──► session (+ needs_mailbox_password)
 //! ```
+//!
+//! The purpose is the METHOD's and nothing else's: `session.oauthBegin`
+//! is a sign-in whatever token the connection holds (it reads none), and
+//! linking goes only through `session.linkIdentity`. A sign-in that
+//! reaches an existing mailbox mints a session that is **locked** until
+//! the mailbox password is proven once: the provider said who the visitor
+//! is, and that password is the account's second factor for the mailbox
+//! and for every privileged surface alike ([`crate::rpc`]).
 //!
 //! The binding cookie (`ayane_oauth_binding`, HttpOnly, `SameSite=Lax`,
 //! scoped to `/api/auth/oauth`) closes login CSRF: a callback that reaches
@@ -122,7 +132,11 @@ pub enum AuthConfigError {
     /// A URL is neither https nor a loopback http origin.
     #[error("{0} must be https (http is allowed only for a loopback host)")]
     NotHttps(&'static str),
-    /// The public base URL carries a path, query or fragment.
+    /// A URL carries userinfo (`https://user:password@host`).
+    #[error("{0} must not carry userinfo (user:password@ before the host)")]
+    Userinfo(&'static str),
+    /// The public base URL is anything but `scheme://host[:port]` plus an
+    /// optional single `/`.
     #[error("{0} must be a bare origin (scheme://host[:port])")]
     NotAnOrigin(&'static str),
 }
@@ -157,8 +171,54 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
+/// The authority of a URL as RAWLY spelled: the text between `scheme://`
+/// and the first `/`, `?` or `#`. `None` when there is no `scheme://`.
+///
+/// The normalised [`Url`] is not enough for the checks below: it drops an
+/// empty `user@`, folds `/.` and `/..` path segments into `/`, and strips
+/// tab and newline characters anywhere in the input — each one a spelling
+/// two parsers would read differently. The raw text is what was configured.
+fn raw_authority(raw: &str) -> Option<&str> {
+    let rest = raw.split_once("://")?.1;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Whether `raw` is spelled as a bare origin — `scheme://host[:port]`
+/// followed by nothing but an optional single `/` — judged on the raw
+/// string, not on a normalised path.
+fn is_bare_origin(raw: &str) -> bool {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return false;
+    };
+    // One trailing `/` is the same origin; anything else after the
+    // authority (a path, a second slash, a query, a fragment, a backslash
+    // the `url` crate would read as a path separator) is not bare.
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    !scheme.is_empty()
+        && !authority.is_empty()
+        && !authority.bytes().any(|b| {
+            matches!(b, b'/' | b'?' | b'#' | b'\\' | b'@')
+                || b.is_ascii_whitespace()
+                || b.is_ascii_control()
+        })
+}
+
 fn parse_secure_url(raw: &str, name: &'static str) -> Result<Url, AuthConfigError> {
-    let url = Url::parse(raw.trim()).map_err(|error| AuthConfigError::InvalidUrl(name, error))?;
+    let raw = raw.trim();
+    let url = Url::parse(raw).map_err(|error| AuthConfigError::InvalidUrl(name, error))?;
+    // MUT:no-userinfo — a URL that carries userinfo is refused outright.
+    // `https://u:p@host` and `https://host` are different authorities to
+    // every other parser (a browser, a proxy, curl) while the normalised
+    // `Url` happily serves either; the operator wrote one host, so a
+    // second one in front of the `@` is never honoured. The raw authority
+    // is checked too: an empty `user@` leaves no trace on the `Url`.
+    let userinfo = raw_authority(raw).is_some_and(|authority| authority.contains('@'))
+        || !url.username().is_empty()
+        || url.password().is_some();
+    if userinfo {
+        return Err(AuthConfigError::Userinfo(name));
+    }
     if url.scheme() != "https" && !(url.scheme() == "http" && is_loopback(&url)) {
         return Err(AuthConfigError::NotHttps(name));
     }
@@ -166,11 +226,14 @@ fn parse_secure_url(raw: &str, name: &'static str) -> Result<Url, AuthConfigErro
 }
 
 fn parse_origin(raw: &str, name: &'static str) -> Result<Url, AuthConfigError> {
+    let raw = raw.trim();
     let url = parse_secure_url(raw, name)?;
-    let bare = (url.path() == "/" || url.path().is_empty())
-        && url.query().is_none()
-        && url.fragment().is_none();
-    if !bare || url.host().is_none() {
+    // MUT:bare-origin-raw — "bare" is judged on the raw spelling. The
+    // normalised path would accept `https://host/.` (folded to `/`) and
+    // a host with an embedded tab (stripped): both carry more than an
+    // origin, and a return address or redirect URI built on them would
+    // not be the origin the operator believes they configured.
+    if !is_bare_origin(raw) || url.host().is_none() {
         return Err(AuthConfigError::NotAnOrigin(name));
     }
     Ok(url)
@@ -811,6 +874,16 @@ struct Ticket {
     expires: Instant,
 }
 
+/// Why [`AttemptStore::take_ticket_for`] did not spend a ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketRefusal {
+    /// No live ticket by that value: never issued, already spent, or
+    /// expired.
+    Unknown,
+    /// The ticket names another provider. Nothing was consumed.
+    Mismatch,
+}
+
 /// The in-memory side of federated sign-in: kirino's one-time attempt
 /// store, the tickets that unlock an attempt, the purpose parked behind
 /// each `state` (the browser only carries the state back) and the
@@ -894,10 +967,30 @@ impl AttemptStore {
         Ok((ticket, attempt))
     }
 
-    /// Spend a ticket: exactly once, never an expired one.
-    pub fn take_ticket(&self, ticket: &str) -> Option<(LoginAttempt, AttemptPurpose)> {
-        let taken = self.tickets.lock().expect("tickets mutex").remove(ticket)?;
-        (taken.expires > Instant::now()).then_some((taken.attempt, taken.purpose))
+    /// Spend a ticket — and only on the route of the provider it was
+    /// minted for. The provider check and the removal are one step under
+    /// the tickets lock, so a mismatch leaves the ticket exactly where it
+    /// was: the browser that took a wrong turn can still spend it on the
+    /// right route. This is the ONLY way a ticket is spent.
+    pub fn take_ticket_for(
+        &self,
+        ticket: &str,
+        provider: &str,
+    ) -> Result<(LoginAttempt, AttemptPurpose), TicketRefusal> {
+        let mut tickets = self.tickets.lock().expect("tickets mutex");
+        let live = tickets
+            .get(ticket)
+            .filter(|live| live.expires > Instant::now());
+        let Some(live) = live else {
+            return Err(TicketRefusal::Unknown);
+        };
+        if live.attempt.provider != provider {
+            return Err(TicketRefusal::Mismatch);
+        }
+        let Some(taken) = tickets.remove(ticket) else {
+            return Err(TicketRefusal::Unknown);
+        };
+        Ok((taken.attempt, taken.purpose))
     }
 
     /// The purpose parked behind `state`, taken out (the attempt is spent
@@ -994,8 +1087,9 @@ pub enum OAuthError {
     Code,
     /// The callback did not come from the browser that started the sign-in.
     Binding,
-    /// The attempt was started for another provider.
-    Mismatch,
+    /// The ticket or callback was presented on another provider's route
+    /// than the attempt was started for.
+    MismatchProvider,
     /// The token endpoint's answer was unusable.
     Token,
     /// The provider returned no usable subject.
@@ -1023,7 +1117,7 @@ impl From<CallbackProblem> for OAuthError {
             CallbackProblem::MissingState | CallbackProblem::UnknownState => Self::State,
             CallbackProblem::MissingCode => Self::Code,
             CallbackProblem::BindingMismatch => Self::Binding,
-            CallbackProblem::ProviderMismatch => Self::Mismatch,
+            CallbackProblem::ProviderMismatch => Self::MismatchProvider,
             CallbackProblem::TokenInvalid(_) | CallbackProblem::IdTokenInvalid(_) => Self::Token,
             CallbackProblem::IdentityEmpty => Self::Identity,
             CallbackProblem::Transport(_) => Self::Unreachable,
@@ -1040,7 +1134,7 @@ impl OAuthError {
             Self::State => "state",
             Self::Code => "code",
             Self::Binding => "binding",
-            Self::Mismatch => "mismatch",
+            Self::MismatchProvider => "mismatch_provider",
             Self::Token => "token",
             Self::Identity => "identity",
             Self::Unreachable => "unreachable",
@@ -1338,11 +1432,21 @@ fn failure(reason: OAuthError) -> Response {
 
 /// `GET /api/auth/oauth/{provider}?ticket=…` — spend the ticket, bind the
 /// attempt to this browser, send it to the provider.
+///
+/// Nothing is spent before the route's provider is known to the catalog:
+/// an unknown provider, or one without a public base, is refused by name
+/// and a real ticket in that request stays spendable on its own route.
 async fn oauth_start(
     State(app): State<AppState>,
     Path(provider): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
+    let Some(built_in) = app.auth.catalog.provider(&provider) else {
+        return failure(OAuthError::UnknownProvider);
+    };
+    let Some(redirect_uri) = app.auth.catalog.redirect_uri(&provider) else {
+        return failure(OAuthError::NotConfigured);
+    };
     let Some(ticket) = query
         .as_deref()
         .and_then(|raw| {
@@ -1354,21 +1458,16 @@ async fn oauth_start(
     else {
         return failure(OAuthError::State);
     };
-    // MUT:ticket-single-use — the ticket is spent here, before anything
-    // else; a replayed one finds nothing.
-    let Some((attempt, _purpose)) = app.auth.attempts.take_ticket(&ticket) else {
-        return failure(OAuthError::State);
-    };
-    // The ticket names its provider: one spent on another provider's
-    // route is refused (and stays spent).
-    if attempt.provider != provider {
-        return failure(OAuthError::Mismatch);
-    }
-    let Some(built_in) = app.auth.catalog.provider(&provider) else {
-        return failure(OAuthError::UnknownProvider);
-    };
-    let Some(redirect_uri) = app.auth.catalog.redirect_uri(&provider) else {
-        return failure(OAuthError::NotConfigured);
+    // MUT:ticket-single-use — the ticket is spent here, once; a replayed
+    // one finds nothing.
+    // MUT:ticket-provider-before-spend — it is spent only on the provider
+    // route it was minted for. A ticket presented on another provider's
+    // route is refused WITHOUT being consumed: the check and the removal
+    // are one step, so a wrong turn costs the browser nothing.
+    let attempt = match app.auth.attempts.take_ticket_for(&ticket, &provider) {
+        Ok((attempt, _purpose)) => attempt,
+        Err(TicketRefusal::Mismatch) => return failure(OAuthError::MismatchProvider),
+        Err(TicketRefusal::Unknown) => return failure(OAuthError::State),
     };
     let Some(binding) = attempt.browser_binding.clone() else {
         return failure(OAuthError::State);
@@ -1618,6 +1717,87 @@ mod tests {
         // A malformed base URL is refused even with no provider beside it.
         let env = Env::from([(PUBLIC_BASE_URL_ENV, "http://mail.example.test")]);
         assert!(ProviderCatalog::from_env_with(read(&env)).is_err());
+    }
+
+    #[test]
+    fn the_public_base_refuses_userinfo() {
+        // MUT:no-userinfo — `https://user:password@host` is one authority
+        // to the normalised `Url` and another to every other parser. It is
+        // refused before anything else is judged, and the refusal names
+        // the variable without echoing what was typed in front of the `@`.
+        for raw in [
+            "https://someone:s3cr3t@mail.example.test",
+            "https://someone@mail.example.test",
+            "https://:s3cr3t@mail.example.test",
+            "https://@mail.example.test",
+            "http://someone:s3cr3t@127.0.0.1:3023",
+        ] {
+            let env = Env::from([
+                (GITHUB_CLIENT_ID_ENV, "cid-github"),
+                (PUBLIC_BASE_URL_ENV, raw),
+            ]);
+            let refused = ProviderCatalog::from_env_with(read(&env)).unwrap_err();
+            assert_eq!(
+                refused,
+                AuthConfigError::Userinfo(PUBLIC_BASE_URL_ENV),
+                "{raw:?}"
+            );
+            let shown = refused.to_string();
+            assert!(
+                !shown.contains("s3cr3t") && !shown.contains("someone"),
+                "{shown}"
+            );
+        }
+        // An `@` after the authority is data, not an authority: not
+        // userinfo (though a query is still not a bare origin).
+        let env = Env::from([
+            (GITHUB_CLIENT_ID_ENV, "cid-github"),
+            (PUBLIC_BASE_URL_ENV, "https://mail.example.test/?to=a@b"),
+        ]);
+        assert_eq!(
+            ProviderCatalog::from_env_with(read(&env)).unwrap_err(),
+            AuthConfigError::NotAnOrigin(PUBLIC_BASE_URL_ENV)
+        );
+    }
+
+    #[test]
+    fn the_public_base_is_bare_on_the_raw_string() {
+        // MUT:bare-origin-raw — the normalised `Url` folds each of these
+        // onto a bare origin (`/.` and `/a/..` become `/`, a backslash is a
+        // path separator, an embedded tab is dropped); the raw spelling is
+        // what the operator wrote, and it carries more than an origin.
+        assert_eq!(
+            Url::parse("https://mail.example.test/.").unwrap().path(),
+            "/"
+        );
+        for raw in [
+            "https://mail.example.test/.",
+            "https://mail.example.test/..",
+            "https://mail.example.test/a/..",
+            "https://mail.example.test//",
+            "https://mail.example.test\\",
+            "https://mail.example.test\\webmail",
+            "https://mail.exa\tmple.test",
+        ] {
+            let env = Env::from([
+                (GITHUB_CLIENT_ID_ENV, "cid-github"),
+                (PUBLIC_BASE_URL_ENV, raw),
+            ]);
+            assert_eq!(
+                ProviderCatalog::from_env_with(read(&env)).unwrap_err(),
+                AuthConfigError::NotAnOrigin(PUBLIC_BASE_URL_ENV),
+                "{raw:?}"
+            );
+        }
+        // With and without the one optional slash: the same origin.
+        for raw in ["https://mail.example.test", "https://mail.example.test/"] {
+            let env = Env::from([
+                (GITHUB_CLIENT_ID_ENV, "cid-github"),
+                (PUBLIC_BASE_URL_ENV, raw),
+            ]);
+            let catalog = ProviderCatalog::from_env_with(read(&env)).expect("a bare origin");
+            assert_eq!(catalog.return_origins(), ["https://mail.example.test"]);
+        }
     }
 
     #[test]
@@ -1997,7 +2177,16 @@ mod tests {
             .expect("begin");
         assert!(attempt.browser_binding.is_some(), "every attempt is bound");
         assert_eq!(attempt.provider, "github");
-        let (taken, purpose) = attempts.take_ticket(&ticket).expect("first spend");
+        // MUT:ticket-provider-before-spend — the ticket is spent only on
+        // its own provider's route; a wrong provider is refused and the
+        // ticket survives it, intact and still single-use.
+        assert_eq!(
+            attempts.take_ticket_for(&ticket, "google"),
+            Err(TicketRefusal::Mismatch)
+        );
+        let (taken, purpose) = attempts
+            .take_ticket_for(&ticket, "github")
+            .expect("spend on the right route after the refusal");
         assert_eq!(taken.state, attempt.state);
         assert_eq!(
             purpose,
@@ -2006,8 +2195,14 @@ mod tests {
             }
         );
         // MUT:ticket-single-use — a replayed ticket finds nothing.
-        assert!(attempts.take_ticket(&ticket).is_none());
-        assert!(attempts.take_ticket("never-issued").is_none());
+        assert_eq!(
+            attempts.take_ticket_for(&ticket, "github"),
+            Err(TicketRefusal::Unknown)
+        );
+        assert_eq!(
+            attempts.take_ticket_for("never-issued", "github"),
+            Err(TicketRefusal::Unknown)
+        );
         // kirino's store still holds the attempt for the callback.
         assert!(attempts
             .attempts
@@ -2015,6 +2210,50 @@ mod tests {
             .await
             .expect("take")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_ticket_on_another_provider_is_refused_but_not_consumed() {
+        let attempts = AttemptStore::new();
+        let (ticket, attempt) = attempts
+            .begin(
+                "github",
+                AttemptPurpose::Link {
+                    address: Address::parse("a@example.test").expect("address"),
+                },
+            )
+            .await
+            .expect("begin");
+        // A ticket presented with a provider the catalog does not know is
+        // no mismatch at all — the route refuses it by name before any
+        // lookup — and an unknown value is simply unknown.
+        assert_eq!(
+            attempts.take_ticket_for("no-such-ticket", "github"),
+            Err(TicketRefusal::Unknown)
+        );
+        // Two refusals on the same ticket: it is still there afterwards.
+        for _ in 0..2 {
+            assert_eq!(
+                attempts.take_ticket_for(&ticket, "google"),
+                Err(TicketRefusal::Mismatch),
+                "a refusal must not consume the ticket"
+            );
+        }
+        let (taken, purpose) = attempts
+            .take_ticket_for(&ticket, "github")
+            .expect("the ticket outlived the refusals");
+        assert_eq!(taken.state, attempt.state);
+        assert_eq!(
+            purpose,
+            AttemptPurpose::Link {
+                address: Address::parse("a@example.test").expect("address")
+            }
+        );
+        // Spent once: dead.
+        assert_eq!(
+            attempts.take_ticket_for(&ticket, "github"),
+            Err(TicketRefusal::Unknown)
+        );
     }
 
     #[tokio::test]
@@ -2110,7 +2349,7 @@ mod tests {
             OAuthError::State,
             OAuthError::Code,
             OAuthError::Binding,
-            OAuthError::Mismatch,
+            OAuthError::MismatchProvider,
             OAuthError::Token,
             OAuthError::Identity,
             OAuthError::Unreachable,

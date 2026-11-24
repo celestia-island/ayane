@@ -10,10 +10,20 @@
 //! The IMAP leg needs the mailbox password and the store only keeps
 //! hashes, so a session carries the plaintext **in memory only**, for its
 //! TTL, and never persists or logs it.
+//!
+//! That password is also the account's second factor on the privileged
+//! surface: a provider-minted session that still owes it
+//! (`needs_mailbox_password`) is refused by EVERY `admin.*` method with
+//! `Session.MailboxLocked`, the same words the mail methods answer, until
+//! `session.unlockMailbox` proves it once. And every handler that edits a
+//! slice of the snapshot does so under the store's lock
+//! ([`update_state`]): an unlocked read-edit-write writes back a moment
+//! that has already passed.
 
 use serde_json::{json, Value};
 
 use ayane_mail::client::{Imap, MarkSeen, Submission};
+use ayane_store::StoredState;
 
 use kirino::auth::identity::external::ExternalIdentityStore;
 
@@ -103,7 +113,7 @@ pub async fn dispatch(
         "session.adminLogin" => wrap(admin_login(app, sessions, ctx, &params)),
         // Provider sign-in: start (ticket → href), claim the callback's
         // handoff, prove the mailbox password of a locked session.
-        "session.oauthBegin" => wrap(oauth_begin(app, sessions, ctx, &params).await),
+        "session.oauthBegin" => wrap(oauth_begin(app, &params).await),
         "session.claimHandoff" => wrap(claim_handoff(app, sessions, ctx, &params)),
         "session.unlockMailbox" => wrap(unlock_mailbox(app, sessions, ctx, &params)),
         // Linked sign-ins of the authenticated mailbox.
@@ -219,6 +229,16 @@ fn wrap_result(result: Result<Value, AppError>) -> RpcOutcome {
     }
 }
 
+/// The refusal every privileged surface answers while the session owes
+/// the mailbox password — the mail methods, the admin gate, the audit leg
+/// — in the same words, so the SPA has one path to act on.
+fn mailbox_locked() -> AppError {
+    AppError::new(
+        "Session.MailboxLocked",
+        "the mailbox is locked: enter the mailbox password",
+    )
+}
+
 /// Authenticate, then run a mail method with the session. The session must
 /// be a mailbox session (admin sessions have no IMAP password).
 async fn mail_route<F, Fut>(
@@ -239,10 +259,7 @@ where
     // MUT:mail-locked — a provider-minted session owes the mailbox password;
     // nothing that opens the mailbox may run before it is proven.
     if session.mailbox_locked() {
-        return RpcOutcome::App(AppError::new(
-            "Session.MailboxLocked",
-            "the mailbox is locked: enter the mailbox password",
-        ));
+        return RpcOutcome::App(mailbox_locked());
     }
     if session.password.is_none() {
         return RpcOutcome::App(AppError::new(
@@ -259,30 +276,25 @@ fn login_policy(app: &AppState) -> Value {
     serde_json::to_value(app.auth.catalog.login_policy()).unwrap_or(Value::Null)
 }
 
-/// `session.oauthBegin {provider, returnTo?}`: start a provider sign-in and
-/// answer the same-origin `href` the browser navigates to.
+/// `session.oauthBegin {provider, returnTo?}`: start a provider SIGN-IN
+/// and answer the same-origin `href` the browser navigates to.
 ///
-/// A live session (the account page) LINKS the identity to its mailbox;
-/// without one (the login page, which passes an explicit `token: null`)
-/// the sign-in LOGS IN and lands on `returnTo` — sanitised to a
-/// same-origin path; a foreign address is dropped, never forwarded.
-async fn oauth_begin(
-    app: &AppState,
-    sessions: &SessionStore,
-    ctx: &mut WsContext,
-    params: &Value,
-) -> Result<Value, AppError> {
+/// Always the login purpose. No token is read — not from the params, not
+/// from the connection — so the method means the same thing on the login
+/// page, on a connection that happens to hold a session, and on the agent
+/// surface. The sign-in lands on `returnTo`, sanitised to a same-origin
+/// path; a foreign address is dropped, never forwarded. Linking an
+/// identity to the signed-in mailbox is [`link_identity`]'s job alone.
+async fn oauth_begin(app: &AppState, params: &Value) -> Result<Value, AppError> {
     let provider = required(params, "provider")?;
-    let purpose = match session_of(sessions, ctx, params) {
-        Ok(session) => AttemptPurpose::Link {
-            address: session.address.clone(),
-        },
-        Err(_) => AttemptPurpose::Login {
-            return_to: auth::safe_return_to(
-                &app.auth.catalog,
-                params.get("returnTo").and_then(Value::as_str),
-            ),
-        },
+    // MUT:oauth-begin-always-login — the purpose is this method's, never
+    // inferred from a token that may be lying around: a session on the
+    // connection (or in the params) does not turn a sign-in into a link.
+    let purpose = AttemptPurpose::Login {
+        return_to: auth::safe_return_to(
+            &app.auth.catalog,
+            params.get("returnTo").and_then(Value::as_str),
+        ),
     };
     let href = auth::begin(app, &provider, purpose)
         .await
@@ -292,6 +304,7 @@ async fn oauth_begin(
 
 /// `session.linkIdentity {provider}` (authenticated only): start a link
 /// sign-in for the session's mailbox; answers the `href` to navigate to.
+/// The one door into `AttemptPurpose::Link`.
 async fn link_identity(
     app: &AppState,
     session: &Session,
@@ -328,6 +341,10 @@ fn oauth_error(provider: &str, e: AuthError) -> AppError {
 /// `session.claimHandoff {code}` — redeem, exactly once, the sign-in the
 /// callback parked. Same shape as `session.login`, plus
 /// `needs_mailbox_password` (the verify card follows) and `return_to`.
+///
+/// `admin` is the authority the session holds, as in every other reply:
+/// `false` while the mailbox password is still owed, whatever the
+/// account's flag says.
 fn claim_handoff(
     app: &AppState,
     sessions: &SessionStore,
@@ -342,16 +359,16 @@ fn claim_handoff(
             "the sign-in handoff is unknown, spent or expired",
         )
     })?;
-    let admin = handoff.admin;
     let (token, session) = sessions
         .mint_provider(
             handoff.address,
             handoff.display_name,
-            admin,
+            handoff.admin,
             handoff.credential,
         )
         .map_err(|_| AppError::new("Session.InvalidCredentials", "session could not be minted"))?;
     ctx.token = Some(token.clone());
+    let admin = sessions.is_admin(app.store.as_ref(), &session);
     Ok(json!({
         "token": token,
         "address": session.address.as_str(),
@@ -521,6 +538,14 @@ fn require_admin(
     params: &Value,
 ) -> Result<(), AppError> {
     let session = session_of(sessions, ctx, params)?;
+    // MUT:locked-no-admin — the mailbox password is the account's second
+    // factor for every privileged surface, not only for the mailbox: a
+    // provider-minted session that still owes it administers nothing, even
+    // when its account is an administrator. Refused by name, before the
+    // grant is consulted, with the same words the mail methods use.
+    if session.mailbox_locked() {
+        return Err(mailbox_locked());
+    }
     // Live account lookup: an admin grant (or its withdrawal) applies to
     // sessions already open.
     if sessions.is_admin(app.store.as_ref(), &session) {
@@ -1093,6 +1118,49 @@ async fn mail_templates_delete(
     Ok(json!({ "ok": true }))
 }
 
+/// Edit the snapshot the way a slice handler must: one locked
+/// read-modify-write ([`ayane_store::StateStore::update`]).
+///
+/// `edit` runs with the store's lock held, on the LATEST saved snapshot:
+/// a link committed, a grant flipped or a whole-state replacement landed a
+/// moment earlier is there to be edited, and nothing can slip in between
+/// the read and the write. (An unlocked `load` → edit → `save` writes back
+/// everything it read, which is how a change made meanwhile used to
+/// vanish.) A refusal from `edit` leaves the stored snapshot untouched
+/// and is answered as returned.
+fn update_state(
+    app: &AppState,
+    edit: &mut dyn FnMut(&mut StoredState) -> Result<Value, AppError>,
+) -> Result<Value, AppError> {
+    let store_failed =
+        |e: ayane_store::StoreError| AppError::new("Admin.StoreFailed", e.to_string());
+    let mut answer: Option<Result<Value, AppError>> = None;
+    // The edit's own refusal rides the store's `Rejected` out of the
+    // closure, so `update` writes nothing and keeps the lock to the end.
+    let written = app.store.update(&mut |state| match edit(state) {
+        Ok(value) => {
+            answer = Some(Ok(value));
+            Ok(())
+        }
+        Err(refusal) => {
+            answer = Some(Err(refusal));
+            Err(ayane_store::StoreError::Rejected(
+                "refused by the handler; nothing written".to_owned(),
+            ))
+        }
+    });
+    match answer {
+        // The edit refused: nothing was written, and its reason stands.
+        Some(Err(refusal)) => Err(refusal),
+        Some(Ok(value)) => written.map(|()| value).map_err(store_failed),
+        // The edit never ran: the snapshot could not be read.
+        None => Err(written.err().map_or_else(
+            || AppError::new("Admin.StoreFailed", "the edit did not run"),
+            store_failed,
+        )),
+    }
+}
+
 /// Flip one account's administrator grant WITHOUT touching its password
 /// (the whole-state PUT would demand every password; a role change is not
 /// a credential change).
@@ -1101,28 +1169,26 @@ fn set_account_admin(app: &AppState, params: &Value) -> Result<Value, AppError> 
     let address = ayane_proto::Address::parse(&address)
         .map_err(|e| AppError::new("Admin.MalformedState", e.to_string()))?;
     let admin = params.get("admin").and_then(Value::as_bool) == Some(true);
-    let mut stored = app
-        .store
-        .load()
-        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
-    let mut found = false;
-    for account in &mut stored.desired.accounts {
-        if account.address == address {
-            account.admin = admin;
-            found = true;
+    // MUT:locked-admin-write — the flip reads and writes under the store's
+    // lock; an unlocked load → save here wrote back a snapshot from before
+    // a link committed meanwhile and dropped it.
+    update_state(app, &mut |stored| {
+        let mut found = false;
+        for account in &mut stored.desired.accounts {
+            if account.address == address {
+                account.admin = admin;
+                found = true;
+            }
         }
-    }
-    if !found {
-        return Err(AppError::new("Admin.MalformedState", "no such account"));
-    }
-    stored
-        .desired
-        .validate()
-        .map_err(|e| AppError::new("Admin.StateRejected", e.to_string()))?;
-    app.store
-        .save(&stored)
-        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
-    Ok(json!({ "saved": true, "address": address.as_str(), "admin": admin }))
+        if !found {
+            return Err(AppError::new("Admin.MalformedState", "no such account"));
+        }
+        stored
+            .desired
+            .validate()
+            .map_err(|e| AppError::new("Admin.StateRejected", e.to_string()))?;
+        Ok(json!({ "saved": true, "address": address.as_str(), "admin": admin }))
+    })
 }
 
 // ── network surface ───────────────────────────────────────────────────────
@@ -1214,20 +1280,17 @@ fn policy_put(app: &AppState, params: Value) -> Result<Value, AppError> {
     }
     let allowlist = parse_rules(&params, "allowlist")?;
     let denylist = parse_rules(&params, "denylist")?;
-    let mut stored = app
-        .store
-        .load()
-        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
-    stored.desired.policy.allowlist = allowlist;
-    stored.desired.policy.denylist = denylist;
-    stored
-        .desired
-        .validate()
-        .map_err(|e| AppError::new("Admin.StateRejected", e.to_string()))?;
-    app.store
-        .save(&stored)
-        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
-    Ok(json!({ "saved": true, "note": "apply to reload the engine" }))
+    // MUT:locked-admin-write — one locked read-modify-write, like every
+    // other slice edit (see `set_account_admin`).
+    update_state(app, &mut |stored| {
+        stored.desired.policy.allowlist = allowlist.clone();
+        stored.desired.policy.denylist = denylist.clone();
+        stored
+            .desired
+            .validate()
+            .map_err(|e| AppError::new("Admin.StateRejected", e.to_string()))?;
+        Ok(json!({ "saved": true, "note": "apply to reload the engine" }))
+    })
 }
 
 // ── audit (keyword + arona AI) ────────────────────────────────────────────
@@ -1284,10 +1347,7 @@ async fn audit_run(
     // called it (their INBOX is the surface being audited).
     let session = session_of(sessions, ctx, &params)?;
     if session.mailbox_locked() {
-        return Err(AppError::new(
-            "Session.MailboxLocked",
-            "the mailbox is locked: enter the mailbox password",
-        ));
+        return Err(mailbox_locked());
     }
     let password = session.password.as_deref().ok_or_else(|| {
         AppError::new(
@@ -1415,25 +1475,22 @@ fn mcp_put(app: &AppState, params: Value) -> Result<Value, AppError> {
         })
         .unwrap_or_default();
     let rotate = params.get("rotateToken").and_then(Value::as_bool) == Some(true);
-    let mut stored = app
-        .store
-        .load()
-        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
-    stored.desired.mcp.tools = tools;
-    let minted = if rotate {
-        let raw =
-            uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
-        stored.desired.mcp.token = raw.clone();
-        Some(raw)
-    } else {
-        None
-    };
-    app.store
-        .save(&stored)
-        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
-    // The token is shown once, on the rotation reply — exactly like the
-    // family's client-secret reveals.
-    Ok(json!({ "saved": true, "token": minted }))
+    // MUT:locked-admin-write — one locked read-modify-write, like every
+    // other slice edit (see `set_account_admin`).
+    update_state(app, &mut |stored| {
+        stored.desired.mcp.tools = tools.clone();
+        let minted = if rotate {
+            let raw = uuid::Uuid::new_v4().simple().to_string()
+                + &uuid::Uuid::new_v4().simple().to_string();
+            stored.desired.mcp.token = raw.clone();
+            Some(raw)
+        } else {
+            None
+        };
+        // The token is shown once, on the rotation reply — exactly like the
+        // family's client-secret reveals.
+        Ok(json!({ "saved": true, "token": minted }))
+    })
 }
 
 async fn mail_mark_seen(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {

@@ -151,6 +151,13 @@ pub trait StateStore: Send + Sync {
 
     /// Atomically replace the snapshot.
     ///
+    /// This is a WHOLE-SNAPSHOT replace and it bypasses the write lock: a
+    /// caller that `load()`s, edits what it read and `save()`s it back
+    /// races every other writer and silently drops whatever landed in
+    /// between (a link made meanwhile, a grant flipped). Read-modify-write
+    /// belongs in [`Self::update`]; `save` is for a snapshot built from
+    /// scratch — seeding, a replacement prepared from the request alone.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the backend or the codec fails.

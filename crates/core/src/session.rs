@@ -6,7 +6,9 @@
 //! provider-minted session for an own-domain account starts **locked**
 //! ([`Session::needs_mailbox_password`]): the provider said nothing about
 //! the mailbox, so the password is proven once on the verify card before
-//! any mail is read.
+//! any mail is read — and before any admin method runs: it is the
+//! account's second factor for every privileged surface
+//! ([`SessionStore::is_admin`]).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,7 +42,10 @@ pub struct Session {
     pub address: Address,
     /// Display name from the desired state.
     pub display_name: String,
-    /// Whether this session may call `admin.*` (set by admin login only).
+    /// The administrator flag as it stood when the session was minted
+    /// (`true` for the admin-token override). A record, not the decision:
+    /// authority is read live by [`SessionStore::is_admin`], which follows
+    /// the account table and answers `false` while the session is locked.
     pub admin: bool,
     /// The mailbox password for the IMAP leg of this session (`None` for
     /// admin sessions). Lives in memory and in the 0600 sessions file
@@ -48,8 +53,9 @@ pub struct Session {
     pub password: Option<String>,
     /// Set while a provider-minted session still owes the mailbox password
     /// (an own-domain account without a cached credential): `password` is
-    /// `None` and every mail method refuses with `Session.MailboxLocked`
-    /// until [`SessionStore::unlock_mailbox`] verifies it once.
+    /// `None` and every mail method AND every admin method refuses with
+    /// `Session.MailboxLocked` until [`SessionStore::unlock_mailbox`]
+    /// verifies it once.
     pub needs_mailbox_password: bool,
     /// When the session expires.
     pub expires: Instant,
@@ -327,18 +333,30 @@ impl SessionStore {
             .ok_or(LoginError::InvalidCredentials)
     }
 
-    /// Re-resolve the session's admin authority against the CURRENT store.
+    /// Whether the session holds admin authority RIGHT NOW.
     ///
     /// Admin is an account property, not a login-time snapshot: flipping an
     /// account's flag must take effect for sessions already open (and
     /// revoking it must bite immediately). Sessions minted by the admin
     /// token override keep their grant (there is no account behind them).
+    ///
+    /// A locked session holds none of it. The mailbox password is the
+    /// account's second factor for every privileged surface, exactly as it
+    /// is for the mailbox: until [`Self::unlock_mailbox`] proves it, the
+    /// provider's word settles who the visitor is and nothing about what
+    /// they may administer. The gate that needs to say WHY answers
+    /// `Session.MailboxLocked` itself (`rpc::require_admin`); this
+    /// predicate is the one every other reader of the flag shares.
     #[must_use]
     pub fn is_admin(&self, store: &dyn StateStore, session: &Session) -> bool {
-        // The no-password marker of a token-override session is not a
-        // locked provider session: that one owes its password and must
-        // re-earn admin through the live table like any account session.
-        if session.admin && session.password.is_none() && !session.needs_mailbox_password {
+        // MUT:locked-no-admin — checked first, before the token-override
+        // shortcut and before the live table: a locked session is never an
+        // admin, whatever either would say.
+        if session.needs_mailbox_password {
+            return false;
+        }
+        // The no-password marker of a token-override session.
+        if session.admin && session.password.is_none() {
             return true;
         }
         store.load().is_ok_and(|stored| {
@@ -660,7 +678,7 @@ mod tests {
         stored.desired.accounts[0].admin = true;
         store.save(&stored).expect("save");
         let sessions = SessionStore::new();
-        let (_, locked) = sessions
+        let (token, locked) = sessions
             .mint_provider(
                 Address::parse("boss@example.test").expect("addr"),
                 "Boss".to_owned(),
@@ -668,11 +686,23 @@ mod tests {
                 None,
             )
             .expect("mint");
-        assert!(sessions.is_admin(&store, &locked));
-        // MUT:locked-admin-live — withdrawing the grant must bite a locked
-        // provider session at once; it is not a token-override session.
+        // MUT:locked-no-admin — the account is an admin and the mint was
+        // told so, and it settles nothing: while the mailbox password is
+        // owed the session holds NO admin authority.
+        assert!(!sessions.is_admin(&store, &locked));
+        sessions
+            .unlock_mailbox(&store, &token, "correct-horse-battery")
+            .expect("unlock");
+        let unlocked = sessions.resolve(&token).expect("live");
+        assert!(sessions.is_admin(&store, &unlocked));
+        // MUT:locked-admin-live — it is not a token-override session: the
+        // grant is read from the live table, so withdrawing it bites at once.
         stored.desired.accounts[0].admin = false;
         store.save(&stored).expect("save");
-        assert!(!sessions.is_admin(&store, &locked));
+        assert!(!sessions.is_admin(&store, &unlocked));
+        // Granting it back is read the same way.
+        stored.desired.accounts[0].admin = true;
+        store.save(&stored).expect("save");
+        assert!(sessions.is_admin(&store, &unlocked));
     }
 }
