@@ -848,6 +848,29 @@ pub struct Handoff {
     expires: Instant,
 }
 
+impl Handoff {
+    /// A finished sign-in that may be claimed from now on for
+    /// [`HANDOFF_TTL`] — the one place that lifetime is stamped. Parking
+    /// stores the handoff as it is given.
+    #[must_use]
+    pub fn new(
+        address: Address,
+        display_name: String,
+        admin: bool,
+        credential: Option<String>,
+        return_to: Option<String>,
+    ) -> Self {
+        Self {
+            address,
+            display_name,
+            admin,
+            credential,
+            return_to,
+            expires: Instant::now() + HANDOFF_TTL,
+        }
+    }
+}
+
 impl std::fmt::Debug for Handoff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The credential is a secret for the handoff's lifetime.
@@ -1005,22 +1028,24 @@ impl AttemptStore {
     }
 
     /// Park a finished sign-in and return the one-time code that claims it.
+    /// The handoff is stored as given, its lifetime included: the code is
+    /// dead the moment that lifetime has passed, whenever it is claimed.
     #[must_use]
     pub fn park_handoff(&self, handoff: Handoff) -> String {
         let code = random_code().unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
-        self.handoffs.lock().expect("handoffs mutex").insert(
-            code.clone(),
-            Handoff {
-                expires: Instant::now() + HANDOFF_TTL,
-                ..handoff
-            },
-        );
+        self.handoffs
+            .lock()
+            .expect("handoffs mutex")
+            .insert(code.clone(), handoff);
         code
     }
 
     /// Claim a finished sign-in: exactly once, never an expired one.
     pub fn take_handoff(&self, code: &str) -> Option<Handoff> {
         let taken = self.handoffs.lock().expect("handoffs mutex").remove(code)?;
+        // MUT:handoff-expiry — the sweep only runs when a map grows, so
+        // this check is what refuses a code that outlived HANDOFF_TTL: it
+        // is taken out and answers nothing, as if it never existed.
         (taken.expires > Instant::now()).then_some(taken)
     }
 }
@@ -1286,17 +1311,18 @@ async fn sign_in(
     else {
         return failed(OAuthError::Store);
     };
-    let handoff = Handoff {
-        address: row.address.clone(),
-        display_name: row.display_name.clone(),
-        admin: row.admin,
-        // MUT:no-implicit-credential — an own-domain account has no cached
-        // credential: the mailbox password is asked for once on the verify
-        // card. Only a forwarding-node account (cached credential) skips it.
-        credential: stored.cached_credential(&row.address),
-        return_to: return_to.map(str::to_owned),
-        expires: Instant::now(),
-    };
+    // MUT:no-implicit-credential — an own-domain account has no cached
+    // credential: the mailbox password is asked for once on the verify
+    // card. Only a forwarding-node account (cached credential) skips it.
+    // MUT:handoff-ttl — the construction site stamps the code's lifetime
+    // ([`Handoff::new`]): `park_handoff` keeps it as stamped, never longer.
+    let handoff = Handoff::new(
+        row.address.clone(),
+        row.display_name.clone(),
+        row.admin,
+        stored.cached_credential(&row.address),
+        return_to.map(str::to_owned),
+    );
     let code = app.auth.attempts.park_handoff(handoff);
     let _ = links.record_login(identity).await;
     CallbackOutcome::Handoff { code }
@@ -2278,18 +2304,21 @@ mod tests {
         assert!(attempts.take_purpose(&attempt.state).is_none());
     }
 
+    /// The handoff a finished sign-in parks, as `sign_in` builds it.
+    fn handoff() -> Handoff {
+        Handoff::new(
+            Address::parse("alice@example.test").expect("address"),
+            "Alice".to_owned(),
+            false,
+            Some("cached-credential".to_owned()),
+            Some("/inbox".to_owned()),
+        )
+    }
+
     #[test]
     fn a_handoff_is_claimed_exactly_once() {
         let attempts = AttemptStore::new();
-        let handoff = Handoff {
-            address: Address::parse("alice@example.test").expect("address"),
-            display_name: "Alice".to_owned(),
-            admin: false,
-            credential: Some("cached-credential".to_owned()),
-            return_to: Some("/inbox".to_owned()),
-            expires: Instant::now(),
-        };
-        let code = attempts.park_handoff(handoff);
+        let code = attempts.park_handoff(handoff());
         // MUT:handoff-one-time — the code is a bearer for the session it
         // mints; a second claim must find nothing.
         let claimed = attempts.take_handoff(&code).expect("first claim");
@@ -2300,6 +2329,72 @@ mod tests {
         // Debug never shows a credential.
         let shown = format!("{claimed:?}");
         assert!(shown.contains("[redacted]"), "{shown}");
+    }
+
+    #[test]
+    fn a_handoff_lives_for_the_handoff_ttl_and_no_longer() {
+        // MUT:handoff-ttl — the one construction site stamps exactly one
+        // minute: neither the ticket's ten minutes (the code is a bearer
+        // for the session it mints) nor less. The minute is spelled out
+        // here and NOT read from `HANDOFF_TTL`: an expectation that
+        // follows the constant lets any other value pass with it. Parking
+        // keeps the instant as stamped: it never re-stamps.
+        const ONE_MINUTE: Duration = Duration::from_secs(60);
+        let before = Instant::now();
+        let handoff = handoff();
+        let after = Instant::now();
+        assert!(
+            handoff.expires >= before + ONE_MINUTE,
+            "the code dies too early: {:?} before {:?}",
+            handoff.expires,
+            before + ONE_MINUTE
+        );
+        assert!(
+            handoff.expires <= after + ONE_MINUTE,
+            "the code outlives its minute: {:?} after {:?}",
+            handoff.expires,
+            after + ONE_MINUTE
+        );
+        let attempts = AttemptStore::new();
+        let code = attempts.park_handoff(handoff);
+        let parked = attempts
+            .take_handoff(&code)
+            .expect("a fresh code is claimed");
+        assert!(parked.expires >= before + ONE_MINUTE && parked.expires <= after + ONE_MINUTE);
+    }
+
+    #[test]
+    fn an_expired_handoff_is_never_claimed() {
+        // MUT:handoff-expiry — a code that outlived its minute is no code
+        // at all: the claim answers nothing (no session is minted from
+        // it), and the dead handoff is taken out on the way.
+        const TWO_MINUTES: Duration = Duration::from_secs(120);
+        let attempts = AttemptStore::new();
+        let now = Instant::now();
+        // Longer ago than any code may live; on a monotonic clock that
+        // does not reach back that far (a machine up for under two
+        // minutes) any past instant is as expired.
+        let long_gone = now
+            .checked_sub(TWO_MINUTES)
+            .or_else(|| now.checked_sub(Duration::from_secs(1)))
+            .expect("the monotonic clock reaches back a second");
+        let code = attempts.park_handoff(Handoff {
+            expires: long_gone,
+            ..handoff()
+        });
+        assert!(attempts.take_handoff(&code).is_none());
+        assert!(
+            !attempts
+                .handoffs
+                .lock()
+                .expect("handoffs mutex")
+                .contains_key(&code),
+            "the expired handoff is removed, not left for a later claim"
+        );
+        assert!(attempts.take_handoff(&code).is_none());
+        // A live one parked beside it is untouched by that refusal.
+        let live = attempts.park_handoff(handoff());
+        assert!(attempts.take_handoff(&live).is_some());
     }
 
     #[test]
