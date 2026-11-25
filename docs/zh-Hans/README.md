@@ -4,8 +4,10 @@
   <strong>Celestia 自建邮件服务——管理面、网页客户端与防护层，跑在成熟的 Postfix/Dovecot 栈上</strong>
 </div>
 
-> **状态：Stage 0 骨架。** 仓库能起、`/api/health` 能答、能渲染引擎配置，但**还不能收发邮件**，
-> 当前不可部署。
+> **状态：已上线。** 控制面、渲染 Webmail、防护层与 Celestia ID 登录已跑在生产 rig
+> （`mail.acgsyzx.me`）；邮件引擎（Postfix / Dovecot / rspamd / ClamAV）已部署，DKIM、
+> SPF、DMARC 齐。入站 25 实测通、rspamd 在门口拒垃圾；对大厂出站有限流（PTR 已生效，
+> Postfix 自动重试）。
 
 ## 名字
 
