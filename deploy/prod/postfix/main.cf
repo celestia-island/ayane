@@ -17,14 +17,19 @@ virtual_mailbox_domains = texthash:/etc/postfix/maps/virtual_domains
 virtual_mailbox_maps = texthash:/etc/postfix/maps/virtual_mailboxes
 # The literal map comes first and is searched until it answers: an existing
 # account, shared mailbox or alias is therefore never rewritten by the
-# variant patterns behind it. `variant_aliases` is the Gmail-style map the
-# control plane renders (dots / `+tag` folded onto the base mailbox); it is
-# empty — a no-op table — unless an inbound variant switch is on.
-virtual_alias_maps = texthash:/etc/postfix/maps/virtual_aliases, regexp:/etc/postfix/maps/variant_aliases, pcre:/etc/postfix/subaddress.pcre
+# variant patterns behind it. `variant_aliases` is the rendered Gmail-style
+# map (dots / `+tag` folded onto the base mailbox) and is the ONLY table that
+# folds an address: it is empty — a no-op table — unless an inbound variant
+# switch is on, and with the `+` switch off nothing folds a plus tag at all.
+virtual_alias_maps = texthash:/etc/postfix/maps/virtual_aliases, regexp:/etc/postfix/maps/variant_aliases
+
 virtual_alias_domains =
 virtual_uid_maps = static:5000
 virtual_gid_maps = static:5000
 virtual_transport = lmtp:dovecot:24
+# `+` is the address extension separator. Folding a tag is NOT implied by
+# it: the recipient map above decides that, and `smtpd_recipient_restrictions`
+# plus `virtual_mailbox_maps` decide what an unfolded tag does.
 recipient_delimiter = +
 
 # TLS — certificates come from the host's certbot tree (volume, read-only).

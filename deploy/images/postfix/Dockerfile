@@ -10,7 +10,6 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
 
 COPY main.cf /etc/postfix/main.cf
 COPY master.cf /etc/postfix/master.cf
-COPY subaddress.pcre /etc/postfix/subaddress.pcre
 COPY entrypoint.py /entrypoint.py
 
 EXPOSE 25 587

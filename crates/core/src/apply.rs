@@ -125,7 +125,9 @@ pub fn render_all(
         RenderedFile {
             // Consulted after the literal alias map (that is the order
             // `virtual_alias_maps` gives them), and empty — a no-op map —
-            // unless an inbound variant switch is on.
+            // unless an inbound variant switch is on. It is the only table
+            // that folds an address: with `inbound_plus` off no `+` row is
+            // rendered, so nothing in the stack folds a tag.
             rel_path: "config/postfix/variant_aliases".to_owned(),
             contents: postfix_variant_alias_regexp(state),
             mode: 0o644,

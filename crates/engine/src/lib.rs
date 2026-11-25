@@ -133,6 +133,19 @@ pub fn postfix_virtual_aliases(state: &DesiredState) -> String {
 /// primary address was matched by the literal map keeps its identity row and
 /// stops there; the identities are also never a *source* of the fold, only a
 /// possible destination.
+///
+/// **This map owns the `+` fold, and it is the only table that does.** The
+/// engine shipped a static `subaddress.pcre` that folded `local+tag@d`
+/// unconditionally; it is retired (the `+` rows here replace it) so the
+/// administrator's inbound switch is the single authority over plus tags. With
+/// `inbound_plus` off this function renders no `+` row at all, and nothing
+/// else in the stack folds one: `recipient_delimiter` only makes `+` the
+/// extension separator, and `virtual_alias_maps` is the only place an address
+/// is rewritten. What an unfolded tag then does is the pre-subaddress
+/// behaviour — the exact `a+tag@d` key is looked up in the literal map (no
+/// match), then in `virtual_mailbox_maps` (no such mailbox), so the recipient
+/// falls through to the domain's catch-all, or is rejected when the domain has
+/// none.
 #[must_use]
 pub fn postfix_variant_alias_regexp(state: &DesiredState) -> String {
     let variants = &state.policy.variants;
@@ -908,14 +921,7 @@ mod tests {
                 "identity row for {address} missing: {literal}"
             );
         }
-        for config in [
-            include_str!("../../../deploy/images/postfix/main.cf"),
-            include_str!("../../../deploy/prod/postfix/main.cf"),
-        ] {
-            let line = config
-                .lines()
-                .find(|line| line.starts_with("virtual_alias_maps"))
-                .expect("virtual_alias_maps in main.cf");
+        for line in virtual_alias_map_lines() {
             let literal_at = line.find("/maps/virtual_aliases").expect("literal map");
             let regexp_at = line.find("/maps/variant_aliases").expect("variant map");
             assert!(
@@ -929,5 +935,61 @@ mod tests {
                 "the variant map must be a regexp: table: {line}"
             );
         }
+    }
+
+    /// The `virtual_alias_maps` lines of the shipped dev and prod configs.
+    fn virtual_alias_map_lines() -> Vec<&'static str> {
+        [
+            include_str!("../../../deploy/images/postfix/main.cf"),
+            include_str!("../../../deploy/prod/postfix/main.cf"),
+        ]
+        .into_iter()
+        .map(|config| {
+            config
+                .lines()
+                .find(|line| line.starts_with("virtual_alias_maps"))
+                .expect("virtual_alias_maps in main.cf")
+        })
+        .collect()
+    }
+
+    #[test]
+    fn no_map_in_the_stack_folds_a_plus_tag_except_the_variant_table() {
+        // The four switches are the only authority over `+`. Before this
+        // change a static `subaddress.pcre` folded every tag regardless of the
+        // policy; it is retired, and this pins both halves: no `pcre:`/other
+        // folding table in `virtual_alias_maps`, and no rendered `+` row with
+        // the switch off.
+        for line in virtual_alias_map_lines() {
+            assert!(
+                !line.contains("subaddress"),
+                "the retired subaddress table must not be listed: {line}"
+            );
+            assert!(
+                !line.contains("pcre:"),
+                "no map other than the rendered one may fold addresses: {line}"
+            );
+            // Exactly two tables: the literal one and the rendered one.
+            assert_eq!(
+                line.split(',').filter(|part| part.contains(':')).count(),
+                2,
+                "virtual_alias_maps must list exactly the literal and variant maps: {line}"
+            );
+        }
+        // Every switch off: the rendered table is empty, so nothing folds a
+        // tag anywhere in the stack.
+        let off = variants_state(0b0000);
+        assert_eq!(postfix_variant_alias_regexp(&off), "");
+        assert!(
+            !postfix_variant_alias_regexp(&off).contains('+'),
+            "a `+` row leaked with inbound_plus off"
+        );
+        // Dots only: still no `+` row — the dot switch does not touch tags.
+        let dots_only = postfix_variant_alias_regexp(&variants_state(0b0001));
+        assert!(!dots_only.is_empty(), "the dots switch must render rows");
+        assert!(
+            !dots_only.lines().any(|row| row.contains("\\+")),
+            "inbound_dots alone must not render a `+` fold: {dots_only}"
+        );
     }
 }
