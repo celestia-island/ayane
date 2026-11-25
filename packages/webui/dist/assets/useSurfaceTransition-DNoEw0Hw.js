@@ -1,0 +1,1 @@
+import{t as e}from"./useReportedTransition-IojcRva7.js";function t(t){let n=e(t);return{track(e){return n.track(e??``)},hooks(e){let t=()=>n.track(e??``);return{onBeforeEnter:()=>{t().run()},onAfterEnter:()=>{t().cancel()},onBeforeLeave:()=>{t().run()},onAfterLeave:()=>{t().cancel()},onEnterCancelled:()=>{t().cancel()},onLeaveCancelled:()=>{t().cancel()}}}}}export{t};

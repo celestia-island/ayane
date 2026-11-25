@@ -108,35 +108,63 @@ onMounted(async () => {
   }
 });
 
-const channels = computed<HkLoginChannel[]>(() =>
-  hkLoginPlanFromDiscovery(policy.value ?? LOCAL_POLICY, {
+/**
+ * The segment group the family's login pages share: the mailbox card and
+ * the family IdP are PEER lanes, so Celestia ID is a TAB, never a row
+ * under the mailbox card. Every other configured provider stays an
+ * alternative row inside the mailbox card — a deployment that registers
+ * something else still reaches it without a second tab.
+ */
+const PEER_PROVIDER = "celestia";
+
+const channels = computed<HkLoginChannel[]>(() => {
+  const plan = hkLoginPlanFromDiscovery(policy.value ?? LOCAL_POLICY, {
     credentialsKey: "credentials",
-  }).channels.map((entry): HkLoginChannel => {
-    if (entry.mode !== "credentials") return entry;
-    const credentials: HkLoginCredentialsChannel = {
-      ...entry,
+  });
+  const rows = plan.channels.flatMap((entry) =>
+    entry.mode === "credentials" ? (entry.methods ?? []) : [],
+  );
+  const peer = rows.find((row) => row.key === PEER_PROVIDER);
+  const others = rows.filter((row) => row !== peer);
+
+  const mailbox: HkLoginCredentialsChannel = {
+    key: "credentials",
+    mode: "credentials",
+    label: t("login.channel.mailbox"),
+    title: t("login.title"),
+    subtitle: t("login.subtitle"),
+    usernameType: "email",
+    usernamePlaceholder: "you@example.com",
+    usernameAutocomplete: "email",
+    // Account-first: the opening card collects the mailbox only. The
+    // password is a factor, and factors are proven on the verify step.
+    passwordField: false,
+  };
+  if (others.length > 0) {
+    // The provider rows: no href — the target needs a server ticket, so
+    // `method-select` starts the sign-in and navigates.
+    mailbox.methods = others.map((row) => ({
+      key: row.key,
+      label: providerLabel(row.key),
+      disabled: starting.value !== null,
+    }));
+    mailbox.methodsDivider = t("login.methodsDivider");
+  }
+
+  const list: HkLoginChannel[] = [mailbox];
+  if (peer !== undefined) {
+    list.push({
+      key: peer.key,
+      mode: "sso",
+      label: t("login.provider.celestia"),
       title: t("login.title"),
       subtitle: t("login.subtitle"),
-      usernameType: "email",
-      usernamePlaceholder: "you@example.com",
-      usernameAutocomplete: "email",
-      // Account-first: the opening card collects the mailbox only. The
-      // password is a factor, and factors are proven on the verify step.
-      passwordField: false,
-    };
-    if (entry.methods?.length) {
-      // The provider rows: no href — the target needs a server ticket, so
-      // `method-select` starts the sign-in and navigates.
-      credentials.methods = entry.methods.map((row) => ({
-        key: row.key,
-        label: providerLabel(row.key),
-        disabled: starting.value !== null,
-      }));
-      credentials.methodsDivider = t("login.methodsDivider");
-    }
-    return credentials;
-  }),
-);
+      icon: undefined,
+      buttonLabel: providerLabel(peer.key),
+    });
+  }
+  return list;
+});
 
 // The active segment follows the policy once it arrives (the plan names
 // the default channel; it is the password card in every mode ayane serves).
@@ -198,6 +226,13 @@ async function claim(code: string): Promise<void> {
 }
 
 /** A provider row was picked: ask for a ticket and leave for the provider. */
+/** A provider tab / row was picked: ask for a ticket and leave. The SSO
+ *  tab carries the provider id as its channel key, so both events land
+ *  on the same start. */
+function onSsoClick(provider: string): void {
+  void startProvider(provider, provider);
+}
+
 async function startProvider(_channel: string, provider: string): Promise<void> {
   if (starting.value !== null) return;
   starting.value = provider;
@@ -299,6 +334,7 @@ function onHandoffBack(): void {
       :logo-src="logoUrl"
       @account-submit="onAccountSubmit"
       @method-select="startProvider"
+      @sso-click="onSsoClick"
       @verify="onVerify"
       @verify-back="onVerifyBack"
     />
