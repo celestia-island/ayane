@@ -448,8 +448,14 @@ mod tests {
         );
 
         // The plain builder derives the envelope from the header; the `_as`
-        // form is the one that splits them.
+        // form is the one that splits them — and only the SENDER is split:
+        // the recipient set still comes from the same headers.
         let derived = build_plain_message(&header_from, "Alice", &to, "s", "b").expect("message");
+        assert_eq!(
+            derived.envelope().to(),
+            message.envelope().to(),
+            "the explicit envelope must not change the recipients"
+        );
         assert_eq!(
             derived.envelope().from().map(ToString::to_string),
             Some("alice+lists@example.com".to_owned())
