@@ -10,8 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use ayane_engine::{
-    dovecot_passwd, postfix_sender_denylist, postfix_virtual_aliases, postfix_virtual_domains,
-    postfix_virtual_mailboxes, rspamd_local_domains,
+    dovecot_passwd, postfix_sender_denylist, postfix_variant_alias_regexp, postfix_virtual_aliases,
+    postfix_virtual_domains, postfix_virtual_mailboxes, rspamd_local_domains,
 };
 use ayane_proto::DesiredState;
 use ayane_store::StoredState;
@@ -120,6 +120,16 @@ pub fn render_all(
         RenderedFile {
             rel_path: "config/postfix/virtual_aliases".to_owned(),
             contents: postfix_virtual_aliases(state),
+            mode: 0o644,
+        },
+        RenderedFile {
+            // Consulted after the literal alias map (that is the order
+            // `virtual_alias_maps` gives them), and empty — a no-op map —
+            // unless an inbound variant switch is on. It is the only table
+            // that folds an address: with `inbound_plus` off no `+` row is
+            // rendered, so nothing in the stack folds a tag.
+            rel_path: "config/postfix/variant_aliases".to_owned(),
+            contents: postfix_variant_alias_regexp(state),
             mode: 0o644,
         },
         RenderedFile {

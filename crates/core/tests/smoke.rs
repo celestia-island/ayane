@@ -39,7 +39,9 @@ async fn api() -> reqwest::Client {
         .expect("http client")
 }
 
-async fn put_state(client: &reqwest::Client) {
+/// Push the smoke fixture. `variants` is the policy's address-variant switch
+/// table (all off when empty), so a step can turn a fold on and prove it there.
+async fn put_state(client: &reqwest::Client, variants: serde_json::Value) {
     let base =
         std::env::var("AYANE_API_URL").unwrap_or_else(|_| "http://127.0.0.1:3023".to_owned());
     let token = std::env::var("AYANE_ADMIN_TOKEN").expect("AYANE_ADMIN_TOKEN must be set");
@@ -59,7 +61,12 @@ async fn put_state(client: &reqwest::Client) {
             {"source": format!("sales@{DOMAIN}"), "targets": [BOSS]}
         ],
         "shared": [],
-        "policy": {"default_action": "reject", "allowlist": [], "denylist": [{"domain": "spam.example"}]}
+        "policy": {
+            "default_action": "reject",
+            "allowlist": [],
+            "denylist": [{"domain": "spam.example"}],
+            "variants": variants,
+        }
     });
 
     let response = client
@@ -210,7 +217,7 @@ async fn send_route_deliver_read_roundtrip() {
         .expect("health body");
     assert!(health.contains("\"status\":\"ok\""), "health: {health}");
 
-    put_state(&client).await;
+    put_state(&client, serde_json::json!({})).await;
     wait_for_login().await;
 
     // 1. direct delivery: alice → boss
@@ -236,7 +243,10 @@ async fn send_route_deliver_read_roundtrip() {
     )
     .await;
 
-    // 4. subaddress: alice → alice+tag lands in alice's own INBOX
+    // 4. subaddress: with `inbound_plus` on, alice → alice+tag lands in
+    //    alice's own INBOX. The switch is the only authority over `+`, so the
+    //    step flips it on first instead of assuming the pre-switch default.
+    put_state(&client, serde_json::json!({"inbound_plus": true})).await;
     send(
         "ayane-dev-pass-1",
         &format!("alice+tag@{DOMAIN}"),
@@ -250,9 +260,25 @@ async fn send_route_deliver_read_roundtrip() {
         "subaddress folding",
     )
     .await;
+    // …and with the switches off the tagged form is none of alice's business:
+    // it is an unknown recipient and the catch-all takes it.
+    put_state(&client, serde_json::json!({})).await;
+    send(
+        "ayane-dev-pass-1",
+        &format!("alice+offsw@{DOMAIN}"),
+        "t4b-subaddress-off",
+    )
+    .await;
+    wait_for(
+        INBOX,
+        "ayane-dev-pass-3",
+        "t4b-subaddress-off",
+        "no tag fold with the switch off",
+    )
+    .await;
 
     // 5. deny list: a foreign MTA from a deny-listed domain is refused.
     expect_rejected().await;
 
-    println!("SMOKE PASS: 5/5 policy paths verified");
+    println!("SMOKE PASS: 6/6 policy paths verified");
 }

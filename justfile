@@ -44,6 +44,9 @@ engine-up:
     [[ -f state/config/postfix/virtual_domains ]] || touch state/config/postfix/virtual_domains
     [[ -f state/config/postfix/virtual_mailboxes ]] || touch state/config/postfix/virtual_mailboxes
     [[ -f state/config/postfix/virtual_aliases ]] || touch state/config/postfix/virtual_aliases
+    # The Gmail-style variant table: Postfix refuses to start with a map file
+    # that does not exist, and an empty table simply never matches.
+    [[ -f state/config/postfix/variant_aliases ]] || touch state/config/postfix/variant_aliases
     [[ -f state/config/postfix/sender_denylist ]] || touch state/config/postfix/sender_denylist
     [[ -f state/config/rspamd/options.inc ]] || echo 'local_domains = [];' > state/config/rspamd/options.inc
     docker compose -f deploy/docker-compose.yml up -d --build

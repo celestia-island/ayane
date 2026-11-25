@@ -62,11 +62,25 @@ const saveTemplateOpen = ref(false);
 const templateName = ref("");
 
 const identityOptions = ref<{ value: string; label: string }[]>([]);
+/** The address-variant switches the administrator enabled: the composer only
+ *  *mentions* them (the variant itself is typed, never listed as an
+ *  identity). */
+const variants = ref<{ outbound_dots: boolean; outbound_plus: boolean }>({
+  outbound_dots: false,
+  outbound_plus: false,
+});
 
 async function loadIdentities(): Promise<void> {
   try {
-    const result = await rpc.call<{ identities: Identity[] }>("mail.fromAddresses");
+    const result = await rpc.call<{
+      identities: Identity[];
+      variants?: { outbound_dots?: boolean; outbound_plus?: boolean };
+    }>("mail.fromAddresses");
     identities.value = result.identities;
+    variants.value = {
+      outbound_dots: result.variants?.outbound_dots === true,
+      outbound_plus: result.variants?.outbound_plus === true,
+    };
     identityOptions.value = result.identities.map((identity) => ({
       value: identity.address,
       label: `${identity.display_name} <${identity.address}> · ${
@@ -245,6 +259,15 @@ async function saveDraft(): Promise<void> {
           :label="t('compose.from')"
           :options="identityOptions"
         />
+        <p v-if="variants.outbound_dots || variants.outbound_plus" class="muted compose-variant-hint">
+          {{
+            variants.outbound_dots && variants.outbound_plus
+              ? t("compose.variantsBoth")
+              : variants.outbound_dots
+                ? t("compose.variantsDots")
+                : t("compose.variantsPlus")
+          }}
+        </p>
         <HkInput v-model="to" type="email" required :label="t('compose.to')" placeholder="someone@example.com" />
         <HkInput v-model="subject" :label="t('compose.subject')" />
         <div class="compose-editor">
@@ -335,6 +358,7 @@ async function saveDraft(): Promise<void> {
 .compose-editor { display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; }
 .compose-editor :deep(.hk-md-editor) { flex: 1; min-height: 18rem; }
 .compose-editor-label { font-size: 0.8125rem; opacity: 0.85; }
+.compose-variant-hint { margin: -4px 0 0; font-size: 0.8125rem; }
 .compose-attachments { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
 .compose-attachment {
   display: inline-flex; align-items: center; gap: 4px;
