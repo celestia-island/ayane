@@ -48,6 +48,7 @@ engine-up:
     # that does not exist, and an empty table simply never matches.
     [[ -f state/config/postfix/variant_aliases ]] || touch state/config/postfix/variant_aliases
     [[ -f state/config/postfix/sender_denylist ]] || touch state/config/postfix/sender_denylist
+    [[ -f state/config/postfix/sender_login ]] || touch state/config/postfix/sender_login
     [[ -f state/config/rspamd/options.inc ]] || echo 'local_domains = [];' > state/config/rspamd/options.inc
     docker compose -f deploy/docker-compose.yml up -d --build
 

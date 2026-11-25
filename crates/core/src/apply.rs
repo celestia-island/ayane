@@ -10,8 +10,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use ayane_engine::{
-    dovecot_passwd, postfix_sender_denylist, postfix_variant_alias_regexp, postfix_virtual_aliases,
-    postfix_virtual_domains, postfix_virtual_mailboxes, rspamd_local_domains,
+    dovecot_passwd, postfix_sender_denylist, postfix_sender_login_maps,
+    postfix_variant_alias_regexp, postfix_virtual_aliases, postfix_virtual_domains,
+    postfix_virtual_mailboxes, rspamd_local_domains,
 };
 use ayane_proto::DesiredState;
 use ayane_store::StoredState;
@@ -135,6 +136,15 @@ pub fn render_all(
         RenderedFile {
             rel_path: "config/postfix/sender_denylist".to_owned(),
             contents: postfix_sender_denylist(state),
+            mode: 0o644,
+        },
+        RenderedFile {
+            // Which envelope sender each authenticated user may use —
+            // consulted by reject_sender_login_mismatch on the
+            // submission ports. An account that is absent here cannot
+            // send at all through 587 (the map is the authority).
+            rel_path: "config/postfix/sender_login".to_owned(),
+            contents: postfix_sender_login_maps(state),
             mode: 0o644,
         },
         RenderedFile {

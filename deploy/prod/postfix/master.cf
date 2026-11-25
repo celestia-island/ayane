@@ -12,8 +12,14 @@ submission inet n       -       n       -       -       smtpd
   -o smtpd_sasl_auth_enable=yes
   -o smtpd_client_restrictions=permit_sasl_authenticated,reject
 # Internal plaintext submission for the control plane (webmail send leg).
-# Loopback-only publication in compose; human clients use 587/465 with TLS.
-10587     inet  n       -       n       -       -       smtpd
+# The HOST-loopback publish in compose (`127.0.0.1:10587:10587`) is the
+# security boundary. Inside the container this service must keep listening
+# on every interface: the published port reaches the container through a
+# DNAT rule that targets the container's OWN address (its eth0 IP, port
+# 10587) — a container-loopback bind here never matches that target, and
+# the control plane's send leg silently fails (host connect() succeeds,
+# then no banner ever arrives).
+10587     inet n       -       n       -       -       smtpd
   -o syslog_name=postfix/internal
   -o smtpd_tls_security_level=none
   -o smtpd_sasl_auth_enable=yes

@@ -71,7 +71,7 @@ services:
       - -c
       - >-
         touch -a /etc/postfix/maps/virtual_aliases
-        /etc/postfix/maps/variant_aliases
+        /etc/postfix/maps/variant_aliases /etc/postfix/maps/sender_login
         && exec /entrypoint.py
     depends_on:
       - dovecot

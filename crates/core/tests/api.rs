@@ -340,7 +340,15 @@ async fn apply_writes_config_then_rewrites_nothing() {
         .iter()
         .filter(|f| f["changed"] == serde_json::Value::Bool(true))
         .collect();
-    assert_eq!(changed.len(), 7, "first apply writes every file: {report}");
+    assert_eq!(changed.len(), 8, "first apply writes every file: {report}");
+    // The sender-login map rides every apply (2026-11-25): it is the table
+    // reject_sender_login_mismatch consults on the submission ports.
+    let login = fixture.state_dir.join("config/postfix/sender_login");
+    let login_map = std::fs::read_to_string(&login).expect("sender_login");
+    assert!(
+        login_map.contains("alice@example.test alice@example.test"),
+        "{login_map}"
+    );
 
     let passwd = fixture.state_dir.join("config/dovecot/passwd");
     let contents = std::fs::read_to_string(&passwd).expect("passwd");
