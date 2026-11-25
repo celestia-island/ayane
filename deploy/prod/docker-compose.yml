@@ -61,6 +61,18 @@ services:
       # exactly this). Empty named volumes copy the image's spool skeleton
       # on first use, so the queue directory structure is preserved.
       - ayane-spool:/var/spool/postfix
+    # The same start-time guarantee as the dev rig: Postfix will not start
+    # while a map file listed in `virtual_alias_maps` is missing, so create
+    # the literal and rendered variant tables empty before the entrypoint runs
+    # (and until the control plane's first apply fills them). Lazy creation in
+    # the entrypoint is not an option: the map directory is read-only there.
+    command:
+      - sh
+      - -c
+      - >-
+        touch -a /etc/postfix/maps/virtual_aliases
+        /etc/postfix/maps/variant_aliases
+        && exec /entrypoint.py
     depends_on:
       - dovecot
       - rspamd

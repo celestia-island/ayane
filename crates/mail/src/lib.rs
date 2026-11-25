@@ -6,7 +6,7 @@
 //! mailboxes, catch-all, allow/deny lists, subaddressing — is unit-testable
 //! without a mail server.
 
-use ayane_proto::{Address, DefaultAction, DesiredState};
+use ayane_proto::{Address, AddressVariants, DefaultAction, DesiredState};
 
 pub mod client;
 pub mod compose;
@@ -60,7 +60,7 @@ pub fn route(state: &DesiredState, sender: &Address, recipient: &Address) -> Rou
         return Route::Reject;
     }
 
-    let candidates = candidate_recipients(recipient);
+    let candidates = candidate_recipients(&state.policy.variants, recipient);
     for candidate in &candidates {
         if state
             .accounts
@@ -110,12 +110,21 @@ pub fn route(state: &DesiredState, sender: &Address, recipient: &Address) -> Rou
     }
 }
 
-/// The recipient itself, then its `+tag`-stripped form (Postfix
-/// `recipient_delimiter = +`).
-fn candidate_recipients(recipient: &Address) -> Vec<Address> {
+/// The recipient itself, then — only when the policy's `inbound_plus` switch
+/// is on — its `+tag`-stripped form (Postfix `recipient_delimiter = +`).
+///
+/// The switch is the single authority over tags on both sides of the service:
+/// the rendered Postfix table strips a tag only with the switch on, so this
+/// classifier must not pre-strip it either. Without the switch the exact
+/// `a+tag@d` key is all there is: an account (nobody names one that way),
+/// a shared mailbox or an alias — otherwise the recipient is unknown and
+/// takes the catch-all / default action, exactly as the MTA delivers it.
+fn candidate_recipients(variants: &AddressVariants, recipient: &Address) -> Vec<Address> {
     let mut candidates = vec![recipient.clone()];
-    if let Some(base) = recipient.without_subaddress() {
-        candidates.push(base);
+    if variants.inbound_plus {
+        if let Some(base) = recipient.without_subaddress() {
+            candidates.push(base);
+        }
     }
     candidates
 }
@@ -181,14 +190,44 @@ mod tests {
     }
 
     #[test]
-    fn subaddressing_resolves_to_the_base_mailbox() {
-        let state = state_with_catch_all(Vec::new());
-        let route = route(
+    fn subaddressing_resolves_to_the_base_mailbox_only_with_the_switch_on() {
+        // `inbound_plus` is the single authority over tags: the Postfix table
+        // strips one only with the switch on, so the classifier must not
+        // pre-strip it either.
+        let mut state = state_with_catch_all(Vec::new());
+        state.policy.variants.inbound_plus = true;
+        let folded = route(
             &state,
             &addr("a@b.example"),
             &addr("ops+alerts@example.com"),
         );
-        assert_eq!(route, Route::Mailbox(addr("ops@example.com")));
+        assert_eq!(folded, Route::Mailbox(addr("ops@example.com")));
+
+        // Switch off: the tagged form is not the base mailbox — it is an
+        // unknown recipient and reaches the catch-all, exactly as the MTA
+        // delivers it.
+        let off = state_with_catch_all(Vec::new());
+        let unfolded = route(&off, &addr("a@b.example"), &addr("ops+alerts@example.com"));
+        assert_eq!(unfolded, Route::CatchAll(addr("inbox@example.com")));
+        // …and with no catch-all it is the default action, not `ops`'s box.
+        let mut bare = state_with_catch_all(Vec::new());
+        bare.domains[0].catch_all = None;
+        assert_eq!(
+            route(&bare, &addr("a@b.example"), &addr("ops+alerts@example.com")),
+            Route::Reject
+        );
+    }
+
+    #[test]
+    fn dots_are_never_stripped_by_the_classifier() {
+        // Dot variants are literal rows rendered into the MTA's table; the
+        // classifier sees the recipient as written.
+        let mut state = state_with_catch_all(Vec::new());
+        state.policy.variants.inbound_dots = true;
+        assert_eq!(
+            route(&state, &addr("a@b.example"), &addr("o.ps@example.com")),
+            Route::CatchAll(addr("inbox@example.com"))
+        );
     }
 
     #[test]

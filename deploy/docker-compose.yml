@@ -49,6 +49,19 @@ services:
       - "127.0.0.1:30587:587"
     volumes:
       - ../state/config/postfix:/etc/postfix/maps:ro
+    # Postfix refuses to start when a map file a table points at is missing
+    # (`dict_texthash_open` / `dict_regexp_open` fail and the daemon shuts
+    # down). The control plane creates these files on its first apply, but the
+    # engine is brought up first, so create the two alias tables empty here:
+    # the literal one and the rendered variant one. An empty table never
+    # matches, so this changes no behaviour.
+    command:
+      - sh
+      - -c
+      - >-
+        touch -a /etc/postfix/maps/virtual_aliases
+        /etc/postfix/maps/variant_aliases
+        && exec /entrypoint.py
     depends_on:
       - dovecot
       - rspamd
