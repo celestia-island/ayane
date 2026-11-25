@@ -897,8 +897,9 @@ mod tests {
     #[test]
     fn the_literal_map_is_complete_and_listed_first() {
         // The order dependency of the whole design: every account and shared
-        // mailbox carries an identity row, and `main.cf` puts the literal map
-        // ahead of the regexp one.
+        // mailbox carries an identity row, and the shipped `main.cf` puts the
+        // literal map ahead of the regexp one. The files are read from the
+        // tree so a redeploy that reorders the maps fails here.
         let state = variants_state(0b0011);
         let literal = postfix_virtual_aliases(&state);
         for address in ["inbox@example.com", "team@example.com"] {
@@ -907,13 +908,26 @@ mod tests {
                 "identity row for {address} missing: {literal}"
             );
         }
-        let maps =
-            "texthash:/etc/postfix/maps/virtual_aliases, regexp:/etc/postfix/maps/variant_aliases";
-        let literal_at = maps.find("virtual_aliases").expect("literal map");
-        let regexp_at = maps.find("variant_aliases").expect("regexp map");
-        assert!(
-            literal_at < regexp_at,
-            "the literal map must be searched first: {maps}"
-        );
+        for config in [
+            include_str!("../../../deploy/images/postfix/main.cf"),
+            include_str!("../../../deploy/prod/postfix/main.cf"),
+        ] {
+            let line = config
+                .lines()
+                .find(|line| line.starts_with("virtual_alias_maps"))
+                .expect("virtual_alias_maps in main.cf");
+            let literal_at = line.find("/maps/virtual_aliases").expect("literal map");
+            let regexp_at = line.find("/maps/variant_aliases").expect("variant map");
+            assert!(
+                literal_at < regexp_at,
+                "the literal map must be searched first: {line}"
+            );
+            // A bare `regexp:` table is what Postfix reads; `pcre:` would need
+            // the extra package for no gain here.
+            assert!(
+                line.contains("regexp:/etc/postfix/maps/variant_aliases"),
+                "the variant map must be a regexp: table: {line}"
+            );
+        }
     }
 }
