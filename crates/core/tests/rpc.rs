@@ -227,6 +227,118 @@ async fn admin_methods_require_an_admin_session() {
     assert_eq!(state["result"]["domains"][0]["name"], "example.test");
 }
 
+/// The send-identity path of `mail.send`, observed without a mail server:
+/// nothing listens on the submission port here, so a From the policy GRANTS
+/// runs through the composer and fails at the relay (`Mail.SubmissionFailed`),
+/// while a From it REFUSES is answered by `resolve_send_identity` first and
+/// never reaches the socket. That difference is the assertion: the switch
+/// changes which refusal the caller sees, not merely whether the send works.
+#[tokio::test]
+async fn mail_send_accepts_a_tagged_from_only_when_the_switch_is_on() {
+    let (surface, _) = surface("fromvariants").await;
+    let login = call(
+        &surface,
+        rpc_request(
+            "session.login",
+            json!({ "address": "test@example.test", "password": PASSWORD }),
+            json!(1),
+        ),
+    )
+    .await;
+    let token = login["result"]["token"].as_str().expect("token").to_owned();
+
+    let admin = call(
+        &surface,
+        rpc_request("session.adminLogin", json!({ "token": ADMIN }), json!(2)),
+    )
+    .await;
+    let admin_token = admin["result"]["token"]
+        .as_str()
+        .expect("admin token")
+        .to_owned();
+
+    let send = |from: &str| {
+        rpc_request(
+            "mail.send",
+            json!({
+                "token": token,
+                "to": "boss@example.test",
+                "subject": "variant",
+                "body": "body",
+                "from": from,
+            }),
+            json!(9),
+        )
+    };
+    // The reply's path-style message, or a marker when the call succeeded
+    // (it cannot here: nothing listens on the relay).
+    fn message(reply: &Value) -> String {
+        reply["error"]["message"]
+            .as_str()
+            .map_or_else(|| format!("unexpected success: {reply}"), str::to_owned)
+    }
+
+    // Switch off (the seeded default): the tagged From is refused before the
+    // relay is ever touched.
+    let refused = call(&surface, send("test+news@example.test")).await;
+    assert_eq!(
+        message(&refused),
+        "Mail.BadRecipient: that shared mailbox does not belong to this account"
+    );
+
+    // Turn the outbound plus switch on through the admin policy surface.
+    let saved = call(
+        &surface,
+        rpc_request(
+            "admin.policy.put",
+            json!({
+                "token": admin_token,
+                "allowlist": [],
+                "denylist": [],
+                "variants": { "outbound_plus": true },
+            }),
+            json!(3),
+        ),
+    )
+    .await;
+    assert_eq!(saved["result"]["saved"], json!(true), "{saved}");
+
+    // The same tagged From is now granted: it gets as far as the relay.
+    let granted = call(&surface, send("test+news@example.test")).await;
+    assert!(
+        message(&granted).starts_with("Mail.SubmissionFailed:"),
+        "a granted variant must reach the relay, got {granted}"
+    );
+    // The dot switch is still off, so a dotted From stays refused.
+    let dotted = call(&surface, send("te.st@example.test")).await;
+    assert_eq!(
+        message(&dotted),
+        "Mail.BadRecipient: that shared mailbox does not belong to this account"
+    );
+
+    // Both switches on: the dotted form is granted too.
+    let saved = call(
+        &surface,
+        rpc_request(
+            "admin.policy.put",
+            json!({
+                "token": admin_token,
+                "allowlist": [],
+                "denylist": [],
+                "variants": { "outbound_plus": true, "outbound_dots": true },
+            }),
+            json!(4),
+        ),
+    )
+    .await;
+    assert_eq!(saved["result"]["saved"], json!(true), "{saved}");
+    let dotted = call(&surface, send("te.st@example.test")).await;
+    assert!(
+        message(&dotted).starts_with("Mail.SubmissionFailed:"),
+        "a granted dotted variant must reach the relay, got {dotted}"
+    );
+}
+
 fn rpc_request(method: &str, params: Value, id: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
 }
