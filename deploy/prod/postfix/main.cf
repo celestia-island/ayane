@@ -66,9 +66,10 @@ smtpd_sender_restrictions = reject_sender_login_mismatch
 # Policy refusals must fail closed; only add-header actions may fail open.
 # `tempfail`, not `reject`: a 4xx makes the sending MTA retry and keeps
 # the mail in ITS queue until the filter is back — fail-closed AND no loss.
-# `reject` would answer 554 at CONNECT and turn one outage into a wave of
-# bounces (R2 measured both). Postfix has no per-action knob, so the
-# strict-but-temporary default is the one that holds both invariants.
+# `reject` would refuse the connection outright (554 at the banner, 550 on
+# MAIL FROM) and turn one outage into a wave of permanent bounces. Postfix
+# has no per-action knob, so the strict-but-temporary default is the one
+# that holds both invariants.
 smtpd_milters = inet:rspamd:11332
 milter_default_action = tempfail
 milter_protocol = 6

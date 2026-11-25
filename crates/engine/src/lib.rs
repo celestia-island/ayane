@@ -1636,10 +1636,12 @@ mod tests {
             );
         }
         // The plaintext AUTH port must NOT bind the container's loopback:
-        // docker-proxy forwards the host-published port to the container's
-        // eth0, so a container-lo bind cuts the control plane's send leg
-        // (R2 measured it). The boundary is the HOST-loopback publish in
-        // compose; inside the container the service listens on all ifaces.
+        // the host-published port reaches the container through a DNAT rule
+        // that targets the container's own address, so a container-lo bind
+        // never receives it and the control plane's send leg silently fails
+        // (connect() succeeds, no banner ever arrives). The boundary is the
+        // HOST-loopback publish in compose; inside the container the service
+        // listens on every interface.
         let master = include_str!("../../../deploy/prod/postfix/master.cf");
         let internal = master
             .lines()
@@ -1656,9 +1658,21 @@ mod tests {
         );
         // The sender_login map must exist before the first apply, or
         // reject_sender_login_mismatch refuses every authenticated sender.
+        // Every place that pre-creates the other maps must pre-create this
+        // one too — a recipe that forgets it is a silent "nobody can send".
         assert!(
             compose.contains("/etc/postfix/maps/sender_login"),
-            "compose must pre-create the sender_login map"
+            "prod compose must pre-create the sender_login map"
+        );
+        let dev_compose = include_str!("../../../deploy/docker-compose.yml");
+        assert!(
+            dev_compose.contains("/etc/postfix/maps/sender_login"),
+            "dev compose must pre-create the sender_login map"
+        );
+        let justfile = include_str!("../../../justfile");
+        assert!(
+            justfile.contains("touch state/config/postfix/sender_login"),
+            "the dev recipe must pre-create the sender_login map"
         );
     }
 

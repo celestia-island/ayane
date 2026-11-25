@@ -62,9 +62,9 @@ smtpd_sender_restrictions = reject_sender_login_mismatch
 
 # Content filter (spam / DKIM / headers) via milter. Same fail-closed
 # posture as production (2026-11-25 security recon): a down filter must not
-# disable the DKIM/DMARC reject verdicts. `tempfail` = the sending side
-# retries (4xx), so a stopped rspamd DEFERS mail rather than passing it —
-# in the dev rig, start the filter before sending or mail sits in the queue.
+# disable the DKIM/DMARC reject verdicts. `tempfail` answers 4xx, so the
+# SENDING side keeps the mail in its own queue and retries — nothing is
+# bounced. In the dev rig, start the filter before sending or mail waits.
 smtpd_milters = inet:rspamd:11332
 milter_default_action = tempfail
 milter_protocol = 6
