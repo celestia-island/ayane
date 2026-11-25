@@ -94,6 +94,90 @@ pub fn postfix_virtual_aliases(state: &DesiredState) -> String {
     rows.into_iter().map(|row| format!("{row}\n")).collect()
 }
 
+/// The `regexp:` map that folds Gmail-style address variants onto the base
+/// mailbox, or the empty string when the policy enables no inbound variant.
+///
+/// **Why a regular-expression map.** `virtual_alias_maps` is a literal lookup:
+/// the dot and `+tag` variants of one address cannot be enumerated. Postfix
+/// queries a `regexp:` table with the whole address (local part dots and plus
+/// tags intact, unlike indexed tables, which are also queried with the
+/// extension stripped) and rewrites the recipient with the pattern's `$n`
+/// captures. Folding one dot per pass is enough because **virtual aliasing is
+/// recursive**: `cleanup(8)` looks the rewritten address up again until it no
+/// longer changes, so `a.b.c@d` folds to `.c`, then to `c`.
+///
+/// **Why it does not steal real mailboxes.** The table is appended *after* the
+/// literal map in `virtual_alias_maps` and Postfix searches the tables in the
+/// configured order until a match is found, so an address that exists (an
+/// account, a shared mailbox — both carry an identity row in
+/// [`postfix_virtual_aliases`] — or an alias) is answered by the literal map
+/// and never reaches these patterns. Aliases therefore stay literal, exactly
+/// as before: `ops+tag@d` gets a mail from across the internet to `ops@d`
+/// only when `ops@d` exists and `ops+tag@d` does not.
+///
+/// **The rows, in order** (first match wins; every row ends the address in
+/// the domain alternation, which is backslash-escaped so a `.` can only be a
+/// dot):
+///
+/// - `a+tag@d` → `a@d` — the local part before the `+` is dot-free, so this
+///   row finishes the fold in one pass (`[^+]+`).
+/// - `+a@d` → `a@d` — an empty local part before the tag (`[^+]+` needs a
+///   character, so it cannot be left to the row above).
+/// - `a.b@d` → `ab@d` — drop one dot; the right-hand class stops at the next
+///   dot, so this row runs once per pass and the recursion does the rest.
+///   It skips over a `+`, which keeps a tag out of the folded local part.
+/// - `.a.b@d` → `a.b@d` — a leading dot has nothing in front of it, so this
+///   row peels it instead (and repeats per pass).
+///
+/// **No arm fires on a dot-less, plus-less local part**, so a mailbox whose
+/// primary address was matched by the literal map keeps its identity row and
+/// stops there; the identities are also never a *source* of the fold, only a
+/// possible destination.
+#[must_use]
+pub fn postfix_variant_alias_regexp(state: &DesiredState) -> String {
+    let variants = &state.policy.variants;
+    if !variants.any_inbound() {
+        return String::new();
+    }
+    let domains: Vec<String> = enabled_domains(state)
+        .iter()
+        .map(|domain| domain.replace('.', "\\."))
+        .collect();
+    if domains.is_empty() {
+        return String::new();
+    }
+    let domain = domains.join("|");
+    // Rows are `pattern result`: Postfix 3.7's regexp(5) reader wants the
+    // pattern enclosed in its own delimiter (`/^…$/`, the example form in the
+    // manual — a bare `^…$` is read as an option field and the rule skipped).
+    // A capture is always interpolated as `${n}`: Postfix reads `$n` greedily,
+    // so `$1@` would be "group 1 followed by a literal @", but the moment the
+    // result is written without a separator it would read `$12`.
+    let mut rows = String::new();
+    if variants.inbound_plus {
+        // `local+tag` where the local part is dot-free: strip the tag in one
+        // pass. `+a` (an empty local part) is its own row rather than a
+        // `[^+]+` with nothing in it: Postfix does not reliably match an
+        // empty leading capture, and the tag is optional in what the address
+        // means anyway.
+        rows.push_str(&format!("/^([^+]+)\\+([^@]*)@({domain})$/ ${{1}}@${{3}}\n"));
+        rows.push_str(&format!("/^\\+([^@]*)@({domain})$/ ${{1}}@${{2}}\n"));
+    }
+    if variants.inbound_dots {
+        // `a.b@d` → `ab@d`: drop one dot. One pass only here (the right-hand
+        // class stops at the next dot), so the next pass repeats it and the
+        // recursion finishes the fold; skipping over the `+` keeps a tag out
+        // of the folded local part.
+        rows.push_str(&format!(
+            "/^([^.]+)\\.([^@]*)@({domain})$/ ${{1}}${{2}}@${{3}}\n"
+        ));
+        // `.a.b@d` → `a.b@d`: the row above needs a character in front of the
+        // dot it drops, so a leading dot is peeled by this one instead.
+        rows.push_str(&format!("/^\\.([^@]*)@({domain})$/ ${{1}}@${{2}}\n"));
+    }
+    rows
+}
+
 /// Postfix `check_sender_access` map enforcing the sender deny list.
 ///
 /// Postfix accepts `user@domain`, `domain` and `user` keys; a matching sender
@@ -377,5 +461,459 @@ mod tests {
             Some("zoe@example.com:{SHA512-CRYPT}$6$a$z:5000:5000::/var/mail/vhosts/example.com/zoe::")
         );
         assert_eq!(lines.next(), None);
+    }
+
+    // ── Gmail-style address variants ─────────────────────────────────────
+    //
+    // The `virtual_alias_maps` contract these tests pin, quoted from Postfix
+    // 3.7.11 (see the doc comment on `postfix_variant_alias_regexp`):
+    //
+    // * `virtual(5)`: "Virtual aliasing is recursive, and is implemented by
+    //   the Postfix cleanup(8) daemon before mail is queued." — the rewritten
+    //   address is looked up again, which is what folds `a.b.c` one dot per
+    //   pass.
+    // * `postconf(5)` on `virtual_alias_maps`: "Tables will be searched in the
+    //   specified order until a match is found. Note: these lookups are
+    //   recursive." — the literal map is listed first, so a real mailbox (or
+    //   an alias) is answered there and the variant patterns never see it.
+    // * `virtual(5)` on regular-expression tables: "Each pattern is a regular
+    //   expression that is applied to the entire address being looked up …
+    //   Patterns are applied in the order as specified in the table, until a
+    //   pattern is found that matches the search string." — the rows below run
+    //   in file order, first match wins.
+    //
+    // Everything below feeds the renderer's own bytes through `postfix_lookup`
+    // (the `regexp(5)` parser) and `rewrite` (the recursive loop), so a row
+    // Postfix would reject or mis-read fails the tests here.
+
+    /// One row of a Postfix `regexp:` table, parsed the way `regexp(5)`
+    /// documents it (`pattern result`, `#` comments): the pattern is enclosed
+    /// in its own first character as the delimiter, with `\` escapes inside,
+    /// and back-references become regex groups so the row compiles with the
+    /// `regex` crate.
+    fn postfix_lookup_row(line: &str) -> (String, String) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            panic!("blank or comment row rendered: {line:?}");
+        }
+        let delimiter = line.chars().next().expect("row start");
+        let rest = &line[1..];
+        let mut pattern = String::new();
+        let mut chars = rest.chars();
+        let mut closed = false;
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                let escaped = chars.next().expect("trailing backslash");
+                pattern.push('\\');
+                pattern.push(escaped);
+            } else if ch == delimiter {
+                closed = true;
+                break;
+            } else {
+                pattern.push(ch);
+            }
+        }
+        assert!(closed, "row has no closing delimiter: {line:?}");
+        let tail: String = chars.collect();
+        let result = tail.trim().to_owned();
+        assert!(!result.is_empty(), "row has no result: {line:?}");
+        (pattern, result)
+    }
+
+    /// The `regex`-crate source for one rendered row: Postfix's `$n` inside a
+    /// *pattern* is a group back-reference, which the crate spells `(?P=n)`
+    /// (a bare `\1` there would be an octal escape).
+    fn postfix_pattern_source(pattern: &str) -> String {
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut compiled = String::new();
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index] == '\\'
+                && chars.get(index + 1) == Some(&'$')
+                && chars.get(index + 2).is_some_and(char::is_ascii_digit)
+            {
+                compiled.push_str(&format!("(?P={})", chars[index + 2]));
+                index += 3;
+            } else {
+                compiled.push(chars[index]);
+                index += 1;
+            }
+        }
+        compiled
+    }
+
+    /// Match one rendered row against one address, exactly as Postfix applies
+    /// it: the whole address, anchored left by `^` and right by `$` (with a
+    /// trailing CR tolerated), `+` a literal, and `${n}` in the result filled
+    /// from group `n`.
+    fn postfix_lookup(line: &str, address: &str) -> Option<String> {
+        let (pattern, result) = postfix_lookup_row(line);
+        let groups = pattern.matches('(').count();
+        for group in 1..=9 {
+            let reference = format!("${{{group}}}");
+            assert!(
+                !result.contains(&reference) || group <= groups,
+                "row {line:?} references group {group}, which it does not define"
+            );
+        }
+        let body = postfix_pattern_source(&pattern);
+        let body = body.strip_prefix('^').unwrap_or(&body);
+        let body = body.strip_suffix('$').unwrap_or(body);
+        let source = format!("(?s)^{body}(?:\\r)?\\z");
+        let regex = regex::RegexBuilder::new(&source)
+            .size_limit(1 << 22)
+            .build()
+            .unwrap_or_else(|e| panic!("row {line:?} does not compile: {e}"));
+        let caps = regex.captures(address)?;
+        let result_chars: Vec<char> = result.chars().collect();
+        let mut out = String::new();
+        let mut index = 0;
+        while index < result_chars.len() {
+            if result_chars[index] == '$'
+                && result_chars.get(index + 1) == Some(&'{')
+                && result_chars.get(index + 3) == Some(&'}')
+            {
+                let group = result_chars[index + 2].to_digit(10).expect("group digit") as usize;
+                out.push_str(caps.get(group).map_or("", |m| m.as_str()));
+                index += 4;
+            } else {
+                out.push(result_chars[index]);
+                index += 1;
+            }
+        }
+        Some(out)
+    }
+
+    /// The reference model of Postfix's virtual alias loop: one lookup is the
+    /// literal map first (an exact key hit is the answer), the regexp table
+    /// only when the literal map has no row, both in file order; the rewritten
+    /// address is the new input and the lookup repeats until it stops changing.
+    fn rewrite(literal: &str, regexp: &str, address: &str) -> String {
+        let literal_rows: Vec<(String, String)> = literal
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                let cut = line.find([' ', '\t'])?;
+                Some((line[..cut].to_owned(), line[cut..].trim().to_owned()))
+            })
+            .collect();
+        let rows: Vec<&str> = regexp
+            .lines()
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        let mut current = address.to_owned();
+        for _ in 0..1000 {
+            let next = literal_rows
+                .iter()
+                .find(|(key, _)| *key == current)
+                .map(|(_, value)| value.clone())
+                .or_else(|| rows.iter().find_map(|row| postfix_lookup(row, &current)));
+            match next {
+                Some(next) if next == current => return current,
+                Some(next) => current = next,
+                None => return current,
+            }
+        }
+        panic!("alias expansion of {address:?} did not settle: {current}");
+    }
+
+    fn variants_state(bits: u8) -> DesiredState {
+        let mut state = fixture();
+        state.policy.variants = ayane_proto::AddressVariants {
+            inbound_dots: bits & 1 != 0,
+            inbound_plus: bits & 2 != 0,
+            outbound_dots: bits & 4 != 0,
+            outbound_plus: bits & 8 != 0,
+        };
+        state
+    }
+
+    #[test]
+    fn variant_map_is_empty_with_every_switch_off() {
+        assert_eq!(postfix_variant_alias_regexp(&fixture()), "");
+        // Outbound switches never reach the Postfix map.
+        assert_eq!(postfix_variant_alias_regexp(&variants_state(0b1100)), "");
+    }
+
+    #[test]
+    fn variant_map_renders_the_dot_rows() {
+        assert_eq!(
+            postfix_variant_alias_regexp(&variants_state(0b0001)),
+            "/^([^.]+)\\.([^@]*)@(example\\.com)$/ ${1}${2}@${3}\n\
+             /^\\.([^@]*)@(example\\.com)$/ ${1}@${2}\n"
+        );
+    }
+
+    #[test]
+    fn variant_map_renders_the_plus_rows() {
+        assert_eq!(
+            postfix_variant_alias_regexp(&variants_state(0b0010)),
+            "/^([^+]+)\\+([^@]*)@(example\\.com)$/ ${1}@${3}\n\
+             /^\\+([^@]*)@(example\\.com)$/ ${1}@${2}\n"
+        );
+    }
+
+    #[test]
+    fn variant_map_renders_both_families_with_the_tag_first() {
+        assert_eq!(
+            postfix_variant_alias_regexp(&variants_state(0b0011)),
+            "/^([^+]+)\\+([^@]*)@(example\\.com)$/ ${1}@${3}\n\
+             /^\\+([^@]*)@(example\\.com)$/ ${1}@${2}\n\
+             /^([^.]+)\\.([^@]*)@(example\\.com)$/ ${1}${2}@${3}\n\
+             /^\\.([^@]*)@(example\\.com)$/ ${1}@${2}\n"
+        );
+    }
+
+    #[test]
+    fn every_rendered_row_is_a_table_row_postfix_parses() {
+        // `regexp(5)` wants the pattern delimited; a bare `^…$` is read as an
+        // option field and the row silently skipped, which is how a map that
+        // looks right does nothing at all.
+        for bits in [0b0001u8, 0b0010, 0b0011] {
+            let rendered = postfix_variant_alias_regexp(&variants_state(bits));
+            assert!(
+                !rendered.is_empty(),
+                "combination {bits:04b} rendered nothing"
+            );
+            for row in rendered.lines() {
+                assert!(row.starts_with('/'), "{bits:04b}: undelimited row {row:?}");
+                assert!(
+                    row.contains("/ "),
+                    "{bits:04b}: no delimiter before the result {row:?}"
+                );
+                let (pattern, _) = postfix_lookup_row(row);
+                assert!(pattern.starts_with('^'), "{bits:04b}: unanchored {row:?}");
+                assert!(pattern.ends_with('$'), "{bits:04b}: unanchored {row:?}");
+                // A `.` must never be a wildcard.
+                assert!(
+                    !pattern.contains("@(example.com)"),
+                    "{bits:04b}: unescaped domain in {row:?}"
+                );
+                // A capture is never followed by a digit, so `${n}` is only
+                // belt and braces against Postfix's greedy `$n` reader.
+                assert!(!row.contains("$0"), "{bits:04b}: group zero in {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn variant_map_covers_every_enabled_domain_and_skips_disabled_ones() {
+        let mut state = variants_state(0b0001);
+        state.domains.push(MailDomain {
+            name: "second.example".to_owned(),
+            catch_all: None,
+            enabled: true,
+        });
+        let rendered = postfix_variant_alias_regexp(&state);
+        assert!(
+            rendered.contains("example\\.com|second\\.example"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("retired"), "{rendered}");
+    }
+
+    #[test]
+    fn variant_map_is_empty_without_hosted_domains() {
+        let mut state = variants_state(0b0011);
+        for domain in &mut state.domains {
+            domain.enabled = false;
+        }
+        assert_eq!(postfix_variant_alias_regexp(&state), "");
+    }
+
+    /// The four switches × the recipient shapes that matter.
+    fn folded(bits: u8, recipient: &str) -> String {
+        let state = variants_state(bits);
+        rewrite(
+            &postfix_virtual_aliases(&state),
+            &postfix_variant_alias_regexp(&state),
+            recipient,
+        )
+    }
+
+    #[test]
+    fn every_switch_off_leaves_every_recipient_alone() {
+        for recipient in [
+            "a.b@example.com",
+            "a.b.c@example.com",
+            "ops+tag@example.com",
+            "a.b+tag@example.com",
+            "inbox@example.com",
+        ] {
+            assert_eq!(
+                folded(0b0000, recipient),
+                recipient,
+                "`{recipient}` must not change with every switch off"
+            );
+        }
+        // The existing literal rows still apply with every switch off — the
+        // alias forwards and the catch-all catches, exactly as before.
+        assert_eq!(
+            folded(0b0000, "sales@example.com"),
+            "inbox@example.com, boss@elsewhere.example"
+        );
+    }
+
+    #[test]
+    fn inbound_dots_folds_any_number_of_dots_onto_the_base_mailbox() {
+        for (recipient, delivered) in [
+            ("a.b@example.com", "ab@example.com"),
+            ("a.b.c@example.com", "abc@example.com"),
+            ("x.y.z.w@example.com", "xyzw@example.com"),
+            (".a.b@example.com", "ab@example.com"),
+            ("alice.smith@example.com", "alicesmith@example.com"),
+            ("inbox@example.com", "inbox@example.com"),
+            // Not a hosted domain: nothing to fold.
+            ("a.b@elsewhere.example", "a.b@elsewhere.example"),
+        ] {
+            assert_eq!(folded(0b0001, recipient), delivered, "folding {recipient}");
+        }
+    }
+
+    #[test]
+    fn inbound_plus_strips_the_tag_down_to_the_base_mailbox() {
+        for (recipient, delivered) in [
+            ("ops+alerts@example.com", "ops@example.com"),
+            ("inbox+tag@example.com", "inbox@example.com"),
+            ("a+b+c@example.com", "a@example.com"),
+            ("+a@example.com", "a@example.com"),
+            // Nothing is left of the local part: no address can hold that, so
+            // the fold leaves the recipient for the catch-all below.
+            ("+@example.com", "inbox@example.com"),
+            // With the plus switch alone a dot is not a variant: the tag
+            // strips and the dots stay.
+            ("o.ps+tag@example.com", "o.ps@example.com"),
+        ] {
+            assert_eq!(folded(0b0010, recipient), delivered, "folding {recipient}");
+        }
+    }
+
+    #[test]
+    fn a_combined_variant_needs_both_inbound_switches() {
+        let recipient = "a.b+tag@example.com";
+        assert_eq!(folded(0b0011, recipient), "ab@example.com");
+        // Dots only: the tag survives, so this is not the base mailbox.
+        assert_eq!(folded(0b0001, recipient), "ab+tag@example.com");
+        // Plus only: the tag strips, the dots stay.
+        assert_eq!(folded(0b0010, recipient), "a.b@example.com");
+        assert_eq!(folded(0b0000, recipient), recipient);
+    }
+
+    #[test]
+    fn the_fold_terminates_on_awkward_local_parts() {
+        // `rewrite` panics if the expansion does not settle inside Postfix's
+        // recursion limit.
+        for recipient in [
+            "a.b.c.d.e.f+one.two.three@example.com",
+            "....x+y+z@example.com",
+            "x+.+y@example.com",
+            "very.long.and.dotted.local.part@example.com",
+        ] {
+            let result = folded(0b0011, recipient);
+            assert!(!result.contains('+'), "{recipient} kept a tag: {result}");
+            assert!(
+                !result.split('@').next().unwrap_or("").contains('.'),
+                "{recipient} kept a dot: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_mailbox_beats_its_own_variants() {
+        // `a.b@example.com` exists. Its literal identity row answers before
+        // any pattern runs, so the dot fold cannot take it to `ab`; and
+        // `ab@example.com` is untouched (there is no row folding *into* a
+        // mailbox), so no variant can be rewritten into somebody's box.
+        let mut state = variants_state(0b0001);
+        state.accounts.push(Account {
+            id: Uuid::nil(),
+            address: addr("a.b@example.com"),
+            display_name: "Dotted".to_owned(),
+            quota_bytes: 0,
+            admin: false,
+        });
+        let literal = postfix_virtual_aliases(&state);
+        let regexp = postfix_variant_alias_regexp(&state);
+        assert!(
+            literal.contains("a.b@example.com a.b@example.com\n"),
+            "identity row missing: {literal}"
+        );
+        assert_eq!(
+            rewrite(&literal, &regexp, "a.b@example.com"),
+            "a.b@example.com"
+        );
+        assert_eq!(
+            rewrite(&literal, &regexp, "ab@example.com"),
+            "ab@example.com"
+        );
+        // A variant of the dotted mailbox folds all the way down through the
+        // recursion and then meets the catch-all: no `abc` mailbox exists, and
+        // the fold never stops *on* the existing dotted box.
+        assert_eq!(
+            rewrite(&literal, &regexp, "a.b.c@example.com"),
+            "abc@example.com"
+        );
+    }
+
+    #[test]
+    fn aliases_stay_literal_because_the_literal_map_is_searched_first() {
+        // `sales@example.com` forwards to the catch-all inbox. The alias row
+        // is answered literally; its tagged form only reaches it when the
+        // plus switch folds the tag first, and with the switch off the
+        // `@domain` catch-all takes it instead.
+        let on = variants_state(0b0010);
+        let literal = postfix_virtual_aliases(&on);
+        let regexp = postfix_variant_alias_regexp(&on);
+        assert_eq!(
+            rewrite(&literal, &regexp, "sales@example.com"),
+            "inbox@example.com, boss@elsewhere.example"
+        );
+        // The tagged form folds to the alias source, and the literal map then
+        // forwards it exactly as it forwards the bare source. (The recursion
+        // has already finished by then — `sales` is a mailbox-shaped local
+        // part with no dot and no tag, so the regexp table never sees it.)
+        assert_eq!(
+            rewrite(&literal, &regexp, "sales+promo@example.com"),
+            "inbox@example.com, boss@elsewhere.example"
+        );
+        // With the switches off there is no fold at all, so the tagged
+        // address is none of `sales`'s business. (Postfix's own fallbacks do
+        // reach the base key here — `recipient_delimiter` and the `postfix`
+        // "strip `+tag`" pass are engine settings, unchanged by this
+        // feature — so this asserts the variant map's contribution alone: it
+        // renders nothing, and the alias source itself still forwards.)
+        let off = variants_state(0b0000);
+        assert_eq!(postfix_variant_alias_regexp(&off), "");
+        assert_eq!(
+            rewrite(
+                &postfix_virtual_aliases(&off),
+                &postfix_variant_alias_regexp(&off),
+                "sales@example.com"
+            ),
+            "inbox@example.com, boss@elsewhere.example"
+        );
+    }
+
+    #[test]
+    fn the_literal_map_is_complete_and_listed_first() {
+        // The order dependency of the whole design: every account and shared
+        // mailbox carries an identity row, and `main.cf` puts the literal map
+        // ahead of the regexp one.
+        let state = variants_state(0b0011);
+        let literal = postfix_virtual_aliases(&state);
+        for address in ["inbox@example.com", "team@example.com"] {
+            assert!(
+                literal.contains(&format!("{address} {address}\n")),
+                "identity row for {address} missing: {literal}"
+            );
+        }
+        let maps =
+            "texthash:/etc/postfix/maps/virtual_aliases, regexp:/etc/postfix/maps/variant_aliases";
+        let literal_at = maps.find("virtual_aliases").expect("literal map");
+        let regexp_at = maps.find("variant_aliases").expect("regexp map");
+        assert!(
+            literal_at < regexp_at,
+            "the literal map must be searched first: {maps}"
+        );
     }
 }

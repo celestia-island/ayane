@@ -20,7 +20,12 @@ mynetworks = 127.0.0.0/8
 # Virtual mailbox domains (rendered by the control plane).
 virtual_mailbox_domains = texthash:/etc/postfix/maps/virtual_domains
 virtual_mailbox_maps = texthash:/etc/postfix/maps/virtual_mailboxes
-virtual_alias_maps = texthash:/etc/postfix/maps/virtual_aliases, pcre:/etc/postfix/subaddress.pcre
+# The literal map comes first and is searched until it answers: an existing
+# account, shared mailbox or alias is therefore never rewritten by the
+# variant patterns behind it. `variant_aliases` is the Gmail-style map the
+# control plane renders (dots / `+tag` folded onto the base mailbox); it is
+# empty — a no-op table — unless an inbound variant switch is on.
+virtual_alias_maps = texthash:/etc/postfix/maps/virtual_aliases, regexp:/etc/postfix/maps/variant_aliases, pcre:/etc/postfix/subaddress.pcre
 # Do not derive the alias-domain list from the alias maps (the default):
 # every hosted domain is a mailbox domain here, and deriving it would make a
 # single unreadable map poison recipient lookups for all of them.

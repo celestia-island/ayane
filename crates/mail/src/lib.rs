@@ -166,6 +166,7 @@ mod tests {
                 default_action: DefaultAction::Reject,
                 allowlist,
                 denylist: vec![SenderRule::Domain("spam.example".to_owned())],
+                variants: Default::default(),
             },
             audit: Default::default(),
             mcp: Default::default(),

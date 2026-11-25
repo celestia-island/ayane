@@ -1043,7 +1043,18 @@ async fn mail_from_addresses(
             }
         }
     }
-    Ok(json!({ "identities": identities }))
+    // The variant switches ride along so the composer can tell a user their
+    // own address also works with dots or a `+tag`. They list no extra
+    // identities: a variant is something the user constructs, and only the
+    // folders it reaches are real.
+    let variants = &stored.desired.policy.variants;
+    Ok(json!({
+        "identities": identities,
+        "variants": {
+            "outbound_dots": variants.outbound_dots,
+            "outbound_plus": variants.outbound_plus,
+        },
+    }))
 }
 
 /// Resolve the mailbox identity a mail operation runs against: the
@@ -1098,8 +1109,16 @@ fn resolve_read_identity(
     Ok((parsed, shared_password, display))
 }
 
-/// Validate a requested send identity: the session's own address or a
-/// shared mailbox it belongs to. Returns the display name for the header.
+/// Validate a requested send identity: the session's own address, a shared
+/// mailbox it belongs to, or — when the administrator enabled the matching
+/// switch — a Gmail-style variant of its own address (dots folded and/or a
+/// `+tag` stripped back to the primary address).
+///
+/// The variant is only ever a *grant*: the From header keeps the address the
+/// user typed, so the recipient sees the tag they chose, while the envelope
+/// sender and the account stay the session's own. `own` itself is never
+/// normalized, only the request, so with every switch off the answer is
+/// exactly the pre-feature one.
 fn resolve_send_identity(
     stored: &ayane_store::StoredState,
     session: &Session,
@@ -1114,6 +1133,9 @@ fn resolve_send_identity(
     }
     let parsed = ayane_proto::Address::parse(requested)
         .map_err(|e| AppError::new("Mail.BadRecipient", e.to_string()))?;
+    if variant_of(&stored.desired.policy.variants, &parsed, &own) {
+        return Ok((parsed, session.display_name.clone()));
+    }
     let Some(account) = stored
         .desired
         .accounts
@@ -1138,6 +1160,34 @@ fn resolve_send_identity(
     }
     let display = parsed.local().to_owned();
     Ok((parsed, display))
+}
+
+/// Whether `requested` is an address-variant of `own` that the policy allows.
+///
+/// A variant is judged by folding it down to the form the switches name —
+/// dots removed when `outbound_dots` is on, the `+tag` cut off when
+/// `outbound_plus` is on — and comparing that with `own`. The fold is done in
+/// one order for both switches (tag first, then dots), the same order the
+/// inbound map folds in, so `a.b+x@d`, `a.b@d` and `a@d` all agree about what
+/// the base mailbox is. A combined variant such as `a.b+tag@d` therefore
+/// needs *both* switches: any switch that is off leaves a piece of the fold
+/// in place, and the comparison fails.
+fn variant_of(
+    variants: &ayane_proto::AddressVariants,
+    requested: &ayane_proto::Address,
+    own: &ayane_proto::Address,
+) -> bool {
+    if !variants.any_outbound() {
+        return false;
+    }
+    let mut folded = requested.clone();
+    if variants.outbound_plus {
+        folded = folded.strip_plus();
+    }
+    if variants.outbound_dots {
+        folded = folded.fold_dots();
+    }
+    folded == *own
 }
 
 async fn mail_templates_list(
@@ -1316,9 +1366,16 @@ fn policy_get(app: &AppState) -> Result<Value, AppError> {
             })
             .collect()
     }
+    let variants = &stored.desired.policy.variants;
     Ok(json!({
         "allowlist": rules(&stored.desired.policy.allowlist),
         "denylist": rules(&stored.desired.policy.denylist),
+        "variants": {
+            "inbound_dots": variants.inbound_dots,
+            "inbound_plus": variants.inbound_plus,
+            "outbound_dots": variants.outbound_dots,
+            "outbound_plus": variants.outbound_plus,
+        },
     }))
 }
 
@@ -1361,11 +1418,26 @@ fn policy_put(app: &AppState, params: Value) -> Result<Value, AppError> {
     }
     let allowlist = parse_rules(&params, "allowlist")?;
     let denylist = parse_rules(&params, "denylist")?;
+    // The variant switches are a write of their own: absent keeps them, so a
+    // client that only edits the lists never resets them.
+    let variants = match params.get("variants") {
+        Some(value) => serde_json::from_value::<ayane_proto::AddressVariants>(value.clone())
+            .map_err(|e| AppError::new("Admin.MalformedState", format!("invalid variants: {e}")))?,
+        None => {
+            app.store
+                .load()
+                .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?
+                .desired
+                .policy
+                .variants
+        }
+    };
     // MUT:locked-admin-write — one locked read-modify-write, like every
     // other slice edit (see `set_account_admin`).
     update_state(app, &mut |stored| {
         stored.desired.policy.allowlist = allowlist.clone();
         stored.desired.policy.denylist = denylist.clone();
+        stored.desired.policy.variants = variants;
         stored
             .desired
             .validate()
@@ -1691,6 +1763,203 @@ mod tests {
     /// An empty `as` is the webui picker's "not resolved yet" state, not
     /// a mailbox request — it must read as absent so the mount-time race
     /// degrades to the personal mailbox instead of a parse error.
+    fn address(raw: &str) -> ayane_proto::Address {
+        ayane_proto::Address::parse(raw).expect("fixture address")
+    }
+
+    fn variants(bits: u8) -> ayane_proto::AddressVariants {
+        ayane_proto::AddressVariants {
+            inbound_dots: bits & 1 != 0,
+            inbound_plus: bits & 2 != 0,
+            outbound_dots: bits & 4 != 0,
+            outbound_plus: bits & 8 != 0,
+        }
+    }
+
+    fn session_for(own: &str) -> Session {
+        Session {
+            address: address(own),
+            display_name: "Tester".to_owned(),
+            admin: false,
+            password: Some("secret".to_owned()),
+            needs_mailbox_password: false,
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        }
+    }
+
+    /// A stored state with one account (`own`) and one shared mailbox it is a
+    /// member of (`team@example.test`), so both the shared path and the
+    /// variant path are reachable in the same fixture.
+    fn store_for(own: &str, switches: ayane_proto::AddressVariants) -> ayane_store::StoredState {
+        let account_id = uuid::Uuid::new_v4();
+        let desired = ayane_proto::DesiredState {
+            domains: vec![ayane_proto::MailDomain {
+                name: "example.test".to_owned(),
+                catch_all: None,
+                enabled: true,
+            }],
+            accounts: vec![ayane_proto::Account {
+                id: account_id,
+                address: address(own),
+                display_name: "Tester".to_owned(),
+                quota_bytes: 0,
+                admin: false,
+            }],
+            shared: vec![ayane_proto::SharedMailbox {
+                id: uuid::Uuid::new_v4(),
+                address: address("team@example.test"),
+                members: vec![account_id],
+            }],
+            policy: ayane_proto::Policy {
+                variants: switches,
+                ..ayane_proto::Policy::default()
+            },
+            ..ayane_proto::DesiredState::default()
+        };
+        let mut hashes = std::collections::HashMap::new();
+        hashes.insert(own.to_owned(), "hash".to_owned());
+        ayane_store::StoredState {
+            desired,
+            password_hashes: hashes,
+            external_identities: Vec::new(),
+        }
+    }
+
+    /// `resolve_send_identity` against `requested`, as the mail path calls it.
+    fn send_as(
+        own: &str,
+        switches: ayane_proto::AddressVariants,
+        requested: Option<&str>,
+    ) -> Result<String, AppError> {
+        let stored = store_for(own, switches);
+        let session = session_for(own);
+        resolve_send_identity(&stored, &session, requested)
+            .map(|(from, _display)| from.as_str().to_owned())
+    }
+
+    #[test]
+    fn every_outbound_switch_off_keeps_the_pre_feature_answers() {
+        let own = "alice@example.test";
+        // The account's own address, asked for or not, is itself.
+        assert_eq!(send_as(own, variants(0), None).expect("own"), own);
+        assert_eq!(send_as(own, variants(0), Some(own)).expect("own"), own);
+        // The shared mailbox it belongs to still works.
+        assert_eq!(
+            send_as(own, variants(0), Some("team@example.test")).expect("shared"),
+            "team@example.test"
+        );
+        // Every variant is refused, exactly as before the feature.
+        for requested in [
+            "al.ice@example.test",
+            "alice+x@example.test",
+            "al.ice+x@example.test",
+        ] {
+            let refused = send_as(own, variants(0), Some(requested));
+            assert!(refused.is_err(), "`{requested}` must be refused");
+            assert_eq!(
+                refused.expect_err("refused").prose,
+                "that shared mailbox does not belong to this account"
+            );
+        }
+        // Inbound switches alone grant nothing outbound.
+        assert!(send_as(own, variants(0b0011), Some("alice+x@example.test")).is_err());
+    }
+
+    #[test]
+    fn outbound_dots_grants_dotted_forms_of_the_own_address() {
+        let own = "alice@example.test";
+        let on = variants(0b0100);
+        for granted in [
+            "al.ice@example.test",
+            "a.l.i.c.e@example.test",
+            "alice.@example.test",
+            ".alice@example.test",
+        ] {
+            assert_eq!(send_as(own, on, Some(granted)).expect(granted), granted);
+        }
+        // A dot variant of somebody else, or of the shared mailbox, is not the
+        // own address's variant and is still refused.
+        assert!(send_as(own, on, Some("bob.smith@example.test")).is_err());
+        assert!(send_as(own, on, Some("team.x@example.test")).is_err());
+        // The plus tag is a different switch.
+        assert!(send_as(own, on, Some("alice+x@example.test")).is_err());
+        // Another domain never folds.
+        assert!(send_as(own, on, Some("al.ice@elsewhere.test")).is_err());
+    }
+
+    #[test]
+    fn outbound_plus_grants_tagged_forms_of_the_own_address() {
+        let own = "alice@example.test";
+        let on = variants(0b1000);
+        for granted in [
+            "alice+news@example.test",
+            "alice+a+b@example.test",
+            "alice+@example.test",
+        ] {
+            assert_eq!(send_as(own, on, Some(granted)).expect(granted), granted);
+        }
+        assert!(send_as(own, on, Some("bob+x@example.test")).is_err());
+        assert!(send_as(own, on, Some("team+x@example.test")).is_err());
+        // Dots are a different switch.
+        assert!(send_as(own, on, Some("al.ice@example.test")).is_err());
+    }
+
+    #[test]
+    fn a_combined_from_needs_both_outbound_switches() {
+        let own = "alice@example.test";
+        let combined = "al.ice+tag@example.test";
+        // Both on: the tag strips and the dots fold onto the own address.
+        assert_eq!(
+            send_as(own, variants(0b1100), Some(combined)).expect("both on"),
+            combined
+        );
+        // Either switch alone leaves a piece behind.
+        assert!(send_as(own, variants(0b0100), Some(combined)).is_err());
+        assert!(send_as(own, variants(0b1000), Some(combined)).is_err());
+    }
+
+    #[test]
+    fn the_grant_never_widens_the_from_to_a_foreign_address() {
+        let own = "alice@example.test";
+        let switches = variants(0b1111);
+        for foreign in [
+            "bob@example.test",
+            "alice@elsewhere.test",
+            "alic@example.test",
+            "alicee@example.test",
+            "team@example.test.elsewhere",
+        ] {
+            assert!(
+                send_as(own, switches, Some(foreign)).is_err(),
+                "`{foreign}` must stay refused"
+            );
+        }
+        // The shared membership path is unchanged by any switch.
+        assert_eq!(
+            send_as(own, switches, Some("team@example.test")).expect("shared"),
+            "team@example.test"
+        );
+    }
+
+    #[test]
+    fn variant_of_folds_in_the_documented_order() {
+        let own = address("alice@example.test");
+        let all = variants(0b1111);
+        assert!(variant_of(&all, &address("al.ice+tag@example.test"), &own));
+        // Tag first, dots second: the order the inbound map folds in.
+        assert_eq!(
+            address("al.ice+tag@example.test").strip_plus().fold_dots(),
+            own
+        );
+        // Outbound switches only: inbound ones grant nothing here.
+        assert!(!variant_of(
+            &variants(0b0011),
+            &address("alice+x@example.test"),
+            &own
+        ));
+        assert!(!variant_of(&variants(0), &own.clone(), &own));
+    }
+
     #[test]
     fn empty_identity_param_reads_as_absent() {
         assert_eq!(identity_of(&json!({})), None);
@@ -1701,4 +1970,6 @@ mod tests {
             Some("team@example.test")
         );
     }
+
+    // ── send identity: Gmail-style variants ─────────────────────────────
 }

@@ -340,7 +340,7 @@ async fn apply_writes_config_then_rewrites_nothing() {
         .iter()
         .filter(|f| f["changed"] == serde_json::Value::Bool(true))
         .collect();
-    assert_eq!(changed.len(), 6, "first apply writes every file: {report}");
+    assert_eq!(changed.len(), 7, "first apply writes every file: {report}");
 
     let passwd = fixture.state_dir.join("config/dovecot/passwd");
     let contents = std::fs::read_to_string(&passwd).expect("passwd");
@@ -353,6 +353,10 @@ async fn apply_writes_config_then_rewrites_nothing() {
     let maps = std::fs::read_to_string(fixture.state_dir.join("config/postfix/virtual_mailboxes"))
         .expect("maps");
     assert!(maps.contains("boss@example.test OK\n"));
+    // The Gmail-style variant map is always written, and is empty (a no-op
+    // table) while every inbound switch is off.
+    let variants = fixture.state_dir.join("config/postfix/variant_aliases");
+    assert_eq!(std::fs::read_to_string(&variants).expect("variant map"), "");
 
     let response = fixture
         .app
