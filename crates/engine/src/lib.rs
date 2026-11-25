@@ -1626,8 +1626,8 @@ mod tests {
             ),
         ] {
             assert!(
-                text.contains("milter_default_action = reject"),
-                "{path}: milter must fail closed"
+                text.contains("milter_default_action = tempfail"),
+                "{path}: milter must fail closed with a 4xx (tempfail), not reject"
             );
             assert!(
                 text.contains("smtpd_sender_login_maps = texthash:/etc/postfix/maps/sender_login")
@@ -1635,14 +1635,30 @@ mod tests {
                 "{path}: sender login binding missing"
             );
         }
+        // The plaintext AUTH port must NOT bind the container's loopback:
+        // docker-proxy forwards the host-published port to the container's
+        // eth0, so a container-lo bind cuts the control plane's send leg
+        // (R2 measured it). The boundary is the HOST-loopback publish in
+        // compose; inside the container the service listens on all ifaces.
         let master = include_str!("../../../deploy/prod/postfix/master.cf");
         let internal = master
             .lines()
             .find(|l| l.contains("10587") && l.contains("inet"))
             .expect("internal submission service");
         assert!(
-            internal.starts_with("127.0.0.1:10587"),
-            "plaintext AUTH port must bind loopback: {internal}"
+            !internal.starts_with("127.0.0.1"),
+            "container-side loopback bind breaks the control plane: {internal}"
+        );
+        let compose = include_str!("../../../deploy/prod/docker-compose.yml");
+        assert!(
+            compose.contains("127.0.0.1:10587:10587"),
+            "the internal port's boundary is the host-loopback publish"
+        );
+        // The sender_login map must exist before the first apply, or
+        // reject_sender_login_mismatch refuses every authenticated sender.
+        assert!(
+            compose.contains("/etc/postfix/maps/sender_login"),
+            "compose must pre-create the sender_login map"
         );
     }
 
