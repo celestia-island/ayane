@@ -16,9 +16,12 @@
 
 </div>
 
-> **Status: Stage 0 skeleton.** The repository boots, answers `/api/health` and
-> renders the daemon configuration, but it does **not** send or receive mail yet.
-> Nothing here is deployable.
+> **Status: live.** The control plane, rendered webmail, protection layer and
+> the Celestia ID sign-in run on the production rig (`mail.acgsyzx.me`); the
+> mail engine (Postfix / Dovecot / rspamd / ClamAV) is deployed with DKIM, SPF
+> and DMARC. Inbound SMTP/25 is tested and working and rspamd rejects spam at
+> the gate; outbound to the big providers is rate-limited there (PTR is live,
+> Postfix retries).
 
 ## Why this exists
 
