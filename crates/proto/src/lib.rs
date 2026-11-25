@@ -117,6 +117,49 @@ impl Address {
         }
         Some(Self(format!("{base}@{domain}")))
     }
+
+    /// The address with every `.` removed from its local part
+    /// (`a.b.c@d` → `abc@d`), the domain untouched.
+    ///
+    /// This is the Gmail convention that a mailbox may be written with dots
+    /// anywhere in its local part. Folding is idempotent, so a caller can
+    /// compare [`fold_dots`](Self::fold_dots) against a stored primary
+    /// address to decide whether the input is a dot variant of it. With no
+    /// dot in the local part the address is unchanged.
+    ///
+    /// A local part made of dots alone folds to an empty one; that form is
+    /// never a valid variant (the folded value is only ever compared against
+    /// a stored primary address, which always has a real local part), so the
+    /// callers treat it as "not this mailbox" rather than call it an address.
+    #[must_use]
+    pub fn fold_dots(&self) -> Self {
+        let (local, domain) = self.split_domain();
+        Self(format!(
+            "{}@{domain}",
+            local.chars().filter(|ch| *ch != '.').collect::<String>()
+        ))
+    }
+
+    /// The address with its local part cut at the **first** `+`
+    /// (`a+b+c@d` → `a@d`, `a+@d` → `a@d`), the domain untouched.
+    ///
+    /// Unlike [`without_subaddress`](Self::without_subaddress) this keeps a
+    /// bare `a+` (an empty tag) folding to `a`, because the tag is the
+    /// caller's to ignore: what matters is the base mailbox in front of it.
+    /// An address with no `+` folds to itself.
+    #[must_use]
+    pub fn strip_plus(&self) -> Self {
+        let (local, domain) = self.split_domain();
+        let base = local.split_once('+').map_or(local, |(base, _tag)| base);
+        Self(format!("{base}@{domain}"))
+    }
+
+    /// The two halves of the stored address, split at its single `@`.
+    fn split_domain(&self) -> (&str, &str) {
+        self.0
+            .split_once('@')
+            .map_or((self.0.as_str(), ""), |(local, domain)| (local, domain))
+    }
 }
 
 /// Validate a standalone domain name (policy rules, hosted domains).
@@ -260,6 +303,50 @@ pub struct McpConfig {
     pub token: String,
 }
 
+/// The Gmail-style address variants the administrator may allow, split into
+/// four independent switches: receiving and sending, dots and plus tags.
+///
+/// Every switch defaults to off, so a policy stored before this type existed
+/// renders exactly the configuration it rendered before.
+///
+/// The two inbound switches have no say in *which* mailbox a variant reaches —
+/// the aliasing machinery in `ayane-engine` decides that — and the two
+/// outbound switches gate which From addresses a mailbox session may send as
+/// (see `ayane`'s send-identity resolver). They are kept together because an
+/// administrator reasons about them as one table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddressVariants {
+    /// Inbound: dots inside the local part fold to the dot-less mailbox
+    /// (`a.b.c@d` is delivered to `abc@d`).
+    #[serde(default)]
+    pub inbound_dots: bool,
+    /// Inbound: a `+tag` suffix is stripped to the base mailbox
+    /// (`a+tag@d` is delivered to `a@d`).
+    #[serde(default)]
+    pub inbound_plus: bool,
+    /// Outbound: a user may send From their own address with dots inserted.
+    #[serde(default)]
+    pub outbound_dots: bool,
+    /// Outbound: a user may send From their own address with a `+tag`.
+    #[serde(default)]
+    pub outbound_plus: bool,
+}
+
+impl AddressVariants {
+    /// Whether any inbound variant is enabled (the engine's gate for the
+    /// Postfix variant map).
+    #[must_use]
+    pub fn any_inbound(&self) -> bool {
+        self.inbound_dots || self.inbound_plus
+    }
+
+    /// Whether any outbound variant is enabled (the send-identity gate).
+    #[must_use]
+    pub fn any_outbound(&self) -> bool {
+        self.outbound_dots || self.outbound_plus
+    }
+}
+
 /// Recipient policy for unknown recipients.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
@@ -271,6 +358,11 @@ pub struct Policy {
     pub allowlist: Vec<SenderRule>,
     /// Senders that are rejected before any other rule runs.
     pub denylist: Vec<SenderRule>,
+    /// Gmail-style address variants (dots and `+tag`, inbound and outbound).
+    /// Defaults to every switch off, so states stored before the field
+    /// existed keep their exact behaviour.
+    #[serde(default)]
+    pub variants: AddressVariants,
 }
 
 /// A hosted mail domain.
@@ -580,5 +672,143 @@ mod tests {
             state.validate(),
             Err(StateError::EmptySharedMailbox(_))
         ));
+    }
+
+    // ── Gmail-style address variants ──────────────────────────────────────
+
+    #[test]
+    fn fold_dots_removes_every_dot_from_the_local_part() {
+        for (raw, folded) in [
+            ("a.b.c@example.com", "abc@example.com"),
+            ("a.b.c.d.e.f@example.com", "abcdef@example.com"),
+            (".a@example.com", "a@example.com"),
+            ("a.@example.com", "a@example.com"),
+            ("abc@example.com", "abc@example.com"),
+            ("a.b@example.com", "ab@example.com"),
+            // The domain keeps its dots: only the local part folds.
+            ("a.b@mail.example.com", "ab@mail.example.com"),
+            // A plus tag survives folding; stripping is the other switch.
+            ("a.b+tag@example.com", "ab+tag@example.com"),
+        ] {
+            assert_eq!(address(raw).fold_dots().as_str(), folded, "folding `{raw}`");
+        }
+    }
+
+    #[test]
+    fn fold_dots_is_idempotent_and_self_inverse_on_dotless_input() {
+        let dotted = address("jane.doe@example.com");
+        let once = dotted.fold_dots();
+        assert_eq!(once.clone().fold_dots(), once);
+        let plain = address("janedoe@example.com");
+        assert_eq!(plain.fold_dots(), plain);
+    }
+
+    #[test]
+    fn a_local_part_of_dots_only_folds_to_an_empty_local_part() {
+        // Not an address any caller accepts as a variant, but the fold itself
+        // must be total: callers compare against a real primary address, so an
+        // empty local part simply never matches.
+        assert_eq!(address("...@example.com").fold_dots().local(), "");
+        assert_eq!(address(".@example.com").fold_dots().local(), "");
+    }
+
+    #[test]
+    fn strip_plus_cuts_at_the_first_plus() {
+        for (raw, stripped) in [
+            ("a+b@example.com", "a@example.com"),
+            ("a+b+c@example.com", "a@example.com"),
+            ("a++@example.com", "a@example.com"),
+            ("a+@example.com", "a@example.com"),
+            ("a@example.com", "a@example.com"),
+            // Folding dots is the other switch; stripping leaves them alone.
+            ("a.b+tag@example.com", "a.b@example.com"),
+            // The domain is never touched, even with a `+` in a label name.
+            ("a+tag@plus.example.com", "a@plus.example.com"),
+        ] {
+            assert_eq!(
+                address(raw).strip_plus().as_str(),
+                stripped,
+                "stripping `{raw}`"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_plus_is_idempotent() {
+        let once = address("a+b+c@example.com").strip_plus();
+        assert_eq!(once.clone().strip_plus(), once);
+    }
+
+    #[test]
+    fn both_variants_compose_in_either_order() {
+        // The order does not matter: dots are removed and the local part is
+        // cut at the first `+`.
+        let combined = address("a.b+x@example.com");
+        assert_eq!(combined.strip_plus().fold_dots().as_str(), "ab@example.com");
+        assert_eq!(combined.fold_dots().strip_plus().as_str(), "ab@example.com");
+        assert_eq!(
+            address("a.b.c+d@example.com").strip_plus().fold_dots(),
+            address("abc@example.com")
+        );
+    }
+
+    #[test]
+    fn variants_default_to_off_and_round_trip_through_serde() {
+        let policy = Policy::default();
+        assert!(!policy.variants.any_inbound());
+        assert!(!policy.variants.any_outbound());
+        assert_eq!(policy.variants, AddressVariants::default());
+
+        // A policy stored before the field existed reads back with every
+        // switch off — no behaviour change for an old snapshot.
+        let legacy: Policy =
+            serde_json::from_str(r#"{"default_action":"reject","allowlist":[],"denylist":[]}"#)
+                .expect("legacy policy");
+        assert_eq!(legacy, Policy::default());
+
+        // An absent switch inside a present object is off too.
+        let partial: Policy = serde_json::from_str(
+            r#"{"default_action":"reject","allowlist":[],"denylist":[],
+                "variants":{"inbound_plus":true}}"#,
+        )
+        .expect("partial policy");
+        assert!(partial.variants.inbound_plus);
+        assert!(!partial.variants.inbound_dots);
+        assert!(!partial.variants.outbound_dots);
+        assert!(!partial.variants.outbound_plus);
+
+        let all_on = Policy {
+            variants: AddressVariants {
+                inbound_dots: true,
+                inbound_plus: true,
+                outbound_dots: true,
+                outbound_plus: true,
+            },
+            ..Policy::default()
+        };
+        let json = serde_json::to_string(&all_on).expect("serialize");
+        assert!(json.contains("\"inbound_dots\":true"), "{json}");
+        let round_trip: Policy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_trip, all_on);
+        assert!(round_trip.variants.any_inbound());
+        assert!(round_trip.variants.any_outbound());
+    }
+
+    #[test]
+    fn variants_add_no_validation_constraint() {
+        // Every combination of the four booleans validates: they only change
+        // how addresses are matched, never what a state may contain.
+        for bits in 0u8..16 {
+            let mut state = fixture();
+            state.policy.variants = AddressVariants {
+                inbound_dots: bits & 1 != 0,
+                inbound_plus: bits & 2 != 0,
+                outbound_dots: bits & 4 != 0,
+                outbound_plus: bits & 8 != 0,
+            };
+            state
+                .validate()
+                .unwrap_or_else(|e| panic!("combination {bits:04b} rejected: {e}"));
+        }
     }
 }
