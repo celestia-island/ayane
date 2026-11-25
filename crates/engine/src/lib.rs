@@ -352,6 +352,45 @@ pub fn postfix_sender_denylist(state: &DesiredState) -> String {
     rows.into_iter().map(|row| format!("{row}\n")).collect()
 }
 
+/// Postfix `smtpd_sender_login_maps`: which envelope senders each
+/// authenticated user may use. Postfix's `reject_sender_login_mismatch`
+/// refuses a `MAIL FROM` the logged-in user does not own — without this
+/// table any authenticated account could send as any other address on
+/// the domain (2026-11-25 security recon, P1). A user owns their own
+/// address and every shared mailbox they are a member of; an address
+/// may also be listed under several owners (shared mailboxes), which
+/// Postfix accepts — the map is `sender owner, owner, …`.
+#[must_use]
+pub fn postfix_sender_login_maps(state: &DesiredState) -> String {
+    let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for account in &state.accounts {
+        if !hosted(state, account.address.domain()) {
+            continue;
+        }
+        owners
+            .entry(account.address.to_string())
+            .or_default()
+            .insert(account.address.to_string());
+        for shared in &state.shared {
+            if hosted(state, shared.address.domain()) && shared.members.contains(&account.id) {
+                owners
+                    .entry(shared.address.to_string())
+                    .or_default()
+                    .insert(account.address.to_string());
+            }
+        }
+    }
+    owners
+        .into_iter()
+        .map(|(sender, list)| {
+            format!(
+                "{sender} {}\n",
+                list.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        })
+        .collect()
+}
+
 /// rspamd `local_domains` option.
 #[must_use]
 pub fn rspamd_local_domains(state: &DesiredState) -> String {
@@ -1542,6 +1581,69 @@ mod tests {
                 .expect("virtual_alias_maps in main.cf")
         })
         .collect()
+    }
+
+    /// Each sender lists the accounts allowed to use it: a user's own
+    /// address, and every shared mailbox they belong to. A sender may have
+    /// several owners (a shared mailbox) — Postfix accepts the comma list.
+    #[test]
+    fn sender_login_lists_each_sender_with_its_owners() {
+        let map = postfix_sender_login_maps(&fixture());
+        let line = |sender: &str| {
+            map.lines()
+                .find(|l| l.starts_with(sender))
+                .unwrap_or_else(|| panic!("{sender} missing from:\n{map}"))
+        };
+        // The account owns itself.
+        assert!(line("inbox@example.com").contains("inbox@example.com"));
+        // The shared mailbox is owned by its member.
+        let team = line("team@example.com");
+        assert!(team.contains("inbox@example.com"), "{team}");
+        // The retired domain's account is not hosted -> not in the map.
+        assert!(!map.contains("stale@retired.example"), "{map}");
+        // Every row is `sender owner[, owner…]` — Postfix's map shape.
+        for row in map.lines() {
+            let mut parts = row.split(' ');
+            let sender = parts.next().expect("sender");
+            assert!(sender.contains('@'), "{row}");
+            assert!(parts.next().is_some(), "no owner for {row}");
+        }
+    }
+
+    /// The shipped configs carry the three 2026-11-25 security seams: the
+    /// milter fails CLOSED (a down rspamd must not disable the DKIM/DMARC
+    /// reject verdicts), the envelope sender is bound to the logged-in
+    /// identity, and the plaintext internal submission port is bound to
+    /// loopback in master.cf itself (not only in compose). Read from the
+    /// tree so a config edit that widens any of them goes red here.
+    #[test]
+    fn shipped_configs_carry_the_security_seams() {
+        for (path, text) in [
+            ("prod", include_str!("../../../deploy/prod/postfix/main.cf")),
+            (
+                "image",
+                include_str!("../../../deploy/images/postfix/main.cf"),
+            ),
+        ] {
+            assert!(
+                text.contains("milter_default_action = reject"),
+                "{path}: milter must fail closed"
+            );
+            assert!(
+                text.contains("smtpd_sender_login_maps = texthash:/etc/postfix/maps/sender_login")
+                    && text.contains("smtpd_sender_restrictions = reject_sender_login_mismatch"),
+                "{path}: sender login binding missing"
+            );
+        }
+        let master = include_str!("../../../deploy/prod/postfix/master.cf");
+        let internal = master
+            .lines()
+            .find(|l| l.contains("10587") && l.contains("inet"))
+            .expect("internal submission service");
+        assert!(
+            internal.starts_with("127.0.0.1:10587"),
+            "plaintext AUTH port must bind loopback: {internal}"
+        );
     }
 
     #[test]

@@ -56,10 +56,16 @@ smtpd_tls_security_level = none
 # our own account and must be able to send anywhere.
 smtpd_recipient_restrictions = permit_mynetworks, check_sender_access texthash:/etc/postfix/maps/sender_denylist, permit_sasl_authenticated, reject_unauth_destination
 
-# Content filter (spam / DKIM / headers) via milter; accept mail when the
-# filter is down so a missing rspamd never blocks delivery in the dev rig.
+# Bind the envelope sender to the logged-in identity (mirror of production).
+smtpd_sender_login_maps = texthash:/etc/postfix/maps/sender_login
+smtpd_sender_restrictions = reject_sender_login_mismatch
+
+# Content filter (spam / DKIM / headers) via milter. Same fail-closed
+# posture as production (2026-11-25 security recon): a down filter must not
+# disable the DKIM/DMARC reject verdicts. In the dev rig this means a stopped
+# rspamd defers mail instead of passing it — start the filter before sending.
 smtpd_milters = inet:rspamd:11332
-milter_default_action = accept
+milter_default_action = reject
 milter_protocol = 6
 
 message_size_limit = 26214400
