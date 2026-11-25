@@ -38,6 +38,29 @@ pub fn build_plain_message(
     subject: &str,
     body: &str,
 ) -> Result<Message, ComposeError> {
+    build_plain_message_as(from, from_name, from, to, subject, body)
+}
+
+/// [`build_plain_message`] with the From header and the envelope sender
+/// chosen separately.
+///
+/// `from` is what the recipient reads; `envelope_from` is what `MAIL FROM`
+/// carries, and it is the account — never a Gmail-style variant of it. The
+/// two differ exactly when the administrator let a user send as
+/// `alice+tag@d`: the header shows the tag, while SPF, DKIM alignment and
+/// the bounce path stay on the address that actually exists.
+///
+/// # Errors
+///
+/// Returns [`ComposeError`] on the same conditions as [`build_plain_message`].
+pub fn build_plain_message_as(
+    from: &Address,
+    from_name: &str,
+    envelope_from: &Address,
+    to: &Address,
+    subject: &str,
+    body: &str,
+) -> Result<Message, ComposeError> {
     reject_newlines("from display name", from_name)?;
     reject_newlines("subject", subject)?;
 
@@ -46,13 +69,22 @@ pub fn build_plain_message(
 
     let message = Message::builder()
         .from(from)
-        .to(to)
+        .to(to.clone())
         .subject(subject.to_owned())
         .header(ContentType::TEXT_PLAIN)
+        .envelope(envelope_of(envelope_from, &to)?)
         .body(body.to_owned())
         .map_err(|error| ComposeError::Message(error.to_string()))?;
 
     Ok(message)
+}
+
+/// The `MAIL FROM` / `RCPT TO` pair for one message: the sending account
+/// and the recipient the headers name.
+fn envelope_of(envelope_from: &Address, to: &Mailbox) -> Result<Envelope, ComposeError> {
+    let recipients = vec![to.email.clone()];
+    Envelope::new(Some(lettre_address(envelope_from)?), recipients)
+        .map_err(|error| ComposeError::Address(error.to_string()))
 }
 
 /// Build a plain-text DRAFT and serialise it for the Drafts mailbox.
@@ -202,6 +234,35 @@ pub fn build_composed_message_mode(
     attachments: &[OutgoingAttachment],
     markdown: bool,
 ) -> Result<Message, ComposeError> {
+    build_composed_message_as(
+        from,
+        from_name,
+        from,
+        to,
+        subject,
+        body,
+        attachments,
+        markdown,
+    )
+}
+
+/// [`build_composed_message_mode`] with the From header and the envelope
+/// sender chosen separately (see [`build_plain_message_as`]).
+///
+/// # Errors
+///
+/// Returns [`ComposeError`] on the same conditions as the twin above.
+#[allow(clippy::too_many_arguments)]
+pub fn build_composed_message_as(
+    from: &Address,
+    from_name: &str,
+    envelope_from: &Address,
+    to: &Address,
+    subject: &str,
+    body: &str,
+    attachments: &[OutgoingAttachment],
+    markdown: bool,
+) -> Result<Message, ComposeError> {
     reject_newlines("from display name", from_name)?;
     reject_newlines("subject", subject)?;
 
@@ -239,8 +300,9 @@ pub fn build_composed_message_mode(
 
     let message = Message::builder()
         .from(from)
-        .to(to)
+        .to(to.clone())
         .subject(subject.to_owned())
+        .envelope(envelope_of(envelope_from, &to)?)
         .multipart(body)
         .map_err(|error| ComposeError::Message(error.to_string()))?;
 
@@ -354,6 +416,68 @@ mod tests {
         assert!(!text.contains("\r\nTo:"));
         assert!(text.contains("X-Ayane-Draft-To"));
         assert!(text.contains("ops@ (still looking up the domain)"));
+    }
+
+    #[test]
+    fn a_variant_from_header_keeps_the_account_as_the_envelope_sender() {
+        // The From header shows the tag the user typed; `MAIL FROM` carries
+        // the address that exists, so SPF, DKIM alignment and bounces stay
+        // with the mailbox.
+        let header_from = addr("alice+lists@example.com");
+        let account = addr("alice@example.com");
+        let to = addr("boss@example.com");
+        let message = build_plain_message_as(&header_from, "Alice", &account, &to, "s", "b")
+            .expect("message");
+        let rendered = String::from_utf8(render(&message)).expect("utf8");
+        assert!(
+            rendered.contains("From: Alice <alice+lists@example.com>"),
+            "{rendered}"
+        );
+        assert_eq!(
+            message.envelope().from().map(ToString::to_string),
+            Some("alice@example.com".to_owned())
+        );
+        assert_eq!(
+            message
+                .envelope()
+                .to()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["boss@example.com".to_owned()]
+        );
+
+        // The plain builder derives the envelope from the header; the `_as`
+        // form is the one that splits them.
+        let derived = build_plain_message(&header_from, "Alice", &to, "s", "b").expect("message");
+        assert_eq!(
+            derived.envelope().from().map(ToString::to_string),
+            Some("alice+lists@example.com".to_owned())
+        );
+
+        // A multiline attachment body keeps the same split.
+        let attachments = vec![OutgoingAttachment {
+            filename: "a.txt".to_owned(),
+            content_type: "text/plain".to_owned(),
+            data: b"hi".to_vec(),
+        }];
+        let composed = build_composed_message_as(
+            &header_from,
+            "Alice",
+            &account,
+            &to,
+            "s",
+            "b",
+            &attachments,
+            true,
+        )
+        .expect("message");
+        assert_eq!(
+            composed.envelope().from().map(ToString::to_string),
+            Some("alice@example.com".to_owned())
+        );
+        let rendered = String::from_utf8(render(&composed)).expect("utf8");
+        assert!(rendered.contains("alice+lists@example.com"), "{rendered}");
     }
 
     #[test]

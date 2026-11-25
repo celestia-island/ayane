@@ -756,6 +756,12 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
         &session,
         params.get("from").and_then(Value::as_str),
     )?;
+    // The envelope sender is the ACCOUNT, always — never a variant of it.
+    // The header carries whatever the user chose; `MAIL FROM` carries the
+    // address that exists, so SPF, DKIM alignment and bounces stay with the
+    // mailbox (lettre would otherwise derive the envelope from the From
+    // header).
+    let envelope_from = session.address.clone();
 
     // Attachments arrive base64-encoded; the size cap keeps one request
     // from carrying an unreasonable payload (the engine queue handles the
@@ -808,16 +814,26 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
     let message = if attachments.is_empty()
         && params.get("format").and_then(Value::as_str) != Some("markdown")
     {
-        ayane_mail::compose::build_plain_message(&from_address, &from_name, &to, &subject, &body)
-            .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
-    } else {
-        ayane_mail::compose::build_composed_message(
+        ayane_mail::compose::build_plain_message_as(
             &from_address,
             &from_name,
+            &envelope_from,
+            &to,
+            &subject,
+            &body,
+        )
+        .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
+    } else {
+        let markdown = params.get("format").and_then(Value::as_str) == Some("markdown");
+        ayane_mail::compose::build_composed_message_as(
+            &from_address,
+            &from_name,
+            &envelope_from,
             &to,
             &subject,
             &body,
             &attachments,
+            markdown,
         )
         .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
     };
@@ -1115,10 +1131,10 @@ fn resolve_read_identity(
 /// `+tag` stripped back to the primary address).
 ///
 /// The variant is only ever a *grant*: the From header keeps the address the
-/// user typed, so the recipient sees the tag they chose, while the envelope
-/// sender and the account stay the session's own. `own` itself is never
-/// normalized, only the request, so with every switch off the answer is
-/// exactly the pre-feature one.
+/// user typed (the recipient sees the tag they chose), while the caller keeps
+/// the envelope sender on the session's own address — see `mail_send`. `own`
+/// itself is never normalized, only the request, so with every switch off the
+/// answer is exactly the pre-feature one.
 fn resolve_send_identity(
     stored: &ayane_store::StoredState,
     session: &Session,
@@ -1418,26 +1434,26 @@ fn policy_put(app: &AppState, params: Value) -> Result<Value, AppError> {
     }
     let allowlist = parse_rules(&params, "allowlist")?;
     let denylist = parse_rules(&params, "denylist")?;
-    // The variant switches are a write of their own: absent keeps them, so a
-    // client that only edits the lists never resets them.
-    let variants = match params.get("variants") {
-        Some(value) => serde_json::from_value::<ayane_proto::AddressVariants>(value.clone())
-            .map_err(|e| AppError::new("Admin.MalformedState", format!("invalid variants: {e}")))?,
-        None => {
-            app.store
-                .load()
-                .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?
-                .desired
-                .policy
-                .variants
-        }
-    };
+    // The variant switches are a write of their own: absent keeps whatever
+    // the locked read sees, so a client that only edits the lists never
+    // resets them — and never writes back a value read before another writer
+    // committed.
+    let variants = params
+        .get("variants")
+        .map(|value| {
+            serde_json::from_value::<ayane_proto::AddressVariants>(value.clone()).map_err(|e| {
+                AppError::new("Admin.MalformedState", format!("invalid variants: {e}"))
+            })
+        })
+        .transpose()?;
     // MUT:locked-admin-write — one locked read-modify-write, like every
     // other slice edit (see `set_account_admin`).
     update_state(app, &mut |stored| {
         stored.desired.policy.allowlist = allowlist.clone();
         stored.desired.policy.denylist = denylist.clone();
-        stored.desired.policy.variants = variants;
+        if let Some(variants) = &variants {
+            stored.desired.policy.variants = *variants;
+        }
         stored
             .desired
             .validate()

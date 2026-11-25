@@ -428,6 +428,9 @@ pub enum StateError {
     /// A shared mailbox has no members.
     #[error("shared mailbox `{0}` has no members")]
     EmptySharedMailbox(String),
+    /// A hosted domain name is not a valid DNS name.
+    #[error("hosted domain is malformed: {0}")]
+    MalformedDomain(String),
 }
 
 /// The full desired configuration of one instance.
@@ -478,6 +481,15 @@ impl DesiredState {
             }
         }
         for domain in &self.domains {
+            // A hosted domain name is interpolated into DNS records, Postfix
+            // mailbox maps and the variant regexp table; validate() is the
+            // only guard on the REST / ws write paths.
+            if let Err(error) = check_domain(&domain.name) {
+                return Err(StateError::MalformedDomain(format!(
+                    "{}: {error}",
+                    domain.name
+                )));
+            }
             if !seen.insert(format!("@{}", domain.name)) {
                 return Err(StateError::DuplicateAddress(domain.name.clone()));
             }

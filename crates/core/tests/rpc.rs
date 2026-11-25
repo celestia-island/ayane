@@ -304,6 +304,8 @@ async fn mail_send_accepts_a_tagged_from_only_when_the_switch_is_on() {
     assert_eq!(saved["result"]["saved"], json!(true), "{saved}");
 
     // The same tagged From is now granted: it gets as far as the relay.
+    // (The envelope sender stays the account — `compose` pins it — so the
+    // variant only ever changes the From header.)
     let granted = call(&surface, send("test+news@example.test")).await;
     assert!(
         message(&granted).starts_with("Mail.SubmissionFailed:"),
