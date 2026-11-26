@@ -142,13 +142,29 @@ pub fn router(state: AppState) -> Router {
 
 /// The full application: the management REST face plus the ws/mcp
 /// JSON-RPC surface.
+///
+/// The family error landing is the innermost layer of the merged tree, so
+/// every route's error response — the REST face's `{"error": …}`, the MCP
+/// surface's 401, the `/api/` fallback 404 — passes through it. It rewrites
+/// only a browser NAVIGATION (`Sec-Fetch-Dest: document|iframe`, or an
+/// `Accept` naming `text/html`) whose body is JSON, plain text or empty:
+/// a `fetch` caller keeps its bytes, the `/api/ws` upgrade
+/// (`Sec-Fetch-Dest: websocket`) is never a navigation, and the OAuth
+/// failures keep their 302 to `/login?oauth_error=…` (3xx is not an error
+/// status). Without a built front end the layer is inert.
 pub fn full_router(surface: crate::transport::RpcSurface) -> Router {
-    router(surface.app.clone()).merge(
-        Router::new()
-            .route("/api/ws", get(crate::transport::ws_handler))
-            .route("/api/mcp", post(crate::transport::mcp_handler))
-            .with_state(surface),
-    )
+    let landing = match crate::webui::index_shell() {
+        Some(shell) => plana_error_landing::ErrorLanding::new(shell),
+        None => plana_error_landing::ErrorLanding::disabled(),
+    };
+    router(surface.app.clone())
+        .merge(
+            Router::new()
+                .route("/api/ws", get(crate::transport::ws_handler))
+                .route("/api/mcp", post(crate::transport::mcp_handler))
+                .with_state(surface),
+        )
+        .layer(landing.layer())
 }
 
 async fn health() -> Json<crate::Health> {

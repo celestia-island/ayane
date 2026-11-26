@@ -5,7 +5,7 @@ import "@celestia-island/hikari/styles/index.scss";
 // The theme engine: emits the --color-* token sheet every hikari component
 // reads. Without initTheme() the tokens are undefined and components fall
 // back to light defaults (the un-themed gray-card / white-band renders).
-import { initTheme, setLocale } from "@celestia-island/hikari";
+import { createErrorReporting, initTheme, setLocale } from "@celestia-island/hikari";
 
 import { locale as appLocale } from "./lib/i18n";
 
@@ -66,4 +66,13 @@ router.beforeEach((to) => {
   }
 });
 
-createApp(App).use(router).mount("#app");
+const app = createApp(App);
+// The family error landing, installed BEFORE mount: on install it reads the
+// `hk-server-error` island the server injects into index.html when the
+// navigation itself failed (the OAuth callback, a revoked link, a gateway
+// 502) and raises the unified card at the real HTTP status; afterwards it
+// catches what crashes the running app. Mounting first would paint the
+// normal shell and bury the server's verdict.
+app.use(createErrorReporting());
+app.use(router);
+app.mount("#app");

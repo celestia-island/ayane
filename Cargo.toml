@@ -75,6 +75,12 @@ url = "^2"
 async-trait = "^0.1"
 anyhow = "^1"
 
+# error landing: the family's server half — turn a failed browser
+# navigation into the service's own SPA document carrying the
+# hk-server-error island, instead of a tab of raw JSON. Not published on
+# crates.io yet, so it rides plana's master branch.
+plana-error-landing = { git = "https://github.com/celestia-island/plana", branch = "master", version = "^0.8" }
+
 # misc
 thiserror = "^2"
 uuid = { version = "^1", features = ["v4", "serde"] }
