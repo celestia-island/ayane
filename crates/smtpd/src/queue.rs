@@ -24,9 +24,13 @@
 //!   `.json` that recovery removes.
 //! * `fsync(dir)` is what makes the two renames durable. Returning 250 before
 //!   it would acknowledge a message a power cut can still erase.
-//! * Every step that can be interrupted is exercised by the `kill -9` tests:
-//!   after the crash the state must be "fully deliverable" or "never
-//!   acknowledged", never "acknowledged but broken".
+//! * Every step that can be interrupted is pinned by recovery tests that put
+//!   the spool into the state that step leaves behind: a truncated message, an
+//!   orphan `.json`, a same-length bit flip, and a leftover in `tmp/`. After
+//!   such a state the outcome must be "fully deliverable" or "never
+//!   acknowledged", never "acknowledged but broken". (This crate does not
+//!   spawn a process and `kill -9` it; the `SyncHook`s exist so a test can
+//!   stop between two fsyncs, not so they can kill themselves.)
 //!
 //! Recovery ([`Spool::recover`]) runs at start-up and is idempotent:
 //! temporary files that are provably abandoned are deleted, `new/` entries are
@@ -165,7 +169,8 @@ pub struct Spool {
 }
 
 /// A hook the durability tests install to stop between two fsync steps, so a
-/// `kill -9` lands exactly on the boundary instead of somewhere random. It
+/// test can inspect the spool exactly on the boundary (a `kill -9` there is
+/// what the boundary protects against; this crate does not spawn one). It
 /// receives the queue id of the message being committed.
 pub type SyncHook = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -188,7 +193,7 @@ pub enum FsyncKind {
 /// Receives every [`FsyncKind`] as the commit path issues it.
 pub type FsyncObserver = Arc<dyn Fn(FsyncKind) + Send + Sync>;
 
-/// Test hooks: a place to stop between two fsync steps, so a `kill -9` lands
+/// Test hooks: a place to stop between two fsync steps, so a test lands
 /// exactly on the durability boundary instead of somewhere random, plus the
 /// record of which fsyncs actually ran.
 ///
@@ -219,7 +224,7 @@ impl Spool {
         Ok(Self {
             root,
             hooks: Arc::new(Hooks::default()),
-            counter: Arc::new(AtomicU64::new(0)),
+            counter: Arc::new(AtomicU64::new(counter_seed())),
         })
     }
 
@@ -291,6 +296,11 @@ impl Spool {
 
     /// `fsync` the directory `dir`, reporting it to the observer.
     ///
+    /// Only the commit path's call is pinned by a test
+    /// (`commit_syncs_the_file_then_the_directory_before_acknowledging`); the
+    /// calls in `remove()` and `claim()` are not observed by any test today,
+    /// so removing those would not turn anything red.
+    ///
     /// The same limit as [`Spool::sync_file`] applies, and it is worth
     /// stating on both: removing the `fsync` *inside* this call is not
     /// observable from a test in this process either. What the tests pin is
@@ -307,9 +317,18 @@ impl Spool {
         result
     }
 
-    /// A fresh queue identifier: timestamp, pid and a per-spool counter. The
-    /// filesystem does not need it to be globally unique (the rename would
-    /// fail), but a human reading `new/` does.
+    /// A fresh queue identifier: microsecond stamp, pid and a counter.
+    ///
+    /// The stamp alone is not enough — two calls in the same microsecond, or
+    /// two spools in one pid (every test opens several), produce the same
+    /// stamp — so the counter is seeded per instance and then advanced
+    /// monotonically.
+    ///
+    /// **The id is still not provably unique**: two instances of one pid can
+    /// land on the same value, and a seeded counter is a probability, not a
+    /// proof. That is why [`Spool::stage`] refuses an id that is already in
+    /// the queue — a collision must surface as a clear error the caller
+    /// handles, never as a retry and never as a silent overwrite.
     #[must_use]
     pub fn next_id(&self) -> String {
         let stamp = std::time::SystemTime::now()
@@ -324,18 +343,46 @@ impl Spool {
     ///
     /// # Errors
     ///
-    /// Returns the I/O error that prevented the temporary file from being
-    /// created.
+    /// `io::ErrorKind::AlreadyExists` when the spool already holds something
+    /// under this id (`new/`, `cur/` or `tmp/`) — a [`Spool::next_id`]
+    /// collision, **not** a transient failure: the caller must report it, not
+    /// retry with the same id. The existing message is left untouched.
+    ///
+    /// Returns the underlying I/O error when the temporary file cannot be
+    /// created for any other reason.
     pub fn stage(&self, id: &str, envelope: Envelope) -> io::Result<StagedMessage> {
         let message_tmp = self.root.join("tmp").join(format!("{id}.eml"));
+        // An id already on the shelf or in delivery is a collision: writing
+        // it would rename over a committed message of the same name and
+        // leave two acknowledged messages where one file is. `create_new`
+        // alone only guards the instant a live handle exists in `tmp/`; once
+        // the first message is renamed into `new/` the name is free again.
+        if let Some(taken) = self.find_taken(id) {
+            tracing::warn!(id, file = %taken.display(), "queue id already in use; refusing to stage");
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("queue id {id} is already held by {}", taken.display()),
+            ));
+        }
         // Read as well as write: the prepend step moves the received octets up
         // inside this same file, so the handle has to be able to read it back.
-        // `create_new` keeps the "this id is fresh" guarantee either way.
-        let file = OpenOptions::new()
+        // `create_new` still closes the window between the check above and
+        // this call for the `tmp/` half.
+        let file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&message_tmp)?;
+            .open(&message_tmp)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("queue id {id} is already held by {}", message_tmp.display()),
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         Ok(StagedMessage {
             spool: self.clone(),
             id: id.to_owned(),
@@ -346,6 +393,20 @@ impl Spool {
             size: 0,
             failed: None,
         })
+    }
+
+    /// The file that already owns `id`, or `None` when the id is free.
+    fn find_taken(&self, id: &str) -> Option<PathBuf> {
+        ["tmp", "new", "cur"]
+            .into_iter()
+            .flat_map(|dir| {
+                let dir = self.root.join(dir);
+                [
+                    dir.join(format!("{id}.eml")),
+                    dir.join(format!("{id}.json")),
+                ]
+            })
+            .find(|path| path.exists())
     }
 
     /// Lists committed messages.
@@ -962,6 +1023,13 @@ fn is_open_somewhere(path: &Path) -> bool {
         return false;
     };
     let Ok(processes) = std::fs::read_dir("/proc") else {
+        // Without `/proc` this check cannot see any descriptor, so it cannot
+        // prove a file is free; say so, because the sweep then has to lean on
+        // the pid and age rules alone (the side that can delete a live file).
+        tracing::warn!(
+            file = %path.display(),
+            "cannot read /proc: the open-handle check is unavailable, the tmp sweep falls back to pid and age"
+        );
         return false;
     };
     processes.filter_map(Result::ok).any(|process| {
@@ -1003,6 +1071,24 @@ fn id_pid(id: &str) -> Option<u32> {
         return None;
     }
     u32::from_str_radix(pid, 16).ok().filter(|pid| *pid != 0)
+}
+
+/// Where each spool instance's counter starts, so two spools opening in the
+/// same pid do not hand out the same ids back to back.
+///
+/// Nanosecond time mixed with the pid, then spread over the counter's field
+/// with a 64-bit finalizer (splitmix64) so neighbouring seeds are not
+/// neighbouring counters. No external dependency, and no `/dev/urandom` read
+/// on a path that runs at start-up.
+fn counter_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    let mixed = nanos ^ (u64::from(std::process::id()) << 32);
+    let mut z = mixed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// Whether `pid` still runs. Only meaningful for writers on this host, which
@@ -1493,6 +1579,65 @@ mod tests {
             "two hours untouched makes it a leftover"
         );
         assert!(!young.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_spools_in_one_process_do_not_hand_out_the_same_id() {
+        // Every test opens several spools in one pid, and so does any process
+        // that opens a second spool. A counter starting at zero in both put
+        // them on the same ids back to back; the seeded counter spreads them.
+        let root = temp_root("id-spread");
+        let first = Spool::open(&root).expect("first spool");
+        let second = Spool::open(&root).expect("second spool");
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..256 {
+            for id in [first.next_id(), second.next_id()] {
+                assert!(seen.insert(id.clone()), "{id} handed out twice");
+            }
+        }
+        assert_eq!(seen.len(), 512);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staging_an_id_that_is_already_committed_is_a_clear_error() {
+        // R5: the id is taken again after the first message was renamed into
+        // `new/`, where `create_new` no longer protects the name. Staging
+        // must fail loudly — a second 250 for a message that overwrote the
+        // first is a lost mail that recovery cannot detect (`intact=1
+        // corrupt=0`).
+        let root = temp_root("id-collision");
+        let spool = Spool::open(&root).expect("spool");
+        let id = spool.next_id();
+        let first = b"Subject: first\r\n\r\nthe message that must survive\r\n";
+        let mut staged = spool.stage(&id, envelope(&id)).expect("stage");
+        staged.write(first).expect("write");
+        staged.commit().expect("commit");
+
+        let other = Spool::open(&root).expect("second spool");
+        let err = other
+            .stage(&id, envelope(&id))
+            .err()
+            .expect("staging a taken id must fail");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(
+            err.to_string().contains(&id),
+            "the error names the id: {err}"
+        );
+        assert!(
+            err.to_string().contains("new"),
+            "the error names the file that holds it: {err}"
+        );
+
+        assert_eq!(
+            spool.read_message(QueueState::New, &id).expect("read"),
+            first,
+            "the committed message must be byte-for-byte untouched"
+        );
+        let report = spool.recover().expect("recover");
+        assert_eq!((report.intact, report.corrupt), (1, 0));
+        assert!(report.failed.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
