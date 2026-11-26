@@ -29,20 +29,42 @@
 //!   acknowledged", never "acknowledged but broken".
 //!
 //! Recovery ([`Spool::recover`]) runs at start-up and is idempotent:
-//! leftovers in `tmp/` are deleted, `new/` entries are checked against the
-//! length and SHA-256 recorded in their metadata, and anything that does not
-//! match is moved out of the delivery path into `corrupt/`.
+//! temporary files that are provably abandoned are deleted, `new/` entries are
+//! checked against the length and SHA-256 recorded in their metadata, and
+//! anything that does not match is moved out of the delivery path into
+//! `corrupt/`. Every removal or move it could not carry out is recorded in
+//! [`RecoveryReport::failed`], so a full disk cannot make a run look clean.
+//!
+//! **Recovery does not delete a live writer's file.** A temporary file that a
+//! process still holds open, or whose id names a running process, stays where
+//! it is: that writer will commit it (or [`StagedMessage::abandon`] it).
+//!
+//! For that to work with more than one process, the writer must ask the spool
+//! for its ids: [`Spool::open`] → [`Spool::recover`] →
+//! [`Spool::next_id`] → [`Spool::stage`]. An id minted *before* recovery's
+//! sweep can be mistaken for a crash leftover and is discarded.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// Temporary files whose writer cannot be identified (`<id>.json`, or a name
+/// that is not a spool id at all) are deleted once they are this old: the
+/// commit path only ever leaves such a file behind for the duration of one
+/// commit, and a process elsewhere may have a different idea of "now".
+pub const TMP_RESIDUE_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// The octets a streaming hash reads per call. Kept small and constant so the
+/// peak memory of [`Spool::recover`] does not grow with the message size.
+const HASH_CHUNK: usize = 64 * 1024;
 
 /// Where a message sits in the spool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,7 +290,11 @@ impl Spool {
     /// created.
     pub fn stage(&self, id: &str, envelope: Envelope) -> io::Result<StagedMessage> {
         let message_tmp = self.root.join("tmp").join(format!("{id}.eml"));
+        // Read as well as write: the prepend step moves the received octets up
+        // inside this same file, so the handle has to be able to read it back.
+        // `create_new` keeps the "this id is fresh" guarantee either way.
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&message_tmp)?;
@@ -361,9 +387,20 @@ impl Spool {
 
     /// Cleans up after a crash and reports what was found.
     ///
-    /// Idempotent and safe to run while another process is writing: it only
-    /// touches its own `tmp/` leftovers, orphan metadata and entries that fail
-    /// their integrity check.
+    /// Idempotent and safe to run while another process is writing: a
+    /// `tmp/` file is only deleted once it is *provably* abandoned — no
+    /// process holds it open, and its id names either this process or a
+    /// process that no longer exists; a file without a usable id must be
+    /// older than [`TMP_RESIDUE_AGE`].
+    ///
+    /// A file a live writer still holds is left where it is: that writer
+    /// commits it (or [`StagedMessage::abandon`]s it). Writers must therefore
+    /// take their ids from [`Spool::next_id`] *after* calling `recover` (see
+    /// the module docs).
+    ///
+    /// Failures to remove or move something are not swallowed: they are
+    /// logged and returned in [`RecoveryReport::failed`], so a full disk
+    /// cannot make a run look clean.
     ///
     /// # Errors
     ///
@@ -373,10 +410,24 @@ impl Spool {
         let tmp = self.root.join("tmp");
         for entry in std::fs::read_dir(&tmp)? {
             let path = entry?.path();
-            let _ = std::fs::remove_file(&path);
-            report.tmp_removed += 1;
+            match tmp_leftover(&path) {
+                Some(reason) => {
+                    if let Err(err) = std::fs::remove_file(&path) {
+                        tracing::warn!(file = %path.display(), %err, "recovery could not remove a temporary file");
+                        report.record_failure(&path, "remove", &err);
+                    } else {
+                        tracing::debug!(file = %path.display(), reason, "recovery removed a temporary leftover");
+                        report.tmp_removed += 1;
+                    }
+                }
+                None => {
+                    tracing::debug!(file = %path.display(), "recovery left a live writer's file alone")
+                }
+            }
         }
-        fsync_dir(&tmp)?;
+        if let Err(err) = fsync_dir(&tmp) {
+            report.record_failure(&tmp, "fsync", &err);
+        }
 
         for state in [QueueState::New, QueueState::Cur] {
             let dir = self.root.join(state.dir());
@@ -401,14 +452,21 @@ impl Spool {
                 if !messages.contains_key(id) {
                     // The envelope without a message: the rename order makes
                     // this the only reachable orphan.
-                    let _ = std::fs::remove_file(json);
-                    report.orphan_metadata += 1;
+                    if let Err(err) = std::fs::remove_file(json) {
+                        tracing::warn!(file = %json.display(), %err, "recovery could not remove orphan metadata");
+                        report.record_failure(json, "remove", &err);
+                    } else {
+                        report.orphan_metadata += 1;
+                    }
                 }
             }
             for (id, eml) in &messages {
                 let Some(json) = metadata.get(id) else {
-                    quarantine(&self.root, eml, id);
-                    report.corrupt += 1;
+                    if quarantine(&self.root, eml, id) {
+                        report.corrupt += 1;
+                    } else {
+                        report.record_failure(eml, "quarantine", &"rename into corrupt/ failed");
+                    }
                     continue;
                 };
                 let check = match read_envelope(&dir, id) {
@@ -417,21 +475,40 @@ impl Spool {
                 };
                 match check {
                     Ok(()) => report.intact += 1,
-                    Err(_) => {
-                        quarantine(&self.root, eml, id);
-                        let _ = std::fs::remove_file(json);
-                        report.corrupt += 1;
+                    Err(reason) => {
+                        tracing::warn!(id, %reason, "recovery moved an entry that failed its integrity check to corrupt/");
+                        if quarantine(&self.root, eml, id) {
+                            report.corrupt += 1;
+                        } else {
+                            report.record_failure(
+                                eml,
+                                "quarantine",
+                                &"rename into corrupt/ failed",
+                            );
+                        }
+                        if let Err(err) = std::fs::remove_file(json) {
+                            tracing::warn!(file = %json.display(), %err, "recovery could not remove the envelope of a quarantined entry");
+                            report.record_failure(json, "remove", &err);
+                        }
                     }
                 }
             }
-            fsync_dir(&dir)?;
+            if let Err(err) = fsync_dir(&dir) {
+                report.record_failure(&dir, "fsync", &err);
+            }
+        }
+        if !report.failed.is_empty() {
+            tracing::warn!(
+                failed = report.failed.len(),
+                "recovery finished with unhandled errors"
+            );
         }
         Ok(report)
     }
 }
 
 /// What [`Spool::recover`] found and did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     /// Temporary files discarded.
     pub tmp_removed: usize,
@@ -441,6 +518,17 @@ pub struct RecoveryReport {
     pub intact: usize,
     /// Entries moved to `corrupt/` because they failed it.
     pub corrupt: usize,
+    /// One `<operation>: <path>: <error>` line per step recovery could not
+    /// carry out. Empty means the run left nothing behind.
+    pub failed: Vec<String>,
+}
+
+impl RecoveryReport {
+    /// Records a failed step, in the shape [`RecoveryReport::failed`] documents.
+    fn record_failure(&mut self, path: &Path, operation: &str, error: &dyn fmt::Display) {
+        self.failed
+            .push(format!("{operation}: {}: {error}", path.display()));
+    }
 }
 
 /// A message being written into `tmp/`.
@@ -540,6 +628,7 @@ impl StagedMessage {
         //    received octets, in place: the message was written to the file
         //    while it arrived, so it is moved up by one block. The block is a
         //    few hundred octets and the body never passes through memory.
+        //
         if !prepend.is_empty() {
             let length = self.size;
             let moved = match move_in_file(&file, length, prepend.len() as u64) {
@@ -550,38 +639,42 @@ impl StagedMessage {
                     return Err(err);
                 }
             };
-            let mut file = match OpenOptions::new().write(true).open(&self.message_tmp) {
-                Ok(file) => file,
+            if let Err(err) = write_at_start(&file, prepend) {
+                drop(file);
+                self.discard();
+                return Err(err);
+            }
+            // A SHA-256 state cannot be prepended to, and the digest of the
+            // received octets is not enough: the record must cover the file
+            // as stored. Hash the stored file again in [`HASH_CHUNK`] steps —
+            // one streaming pass over tmp, and peak memory stays one buffer
+            // however large the message is.
+            let mut handle = &file;
+            match hash_file(&mut handle, Some(moved)) {
+                Ok(hasher) => self.hasher = hasher,
                 Err(err) => {
+                    drop(file);
                     self.discard();
                     return Err(err);
                 }
-            };
-            if let Err(err) = file.write_all(prepend) {
-                self.discard();
-                return Err(err);
             }
-            self.hasher.update(prepend);
             self.size = moved;
         }
-        // 2. The message survives a power cut: fsync the file itself.
-        let file = match OpenOptions::new().write(true).open(&self.message_tmp) {
-            Ok(file) => file,
-            Err(err) => {
-                self.discard();
-                return Err(err);
-            }
-        };
-        // The contract's first half: the octets are on the medium before any
-        // name points at them. The call is reported to the observer *only when
-        // it succeeded*, so a test asserting the order is also asserting that
-        // a returned `Ok` means the sync happened.
+        // 2. The message survives a power cut: fsync the file itself. One
+        //    handle covers the moved body and the prepended block alike: the
+        //    write head never leaves the end of the message (a second
+        //    descriptor would have its own head at 0 and write `prepend` over
+        //    the start instead of in front of the message).
         if let Err(err) = file.sync_all() {
             drop(file);
             self.discard();
             return Err(err);
         }
         drop(file);
+        // The contract's first half: the octets are on the medium before any
+        // name points at them. The call is reported to the observer *only when
+        // it succeeded*, so a test asserting the order is also asserting that
+        // a returned `Ok` means the sync happened.
         self.spool.note_fsync(FsyncKind::File);
         if let Some(hook) = self.spool.hooks.after_file_sync() {
             hook(&self.id);
@@ -703,8 +796,11 @@ impl Hooks {
 /// Shifts the first `length` octets of `file` up by `offset`, leaving the
 /// first `offset` octets free, without reading the body into memory. Returns
 /// the new length.
+///
+/// The handle must be opened read+write ([`Spool::stage`] does): the octets
+/// are read back out of the file they were written to.
 fn move_in_file(file: &File, length: u64, offset: u64) -> io::Result<u64> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::io::{Seek as _, SeekFrom};
     let mut file = file;
     let mut buffer = vec![0u8; 64 * 1024];
     let mut remaining = length;
@@ -720,11 +816,154 @@ fn move_in_file(file: &File, length: u64, offset: u64) -> io::Result<u64> {
     Ok(length + offset)
 }
 
+/// The SHA-256 of the first `length` octets of `file` (`None`: to the end),
+/// read in [`HASH_CHUNK`] steps — the one place a message is hashed, both when
+/// a prepended block joins the running digest and when recovery verifies a
+/// committed file. Peak memory is one buffer, whatever the message size.
+fn hash_file(file: &mut &File, length: Option<u64>) -> io::Result<Sha256> {
+    let mut hasher = Sha256::new();
+    hash_until(file, length, &mut hasher)?;
+    Ok(hasher)
+}
+
+/// Feeds the first `length` octets of `file` (`None`: to the end) to `hasher`,
+/// reading from the start in [`HASH_CHUNK`] steps.
+fn hash_until(file: &mut &File, length: Option<u64>, hasher: &mut Sha256) -> io::Result<()> {
+    use std::io::{Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    let mut buffer = vec![0u8; HASH_CHUNK];
+    let mut remaining = length;
+    loop {
+        let chunk = remaining.map_or(buffer.len(), |left| (left as usize).min(buffer.len()));
+        if chunk == 0 {
+            break;
+        }
+        let read = file.read(&mut buffer[..chunk])?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        if let Some(left) = remaining.as_mut() {
+            *left -= read as u64;
+        }
+    }
+    Ok(())
+}
+
+/// Writes `block` over the first octets the move left free. Neither `seek` nor
+/// `write_all` on a `File` touches the offset (the `io::Seek` impl
+/// `*&File` -> `&mut File` would), so the single write head stays past the end
+/// of the message, exactly where [`StagedMessage::write`] left it.
+fn write_at_start(file: &File, block: &[u8]) -> io::Result<()> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut handle = file;
+    handle.seek(SeekFrom::Start(0))?;
+    handle.write_all(block)
+}
+
 fn read_envelope(dir: &Path, id: &str) -> io::Result<Envelope> {
     let bytes = std::fs::read(dir.join(format!("{id}.json")))?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
+/// Why a `tmp/` entry is a crash leftover, or `None` when a live writer may
+/// still own it. The decision, in order:
+///
+/// 1. **Held open** by any process (`/proc/<pid>/fd` points at it): a writer is
+///    in the middle of staging it. This is the only signal that survives the
+///    pid checks below being wrong (a crashed process whose pid got reused, a
+///    file from another host), so it comes first and wins.
+/// 2. Carrying **this process's** pid: nothing of ours outlives a restart, so
+///    a fresh spool owns it.
+/// 3. Carrying the pid of a process that is **gone**: the writer died.
+/// 4. Carrying a still-running pid, or no id at all: only the residue-age
+///    threshold (on the `.eml` of the same id) can decide, because only the
+///    writer's absence over a whole window proves abandonment, and only the
+///    `.eml` is kept up to date while a message is being received.
+fn tmp_leftover(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_string_lossy();
+    let id = if let Some(stem) = name.strip_suffix(".eml") {
+        stem
+    } else {
+        name.strip_suffix(".json").unwrap_or(&name)
+    };
+    if is_open_somewhere(path) {
+        return None;
+    }
+    let Some(pid) = id_pid(id) else {
+        return residue_expired(path).then_some("no queue id and older than the residue threshold");
+    };
+    if pid == std::process::id() {
+        return Some("this process's own id");
+    }
+    if !process_alive(pid) {
+        return Some("the process that staged it is gone");
+    }
+    residue_expired(path).then_some("older than the residue threshold despite a live pid")
+}
+
+/// Whether some process currently holds `path` open. Costs one `readdir` over
+/// `/proc/<pid>/fd` per spool file at start-up and nothing afterwards.
+fn is_open_somewhere(path: &Path) -> bool {
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    processes.filter_map(Result::ok).any(|process| {
+        let Ok(handles) = std::fs::read_dir(process.path().join("fd")) else {
+            return false;
+        };
+        handles
+            .filter_map(Result::ok)
+            .any(|handle| std::fs::read_link(handle.path()).is_ok_and(|link| link == target))
+    })
+}
+
+/// Whether the `.eml` of the same id was last written more than
+/// [`TMP_RESIDUE_AGE`] ago — for a `.eml` itself, that is its own stamp. A
+/// stamp we cannot read (or one in the future) is never "old". The `.json`
+/// only appears for the duration of one commit, so it asks its `.eml`.
+fn residue_expired(path: &Path) -> bool {
+    let watched = if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+        path.with_extension("eml")
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::metadata(&watched)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age > TMP_RESIDUE_AGE)
+}
+
+/// The pid encoded in a queue id (`<micros:016x>-<pid:08x>-<counter:06>`).
+fn id_pid(id: &str) -> Option<u32> {
+    let mut parts = id.split('-');
+    let (Some(_stamp), Some(pid), Some(counter), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if counter.len() != 6 {
+        return None;
+    }
+    u32::from_str_radix(pid, 16).ok().filter(|pid| *pid != 0)
+}
+
+/// Whether `pid` still runs. Only meaningful for writers on this host, which
+/// is where the spool lives.
+fn process_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Hashes the message and compares it with the length and digest its envelope
+/// recorded. Reads in [`HASH_CHUNK`] steps so a 25 MiB message costs 64 KiB of
+/// buffer, not 25 MiB.
 fn verify_integrity(message: &Path, envelope: &Envelope) -> Result<(), String> {
     let metadata = std::fs::metadata(message).map_err(|err| err.to_string())?;
     if metadata.len() != envelope.size {
@@ -734,17 +973,27 @@ fn verify_integrity(message: &Path, envelope: &Envelope) -> Result<(), String> {
             envelope.size
         ));
     }
-    let bytes = std::fs::read(message).map_err(|err| err.to_string())?;
-    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let file = File::open(message).map_err(|err| err.to_string())?;
+    let mut file = &file;
+    let hasher = hash_file(&mut file, None).map_err(|err| err.to_string())?;
+    let hash = format!("{:x}", hasher.finalize());
     if hash != envelope.sha256 {
         return Err("checksum mismatch".to_owned());
     }
     Ok(())
 }
 
-fn quarantine(root: &Path, message: &Path, id: &str) {
+/// Moves a message out of the delivery path. Returns whether it landed: a
+/// rename that failed (a full disk, `corrupt/` gone) must not look clean.
+fn quarantine(root: &Path, message: &Path, id: &str) -> bool {
     let target = root.join("corrupt").join(format!("{id}.eml"));
-    let _ = std::fs::rename(message, target);
+    match std::fs::rename(message, &target) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(%id, target = %target.display(), %err, "could not quarantine a message");
+            false
+        }
+    }
 }
 
 /// `fsync` a directory: the only way to make a rename inside it durable.
@@ -918,6 +1167,271 @@ mod tests {
         spool.claim(&id).expect("claim");
         assert!(spool.list(QueueState::New).expect("list").is_empty());
         assert_eq!(spool.list(QueueState::Cur).expect("list").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A spool id for a process that cannot exist: pids are `i32`, so
+    /// `u32::MAX` can never name a live writer.
+    fn dead_id() -> String {
+        "0000000000000001-ffffffff-000000".to_owned()
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn write_residue(path: &Path) {
+        std::fs::write(path, b"left by a writer that is gone").expect("residue");
+    }
+
+    /// Commits `original` behind `prepend` and returns the spool with both
+    /// the stored bytes and the queue's own record of the file.
+    fn staged_with_prepend(
+        name: &str,
+        prepend: &str,
+        original: &[u8],
+    ) -> (PathBuf, Vec<u8>, Envelope) {
+        let root = temp_root(name);
+        let spool = Spool::open(&root).expect("spool");
+        let id = spool.next_id();
+        let mut staged = spool.stage(&id, envelope(&id)).expect("stage");
+        staged.write(original).expect("write");
+        let queued = staged
+            .commit_with_prepend(prepend.as_bytes())
+            .expect("a prepend commit must not fail");
+        let stored = spool.read_message(QueueState::New, &id).expect("read");
+        assert!(
+            std::fs::read_dir(root.join("tmp"))
+                .expect("tmp")
+                .next()
+                .is_none(),
+            "a committed message leaves nothing in tmp/"
+        );
+        let report = spool.recover().expect("recover");
+        assert_eq!(
+            report.intact, 1,
+            "the committed entry must survive recovery"
+        );
+        assert!(report.failed.is_empty());
+        (root, stored, queued.envelope)
+    }
+
+    #[test]
+    fn commit_with_prepend_puts_the_block_in_front_of_the_message() {
+        // The inbound path always prepends `Received:` /
+        // `Authentication-Results:`, and the file has to end up as
+        // `block || received`, in that order: a block that lands on top of the
+        // message (or behind it) is a message the receiver never sent.
+        //
+        // The block is longer than `HASH_CHUNK`, so the move inside the file
+        // takes several steps and a multi-buffer block cannot hide behind one
+        // buffer-sized write.
+        let original = b"Subject: hi\r\n\r\nbody\r\n";
+        let prepend = format!(
+            "Received: from client.test by mx.example\r\nAuthentication-Results: spf=none\r\n{}",
+            format_args!("X-Trace: {}\r\n", "a".repeat(HASH_CHUNK))
+        );
+        let (root, stored, queued) = staged_with_prepend("prepend", &prepend, original);
+        let mut expected = prepend.as_bytes().to_vec();
+        expected.extend_from_slice(original);
+        assert_eq!(
+            stored, expected,
+            "the stored file is the block, then the message"
+        );
+        assert_eq!(queued.size, expected.len() as u64);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn commit_with_prepend_records_the_digest_of_the_whole_file() {
+        // The size and SHA-256 in the envelope describe the file as stored —
+        // block included — which is what recovery re-checks. A digest of the
+        // received octets alone would quarantine every prepended message on
+        // the first recovery.
+        let (root, stored, queued) = staged_with_prepend(
+            "prepend-digest",
+            "Received: from client.test by mx.example\r\nAuthentication-Results: spf=none\r\n",
+            b"Subject: hi\r\n\r\nbody\r\n",
+        );
+        assert_eq!(queued.size, stored.len() as u64);
+        assert_eq!(queued.sha256, sha256_of(&stored));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_leaves_a_live_writers_file_alone() {
+        // The probe: a writer holds `tmp/<id>.eml` open, a second process runs
+        // recovery. Deleting the file would make the writer's commit fail with
+        // ENOENT after it had already proved it could write.
+        let root = temp_root("live-writer");
+        let writer = Spool::open(&root).expect("writer spool");
+        let id = writer.next_id();
+        let mut staged = writer.stage(&id, envelope(&id)).expect("stage");
+        staged
+            .write(b"Subject: hi\r\n\r\nhalf the body\r\n")
+            .expect("write");
+
+        let other = Spool::open(&root).expect("second spool");
+        let report = other.recover().expect("recover");
+        assert_eq!(
+            report.tmp_removed, 0,
+            "a live writer's file is not a leftover"
+        );
+        assert!(report.failed.is_empty());
+        assert!(report.intact == 0);
+        assert!(root.join("tmp").join(format!("{id}.eml")).exists());
+
+        staged.write(b"the rest of the body\r\n").expect("write");
+        let queued = staged.commit().expect("the writer still commits");
+        assert_eq!(queued.envelope.size, 52);
+        assert_eq!(other.list(QueueState::New).expect("list").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_removes_temporary_leftovers_and_reports_them() {
+        // Three leftovers and one live writer: the dead pid proves itself, the
+        // `.json` and the foreign name can only be judged by age, and the live
+        // file must survive all three.
+        let root = temp_root("tmp-sweep");
+        let spool = Spool::open(&root).expect("spool");
+        let tmp = root.join("tmp");
+        let dead = dead_id();
+        write_residue(&tmp.join(format!("{dead}.eml")));
+        let stale_json = tmp.join(format!("{dead}.json"));
+        write_residue(&stale_json);
+        let foreign = tmp.join("not-a-spool-id");
+        write_residue(&foreign);
+        let old = SystemTime::now() - TMP_RESIDUE_AGE - Duration::from_secs(60);
+        for path in [&stale_json, &foreign] {
+            File::options()
+                .write(true)
+                .open(path)
+                .expect("open")
+                .set_modified(old)
+                .expect("age it");
+        }
+        let live_id = spool.next_id();
+        let mut live = spool.stage(&live_id, envelope(&live_id)).expect("stage");
+        live.write(b"Subject: hi\r\n\r\n").expect("write");
+
+        let report = spool.recover().expect("recover");
+        assert_eq!(
+            report.tmp_removed, 3,
+            "dead pid, stale json, stale foreign name"
+        );
+        assert!(report.failed.is_empty());
+        assert!(!tmp.join(format!("{dead}.eml")).exists());
+        assert!(!stale_json.exists());
+        assert!(!foreign.exists());
+        assert!(
+            tmp.join(format!("{live_id}.eml")).exists(),
+            "the live writer's file stays"
+        );
+        live.abandon();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_same_length_bit_flip_is_quarantined_on_recovery() {
+        // Length alone cannot catch this: one octet changes, the size still
+        // matches, and only the recorded SHA-256 separates it from a message
+        // that may be delivered.
+        let root = temp_root("bit-flip");
+        let spool = Spool::open(&root).expect("spool");
+        let id = spool.next_id();
+        let mut staged = spool.stage(&id, envelope(&id)).expect("stage");
+        staged
+            .write(b"Subject: hi\r\n\r\nthe body says hello\r\n")
+            .expect("write");
+        staged.commit().expect("commit");
+        let path = root.join("new").join(format!("{id}.eml"));
+        let mut bytes = std::fs::read(&path).expect("read");
+        let last = bytes.len() - 3;
+        bytes[last] ^= 0x01;
+        std::fs::write(&path, &bytes).expect("flip");
+
+        let report = spool.recover().expect("recover");
+        assert_eq!(
+            report.corrupt, 1,
+            "a same-length change must fail the digest check"
+        );
+        assert_eq!(report.intact, 0);
+        assert!(report.failed.is_empty());
+        assert!(spool.list(QueueState::New).expect("list").is_empty());
+        assert!(root.join("corrupt").join(format!("{id}.eml")).exists());
+        assert!(!root.join("new").join(format!("{id}.json")).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_reports_a_cleanup_it_could_not_carry_out() {
+        // A dead-pid leftover inside a read-only `tmp/`: the removal cannot
+        // succeed (as on a full or read-only medium), so the run must not
+        // report it as removed — the operator needs the difference between
+        // "swept" and "still there".
+        let root = temp_root("tmp-failure");
+        let spool = Spool::open(&root).expect("spool");
+        let tmp = root.join("tmp");
+        let dead = dead_id();
+        write_residue(&tmp.join(format!("{dead}.eml")));
+        let handle = File::open(&tmp).expect("tmp");
+        let mut permissions = handle.metadata().expect("meta").permissions();
+        let writable = permissions.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o500);
+        std::fs::set_permissions(&tmp, permissions).expect("make tmp read-only");
+
+        let report = spool.recover().expect("recover");
+        std::fs::set_permissions(&tmp, writable).expect("restore tmp");
+
+        assert_eq!(report.tmp_removed, 0, "nothing was removed");
+        assert!(!report.failed.is_empty(), "the failure must be reported");
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|line| line.contains(&dead) && line.contains("remove")),
+            "the report names the file and the step: {:?}",
+            report.failed
+        );
+        assert!(tmp.join(format!("{dead}.eml")).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_hashes_a_large_message_in_bounded_steps() {
+        // `verify_integrity` reads in fixed `HASH_CHUNK` steps, so a 25 MiB
+        // message costs one buffer of this size no matter how large it is.
+        // The test asserts the step count directly; the peak itself is not
+        // measurable in-process without an allocator hook.
+        let root = temp_root("large");
+        let spool = Spool::open(&root).expect("spool");
+        let id = spool.next_id();
+        let body = vec![b'x'; 25 * 1024 * 1024];
+        let mut staged = spool.stage(&id, envelope(&id)).expect("stage");
+        staged.write(&body).expect("write");
+        staged.commit().expect("commit");
+        drop(body);
+        let path = root.join("new").join(format!("{id}.eml"));
+
+        let mut file = File::open(&path).expect("open");
+        let mut buffer = vec![0u8; HASH_CHUNK];
+        let mut steps = 0;
+        loop {
+            let read = file.read(&mut buffer).expect("read");
+            if read == 0 {
+                break;
+            }
+            steps += 1;
+        }
+        assert_eq!(steps, 25 * 1024 * 1024 / HASH_CHUNK);
+        assert!(
+            steps > 1,
+            "the hash must stream, not read the message in one call"
+        );
+
+        let report = spool.recover().expect("recover");
+        assert_eq!(report.intact, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
