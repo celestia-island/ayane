@@ -174,7 +174,7 @@ pub struct Spool {
 /// receives the queue id of the message being committed.
 pub type SyncHook = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// One `fsync` the spool performed, in the order it performed them.
+/// One `fsync` the spool performed, and which operation issued it.
 ///
 /// The durability contract is an *order* — `fsync(file)` before the renames,
 /// `fsync(dir)` after them — so a test that only looks at the spool after a
@@ -184,14 +184,46 @@ pub type SyncHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncKind {
-    /// `fsync` of the message file, before the renames.
+    /// `fsync` of the message file.
     File,
-    /// `fsync` of the directory a rename landed in, after the rename.
+    /// `fsync` of a directory.
     Dir,
 }
 
-/// Receives every [`FsyncKind`] as the commit path issues it.
-pub type FsyncObserver = Arc<dyn Fn(FsyncKind) + Send + Sync>;
+/// The operation whose `fsync` was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsyncOp {
+    /// [`StagedMessage::commit`] / [`StagedMessage::commit_with_prepend`]:
+    /// one file sync, then one directory sync.
+    Commit,
+    /// [`Spool::claim`]: the renames out of `new/` and into `cur/`.
+    Claim,
+    /// [`Spool::remove`]: the deletions inside the message's directory.
+    Remove,
+}
+
+/// The operation, the [`FsyncKind`] and — for a directory sync — which
+/// directory was synced (its name under the spool root; `None` for a file
+/// sync). Owned, because the record outlives the call that borrowed the
+/// path.
+///
+/// The kind used to be a bare enum, so a directory sync in `claim`/`remove`
+/// looked exactly like the commit-path one even though its meaning (a rename
+/// landed in that directory) only applies to the commit path. Callers filter
+/// on [`FsyncEvent::op`]; the [`FsyncKind`] alone is not enough to tell them
+/// apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsyncEvent {
+    /// Which spool operation issued the sync.
+    pub op: FsyncOp,
+    /// What was synced.
+    pub kind: FsyncKind,
+    /// The directory synced (`fsync_dir` only), as its name under the root.
+    pub dir: Option<String>,
+}
+
+/// Receives every [`FsyncEvent`] the spool issues, in order.
+pub type FsyncObserver = Arc<dyn Fn(FsyncEvent) + Send + Sync>;
 
 /// Test hooks: a place to stop between two fsync steps, so a test lands
 /// exactly on the durability boundary instead of somewhere random, plus the
@@ -209,6 +241,13 @@ struct Hooks {
     /// Every fsync the commit path issues, in order.
     fsync_observer: Mutex<Option<FsyncObserver>>,
 }
+
+/// Characters in each field of a queue id, in order: microsecond stamp,
+/// provider pid, counter. [`Spool::next_id`] renders exactly this and
+/// [`parse_id`] is the only code that reads it back, so the two cannot drift
+/// apart again (a former `{counter:06}` minimum width rendered a seeded 63-bit
+/// counter as 19–20 digits and silently made every pid lookup fail).
+const ID_FIELDS: [usize; 3] = [16, 8, 16];
 
 impl Spool {
     /// Opens (and creates) a spool root.
@@ -257,7 +296,7 @@ impl Spool {
     }
 
     /// Records one `fsync` as it is issued.
-    fn note_fsync(&self, kind: FsyncKind) {
+    fn note_fsync(&self, event: FsyncEvent) {
         let observer = self
             .hooks
             .fsync_observer
@@ -265,7 +304,7 @@ impl Spool {
             .ok()
             .and_then(|slot| slot.clone());
         if let Some(observer) = observer {
-            observer(kind);
+            observer(event);
         }
     }
 
@@ -290,7 +329,11 @@ impl Spool {
     fn sync_file(&self, file: File) -> io::Result<()> {
         file.sync_all()?;
         drop(file);
-        self.note_fsync(FsyncKind::File);
+        self.note_fsync(FsyncEvent {
+            op: FsyncOp::Commit,
+            kind: FsyncKind::File,
+            dir: None,
+        });
         Ok(())
     }
 
@@ -309,10 +352,16 @@ impl Spool {
     /// one of them is deleted. Verified out of process once with an
     /// `LD_PRELOAD` shim on `fsync(2)`: the commit path issues
     /// `FILE <id>.eml` → `FILE <id>.json` → `DIR new`, in that order.
-    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+    fn sync_dir(&self, op: FsyncOp, dir: &Path) -> io::Result<()> {
         let result = fsync_dir(dir);
         if result.is_ok() {
-            self.note_fsync(FsyncKind::Dir);
+            self.note_fsync(FsyncEvent {
+                op,
+                kind: FsyncKind::Dir,
+                dir: dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            });
         }
         result
     }
@@ -335,7 +384,14 @@ impl Spool {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_micros());
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("{stamp:016x}-{:08x}-{counter:06}", std::process::id())
+        // Fixed widths from [`ID_FIELDS`], in hex: a *minimum* width would let
+        // a large counter overflow its field and the id would no longer match
+        // what `parse_id` expects.
+        let [stamp_width, pid_width, counter_width] = ID_FIELDS;
+        format!(
+            "{stamp:0stamp_width$x}-{:0pid_width$x}-{counter:0counter_width$x}",
+            std::process::id()
+        )
     }
 
     /// Begins writing a message: creates `tmp/<id>.eml`, hashes as it writes,
@@ -462,7 +518,7 @@ impl Spool {
         let dir = self.root.join(state.dir());
         let _ = std::fs::remove_file(dir.join(format!("{id}.eml")));
         let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
-        self.sync_dir(&dir)?;
+        self.sync_dir(FsyncOp::Remove, &dir)?;
         Ok(())
     }
 
@@ -479,8 +535,8 @@ impl Spool {
             cur.join(format!("{id}.json")),
         )?;
         std::fs::rename(new.join(format!("{id}.eml")), cur.join(format!("{id}.eml")))?;
-        self.sync_dir(&new)?;
-        self.sync_dir(&cur)?;
+        self.sync_dir(FsyncOp::Claim, &new)?;
+        self.sync_dir(FsyncOp::Claim, &cur)?;
         Ok(())
     }
 
@@ -734,6 +790,11 @@ impl StagedMessage {
             let moved = match move_in_file(&file, length, prepend.len() as u64) {
                 Ok(moved) => moved,
                 Err(err) => {
+                    // The handle is already out of `self.file`, so `discard`
+                    // cannot close it: release it here, before the unlink.
+                    // NTFS refuses to unlink a file with an open handle, so
+                    // without this line the failure path would leak the tmp
+                    // file on Windows (unix unlinks it either way).
                     drop(file);
                     self.discard();
                     return Err(err);
@@ -839,7 +900,7 @@ impl StagedMessage {
         //    the message is acknowledged while the directory entry that names
         //    it can still be lost: the exact "acknowledged but broken" state
         //    the recovery tests exist to forbid.
-        self.spool.sync_dir(&new_dir)?;
+        self.spool.sync_dir(FsyncOp::Commit, &new_dir)?;
         Ok(QueuedMessage {
             id: self.id.clone(),
             state: QueueState::New,
@@ -1020,7 +1081,14 @@ fn tmp_leftover(path: &Path) -> Option<&'static str> {
 /// `/proc/<pid>/fd` per spool file at start-up and nothing afterwards.
 fn is_open_somewhere(path: &Path) -> bool {
     let Ok(target) = std::fs::canonicalize(path) else {
-        return false;
+        // No resolvable path means no comparison target, so this check cannot
+        // prove the file free either. `true` keeps the sweep's hands off it:
+        // an unknown answer must fall on the "keep" side, never on "delete".
+        tracing::warn!(
+            file = %path.display(),
+            "cannot canonicalize a spool file: the open-handle check is inconclusive, treating it as held"
+        );
+        return true;
     };
     let Ok(processes) = std::fs::read_dir("/proc") else {
         // Without `/proc` this check cannot see any descriptor, so it cannot
@@ -1059,18 +1127,43 @@ fn residue_expired(path: &Path) -> bool {
         .is_some_and(|age| age > TMP_RESIDUE_AGE)
 }
 
-/// The pid encoded in a queue id (`<micros:016x>-<pid:08x>-<counter:06>`).
-fn id_pid(id: &str) -> Option<u32> {
+/// The three fields of a queue id, as [`Spool::next_id`] renders them.
+type IdFields = (u64, u32, u64);
+
+/// Splits a queue id into its fields, or `None` when it is not one.
+///
+/// The shape lives in [`ID_FIELDS`] and is checked field by field, so an id
+/// is only accepted when [`Spool::next_id`] could have produced it. Everything
+/// that reads an id goes through here: the sweep's pid rule must see the ids
+/// the spool actually writes, not a lenient approximation of them.
+fn parse_id(id: &str) -> Option<IdFields> {
     let mut parts = id.split('-');
-    let (Some(_stamp), Some(pid), Some(counter), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    if counter.len() != 6 {
+    let stamp = parts.next()?;
+    let pid = parts.next()?;
+    let counter = parts.next()?;
+    if parts.next().is_some() {
         return None;
     }
-    u32::from_str_radix(pid, 16).ok().filter(|pid| *pid != 0)
+    let [stamp_width, pid_width, counter_width] = ID_FIELDS;
+    for (field, width) in [
+        (stamp, stamp_width),
+        (pid, pid_width),
+        (counter, counter_width),
+    ] {
+        if field.len() != width || !field.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+    }
+    let stamp = u64::from_str_radix(stamp, 16).ok()?;
+    let pid = u32::from_str_radix(pid, 16).ok()?;
+    let counter = u64::from_str_radix(counter, 16).ok()?;
+    Some((stamp, pid, counter))
+}
+
+/// The pid encoded in a queue id, when the id is one [`Spool::next_id`] could
+/// have produced and the pid is not zero.
+fn id_pid(id: &str) -> Option<u32> {
+    parse_id(id).map(|(_, pid, _)| pid).filter(|pid| *pid != 0)
 }
 
 /// Where each spool instance's counter starts, so two spools opening in the
@@ -1222,7 +1315,18 @@ mod tests {
         let order = recorded.lock().expect("observer").clone();
         assert_eq!(
             order,
-            vec![FsyncKind::File, FsyncKind::Dir],
+            vec![
+                FsyncEvent {
+                    op: FsyncOp::Commit,
+                    kind: FsyncKind::File,
+                    dir: None
+                },
+                FsyncEvent {
+                    op: FsyncOp::Commit,
+                    kind: FsyncKind::Dir,
+                    dir: Some("new".to_owned())
+                },
+            ],
             "the commit must fsync the message, then the directory, in that order"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1247,7 +1351,18 @@ mod tests {
             .expect("prepend commit");
         assert_eq!(
             recorded.lock().expect("observer").clone(),
-            vec![FsyncKind::File, FsyncKind::Dir],
+            vec![
+                FsyncEvent {
+                    op: FsyncOp::Commit,
+                    kind: FsyncKind::File,
+                    dir: None
+                },
+                FsyncEvent {
+                    op: FsyncOp::Commit,
+                    kind: FsyncKind::Dir,
+                    dir: Some("new".to_owned())
+                },
+            ],
             "the prepend commit must fsync the message, then the directory"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1337,9 +1452,16 @@ mod tests {
     }
 
     /// A spool id for a process that cannot exist: pids are `i32`, so
-    /// `u32::MAX` can never name a live writer.
+    /// `u32::MAX` can never name a live writer. Built from [`ID_FIELDS`], the
+    /// same definition [`Spool::next_id`] renders.
     fn dead_id() -> String {
-        "0000000000000001-ffffffff-000000".to_owned()
+        let [stamp_width, pid_width, counter_width] = ID_FIELDS;
+        let stamp = 1u64;
+        let counter = 0u64;
+        format!(
+            "{stamp:0stamp_width$x}-{:0pid_width$x}-{counter:0counter_width$x}",
+            u32::MAX
+        )
     }
 
     fn sha256_of(bytes: &[u8]) -> String {
@@ -1638,6 +1760,139 @@ mod tests {
         let report = spool.recover().expect("recover");
         assert_eq!((report.intact, report.corrupt), (1, 0));
         assert!(report.failed.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_id_is_only_recognised_in_the_shape_next_id_writes() {
+        // The id parser is the single reader of the format `next_id` writes,
+        // and it is strictly the same shape — a field of the wrong width or a
+        // digit outside hex is not an id, whatever it is next to.
+        let root = temp_root("id-shape");
+        let spool = Spool::open(&root).expect("spool");
+        let id = spool.next_id();
+        let [stamp_width, pid_width, counter_width] = ID_FIELDS;
+        assert_eq!(
+            id.split('-').map(str::len).collect::<Vec<_>>(),
+            vec![stamp_width, pid_width, counter_width]
+        );
+        assert!(parse_id(&id).is_some(), "a real id parses");
+        let counter = &id[id.len() - counter_width..];
+        let too_narrow = format!(
+            "{}-{:0pid_width$x}-{}",
+            "0".repeat(stamp_width),
+            std::process::id(),
+            "0"
+        );
+        assert_eq!(parse_id(&too_narrow), None, "a short counter is not an id");
+        let widened = format!("{counter}0");
+        let too_wide = format!(
+            "{}-{:0pid_width$x}-{widened}",
+            "0".repeat(stamp_width),
+            std::process::id()
+        );
+        assert_eq!(parse_id(&too_wide), None, "a long counter is not an id");
+        assert_eq!(parse_id("not-an-id"), None);
+        assert_eq!(
+            parse_id(&format!("{id}-0000")),
+            None,
+            "a fourth field is not an id"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_real_id_from_next_id_round_trips_through_the_sweep() {
+        // R6: `next_id` rendered the counter with a *minimum* width, so a
+        // seeded counter produced 19–20 digits while the pid lookup demanded
+        // six — every id the spool itself wrote was rejected, and the sweep's
+        // pid rule only ever fired for hand-made ids. Only the tests saw the
+        // difference because only they used hand-made ids.
+        //
+        // The shape now has one definition (`ID_FIELDS`) that `next_id`
+        // renders and `parse_id` verifies.
+        let root = temp_root("id-roundtrip");
+        let spool = Spool::open(&root).expect("spool");
+        let id = spool.next_id();
+        let (_, pid, _) = parse_id(&id).expect("next_id must produce a parseable id");
+        assert_eq!(pid, std::process::id());
+        assert_eq!(id_pid(&id), Some(std::process::id()));
+
+        // A real id naming a pid that cannot exist: reaped at once, with no
+        // grace period, which is only possible if the id parses.
+        let [stamp_width, pid_width, counter_width] = ID_FIELDS;
+        let (stamp, _, counter) = parse_id(&id).expect("id");
+        let dead_pid = u32::MAX;
+        let dead =
+            format!("{stamp:0stamp_width$x}-{dead_pid:0pid_width$x}-{counter:0counter_width$x}");
+        assert_eq!(id_pid(&dead), Some(dead_pid), "{dead}");
+        let gone = root.join("tmp").join(format!("{dead}.eml"));
+        write_residue(&gone);
+        let report = spool.recover().expect("recover");
+        assert_eq!(
+            report.tmp_removed, 1,
+            "a dead pid is reaped at once: {report:?}"
+        );
+        assert!(!gone.exists());
+
+        // And a real id left behind untouched past the window falls to the
+        // age rule only once the id is recognised at all.
+        let mut staged = spool.stage(&id, envelope(&id)).expect("stage");
+        staged.write(b"Subject: x\r\n\r\nbody\r\n").expect("write");
+        drop(staged);
+        let orphan = root.join("tmp").join(format!("{id}.eml"));
+        age_to(&orphan, TMP_RESIDUE_AGE + Duration::from_secs(60));
+        let report = spool.recover().expect("recover");
+        assert_eq!(report.tmp_removed, 1, "{report:?}");
+        assert!(!orphan.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claim_and_remove_report_their_own_operation() {
+        // S2-2: `claim` and `remove` sync directories too, but not because a
+        // commit's renames landed there. The record says which operation
+        // issued the sync, so a consumer of the commit contract can tell them
+        // apart instead of reading them as commit-path events.
+        let root = temp_root("fsync-scope");
+        let spool = Spool::open(&root).expect("spool");
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        spool.set_fsync_observer(Arc::new(move |event| {
+            sink.lock().expect("observer").push(event);
+        }));
+        let id = spool.next_id();
+        let mut staged = spool.stage(&id, envelope(&id)).expect("stage");
+        staged.write(b"Subject: hi\r\n\r\nbody\r\n").expect("write");
+        staged.commit().expect("commit");
+
+        spool.claim(&id).expect("claim");
+        spool.remove(QueueState::Cur, &id).expect("remove");
+        let events = recorded.lock().expect("observer").clone();
+
+        let dirs: Vec<(FsyncOp, Option<&str>)> = events
+            .iter()
+            .filter(|event| event.kind == FsyncKind::Dir)
+            .map(|event| (event.op, event.dir.as_deref()))
+            .collect();
+        assert_eq!(
+            dirs,
+            vec![
+                (FsyncOp::Commit, Some("new")),
+                (FsyncOp::Claim, Some("new")),
+                (FsyncOp::Claim, Some("cur")),
+                (FsyncOp::Remove, Some("cur")),
+            ],
+            "each operation's directory syncs carry their own label"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.op == FsyncOp::Commit)
+                .count(),
+            2,
+            "the commit contract has exactly its file and directory syncs"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
