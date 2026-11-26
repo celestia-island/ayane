@@ -1041,9 +1041,11 @@ fn read_envelope(dir: &Path, id: &str) -> io::Result<Envelope> {
 /// still own it. The decision, in order:
 ///
 /// 1. **Held open** by any process (`/proc/<pid>/fd` points at it): a writer is
-///    in the middle of staging it. This is the only signal that survives the
-///    pid checks below being wrong (a crashed process whose pid got reused, a
-///    file from another host), so it comes first and wins.
+///    in the middle of staging it. This is the only signal that survives pid
+///    *reuse* and files that came from another host — cases where the pid
+///    below names something alive or dead for the wrong reason. It does not
+///    survive `/proc` being unreadable: then every pid reads as dead and the
+///    sweep falls back to age alone (warned at the point it happens).
 /// 2. Carrying the pid of a process that is **gone**: the writer died.
 /// 3. Carrying **any** live pid — this process's included — or no id at all:
 ///    only the residue-age threshold (clocked on the `.eml` of the same id)

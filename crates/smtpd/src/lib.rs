@@ -21,5 +21,6 @@
 pub mod queue;
 
 pub use queue::{
-    Envelope, FsyncKind, FsyncObserver, QueueState, QueuedMessage, Spool, StagedMessage, SyncHook,
+    Envelope, FsyncEvent, FsyncKind, FsyncObserver, FsyncOp, QueueState, QueuedMessage, Spool,
+    StagedMessage, SyncHook,
 };
