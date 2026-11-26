@@ -136,7 +136,7 @@
 //! BDAT chunk buffer, the **header section bound** the streaming verifier
 //! needs from it, and the per-address AUTH failure budget a reconnect cannot
 //! reset. It also chooses the listener's posture — the
-//! [`ListenerRole`](policy::ListenerRole) it was configured with decides which
+//! [`ListenerRole`] it was configured with decides which
 //! recipient function runs at `RCPT`, and that choice is asserted by a test
 //! that drives the real driver code over a real socket rather than a copy of
 //! its logic.

@@ -306,7 +306,7 @@ pub enum AuthGate {
 /// sliding window and, once the budget is spent, refuses the attempt without
 /// looking at the credential until the window has turned over.
 ///
-/// The table is bounded twice — at most [`AuthGuard::capacity`] addresses, and
+/// The table is bounded twice — at most `AuthGuard::capacity` addresses, and
 /// every entry is dropped once it is older than the window (an address that
 /// stops failing stops costing memory).
 ///
@@ -2064,7 +2064,7 @@ fn error_reply(code: u16, enhanced: &'static str, text: impl Into<String>) -> Re
 }
 
 /// Counts `Received:` header fields in the head of a message (the first
-/// [`MAX_HEADER_BUFFER`] octets), for the loop bound.
+/// `MAX_HEADER_BUFFER` octets), for the loop bound.
 #[must_use]
 pub fn received_count(head: &[u8]) -> usize {
     let mut count = 0;
