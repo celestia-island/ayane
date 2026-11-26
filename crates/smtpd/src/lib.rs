@@ -1,8 +1,9 @@
 //! The inbound SMTP side of the ayane mail service.
 //!
-//! This crate lands in layers. Right now it holds two of them, and they share
-//! one property worth stating up front: **neither opens a socket, reads a
-//! clock, or keeps state outside itself.**
+//! This crate lands in layers. It holds three of them, and two share one
+//! property worth stating up front: **neither opens a socket, reads a clock, or
+//! keeps state outside itself.** The third — [`queue`] — is the only one that
+//! touches the disk, and it touches nothing else.
 //!
 //! # The session layer — pure logic
 //!
@@ -70,6 +71,51 @@
 //! its own size and digest is moved aside rather than delivered, and a
 //! half-written temporary file is discarded.
 //!
+//! # The verification layer — pure computation over the octets
+//!
+//! [`verify`] answers "what does the message claim, and does the claim hold?"
+//! and [`zone`] is the DNS side of that question: a fixed zone a caller hands
+//! in, which is authoritative for **every name it is asked about** — it is not
+//! scoped to the names it lists — so the whole layer runs without a resolver,
+//! a network or a listener. A lookup that misses is answered *negatively* (no
+//! records) and never falls through to the network, which is why a run with no
+//! network measures the verifier instead of an outage.
+//!
+//! ## The verification order, and why it is that order
+//!
+//! ```text
+//! SPF (envelope)  ──►  DKIM (message)  ──►  ARC (evidence)  ──►  DMARC  ──►  local policy
+//!                                                                          (the driver)
+//! ```
+//!
+//! The order is not a preference, but it is also not asserted anywhere:
+//! DMARC's result is a function of SPF's and DKIM's, so it cannot come
+//! earlier; SPF needs no header bytes, so it need not come later; ARC is
+//! evidence *about earlier hops* and never overrides a DKIM verdict. The legs
+//! are independent enough that reordering them would not change any verdict —
+//! which is why [`Verifier::verify`] runs them in this order and this section
+//! states the reason, rather than a test claiming to protect it.
+//!
+//! ## `Received:` is only ever prepended, at the top
+//!
+//! [`Verification::prepend`] is the block the spool writes in front of the
+//! bytes that were verified, `Received:` first. Nothing else about the message
+//! moves: RFC 5321 §4.4 makes each hop responsible for its own trace field in
+//! front of everything that arrived, and a DKIM signature may itself sign
+//! `Received:` (RFC 6376 Appendix A.2 does), so an insertion anywhere else — or
+//! a rewrite of an existing field — would invalidate a signature that was
+//! valid on the wire.
+//!
+//! ## Fail-closed is a verdict here, a refusal in the driver
+//!
+//! This layer decides; it does not refuse. [`PolicyVerdict::Reject`] is what a
+//! DMARC failure under `p=reject` / `p=quarantine` yields, and turning that
+//! into the 5xx at the end of `DATA` is the driver's act — the same split as
+//! the session layer, which never decides whether a mailbox exists either. A
+//! DNS outage yields accept-with-`temperror` rather than a rejection, because a
+//! temporary failure must not lose mail; what it must never do is read as
+//! `pass`, and it does not.
+//!
 //! # The listener split is structural, not configured
 //!
 //! [`policy`] answers two *different listeners*, not one listener with a flag:
@@ -88,6 +134,8 @@ pub mod mailbox;
 pub mod policy;
 pub mod queue;
 pub mod session;
+pub mod verify;
+pub mod zone;
 
 pub use authn::{valid_identity, DenyAll, PasswordVerifier, SaslError};
 pub use command::{Command, ParseError};
@@ -99,3 +147,8 @@ pub use queue::{
     StagedMessage, SyncHook,
 };
 pub use session::{Action, Extensions, Limits, Outcome, Phase, Reply, Session};
+pub use verify::{
+    decide, BodyDigest, BodyHasher, PolicyVerdict, SessionFacts, StreamedMessage, Verification,
+    Verifier, VerifyError,
+};
+pub use zone::{FixedCache, FixedZone};
