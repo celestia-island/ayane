@@ -66,7 +66,35 @@
 //! a refused message is never a channel for commands. That is stricter than
 //! "what follows a terminator is commands", and deliberately so: nothing in a
 //! failed transfer was acknowledged, so nothing in it can be trusted to be a
-//! command. See `Connection::discard_buffered_data`.
+//! command.
+//!
+//! # Discarding a failed transfer: two places, on purpose
+//!
+//! A drain that ends by **finding the client's terminator** cannot be the whole
+//! story, because it consumes that terminator and then has nothing left to
+//! discard: a sender that splits its upload across writes still has the tail of
+//! its message to send, and it arrives *after* the drain has returned. A
+//! refusal is answered from there, so the tail would be read by the command
+//! loop as if the sender had waited for the `554` — and a sender that writes a
+//! whole forged transaction there gets it executed. (That was a real hole in
+//! this module's first fix, and the one-piece test that covered it could not
+//! see the hole: with one write the tail is in the kernel buffer *before* the
+//! drain, and the drain discards it.)
+//!
+//! What the drain can see is the tail it already holds. What it cannot see is
+//! the tail that is still on the way — and that is the one a sender controls,
+//! because it is written before the sender has read the `554`. So a drain that
+//! ends on the client's terminator leaves the connection in a state that says
+//! so: `Connection::settling` (the next read's octets are the refused upload's
+//! tail and are dropped as far as they are not a whole line) and
+//! `Connection::refused` (a `MAIL FROM` in what remains opens nothing —
+//! `503 Bad sequence`). Together they mean the tail can never start a
+//! transaction, whatever it is split into, however late it arrives.
+//!
+//! The state lasts exactly one read, then one command. After that the connection
+//! owes the client ordinary answers again: a client that read its `554` and
+//! wants to send a new message gets a normal transaction out of it. See
+//! `Connection::quarantine_refused_upload`.
 //!
 //! | Decision | `DATA` | `BDAT` |
 //! |---|---|---|
@@ -685,6 +713,16 @@ struct Connection {
     /// else, so nothing in them is ever executed as a command. `None` outside
     /// a failed transfer.
     discard: Option<Vec<u8>>,
+    /// A failed `DATA` transfer's drain ended on a terminator the **client**
+    /// sent, and the connection has not yet read past it: octets that arrive
+    /// for the next command are still the tail of the transfer whose
+    /// terminator was just consumed (a sender that splits its upload across
+    /// writes gets there). Spent by [`Connection::settle`] on that read.
+    settling: bool,
+    /// Armed with `settling`, and for one command longer: a `MAIL FROM` read
+    /// from the refused upload's tail opens no transaction (`503`) — see
+    /// [`Connection::quarantine_refused_upload`]. Spent on that first command.
+    refused: bool,
     auth_state: Option<AuthState>,
     tls: bool,
     /// A second handle on the socket, for the failed-handshake close.
@@ -1045,6 +1083,19 @@ pub fn max_bdat_total(max_message_size: u64) -> u64 {
     max_message_size.max(MAX_BDAT_BUFFER as u64)
 }
 
+/// How a failed `DATA` transfer's drain ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainEnd {
+    /// The client's terminator was found and consumed: the upload is over, but
+    /// a sender that split its writes may still be sending its tail.
+    Terminator,
+    /// The client stopped sending (EOF) or the transaction timer ran out:
+    /// nothing more is coming.
+    NoMore,
+    /// The transaction timer ran out while the client was still sending.
+    TimedOut,
+}
+
 impl Connection {
     fn new(stream: TcpStream, peer: SocketAddr, config: Arc<ServerConfig>) -> Self {
         let socket = SocketHandle::of(&stream);
@@ -1133,6 +1184,8 @@ impl Connection {
             session,
             read_buf: Vec::with_capacity(4096),
             discard: None,
+            settling: false,
+            refused: false,
             auth_state: None,
             tls: secure,
             socket,
@@ -1178,8 +1231,29 @@ impl Connection {
             );
             let text = String::from_utf8_lossy(&line).into_owned();
             let reply = match command::parse(&text, allow_utf8) {
+                // Nothing in the tail of a refused upload starts an envelope:
+                // see [`Connection::quarantine_refused_upload`]. Every other
+                // command is answered normally — this is about who may open a
+                // transaction, not about the connection being unusable.
+                Ok(Command::Mail { .. }) if self.refused => Some(Reply {
+                    code: 503,
+                    enhanced: Some("5.5.1"),
+                    text: "Bad sequence of commands".to_owned(),
+                    lines: Vec::new(),
+                    action: Action::Continue,
+                }),
                 Ok(command) => {
+                    let judged_refused = self.refused;
                     let r = self.dispatch(&command).await?;
+                    // The command this read carried has now been judged
+                    // against `refused`; everything after it is the client
+                    // talking again, on a connection that owes it the ordinary
+                    // answers. (Cleared after the dispatch for exactly that
+                    // reason: the arm above asks the flag, and this is the
+                    // command it is asking about.)
+                    if judged_refused {
+                        self.refused = false;
+                    }
                     r
                 }
                 Err(err) => Some(err.reply()),
@@ -1524,7 +1598,18 @@ impl Connection {
                     // [`Connection::discard_buffered_data`]).
                     self.finish_failed_transfer(deadline, true).await?;
                     self.session.fail_data();
-                    return self.reply_end(false).await;
+                    self.reply_end(false).await?;
+                    // The refused transfer leaves the session with **no
+                    // envelope**, and it stays that way until the client asks
+                    // for a new one. That is what makes a `MAIL FROM` arriving
+                    // in the tail of the refused upload — a sender that
+                    // writes after its terminator, or splits its writes — a
+                    // `503 Bad sequence` this server answers instead of a
+                    // transaction it runs. `end_of_message(false)` already
+                    // reset the envelope; calling this makes that reset the
+                    // state the next command is judged against.
+                    self.quarantine_refused_upload();
+                    return Ok(());
                 }
             };
             if line.end_of_message {
@@ -1824,7 +1909,7 @@ impl Connection {
     /// reading from the socket as needed. Returns `false` when the client
     /// stopped sending (EOF or the transaction timer), which the caller
     /// answers by closing rather than by waiting.
-    async fn drain_until_dot(&mut self, deadline: tokio::time::Instant) -> bool {
+    async fn drain_until_dot(&mut self, deadline: tokio::time::Instant) -> DrainEnd {
         // A single read may return less than everything the client wrote, so
         // keep reading until the terminator is in the buffer or the stream
         // ends; the buffer is scanned before every read.
@@ -1847,22 +1932,22 @@ impl Connection {
                 if let Some(buffer) = &mut self.discard {
                     buffer.drain(..position);
                 }
-                return true;
+                return DrainEnd::Terminator;
             }
             scanned = discard.len().saturating_sub(3);
             if prefill == 0 {
-                return false;
+                return DrainEnd::NoMore;
             }
             match self.fill_available(prefill, deadline).await {
-                Ok(0) => return false,
+                Ok(0) => return DrainEnd::NoMore,
                 Ok(read) => {
                     // Widen each read so a big body is not read a page at a
                     // time.
                     prefill = read.saturating_mul(4).min(1024 * 1024);
                 }
-                Err(err) if err.kind() == io::ErrorKind::TimedOut => return false,
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return false,
-                Err(_) => return false,
+                Err(err) if err.kind() == io::ErrorKind::TimedOut => return DrainEnd::TimedOut,
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return DrainEnd::NoMore,
+                Err(_) => return DrainEnd::NoMore,
             }
         }
     }
@@ -2076,6 +2161,54 @@ impl Connection {
         self.discard = Some(std::mem::take(&mut self.read_buf));
     }
 
+    /// Marks the connection as having just refused a `DATA` transfer, so that
+    /// nothing written into the tail of that upload starts a transaction.
+    ///
+    /// The drain consumed the client's terminator, which means anything the
+    /// client still had queued was written **before** it read the `554` — it
+    /// is the rest of the message the server just refused, and for a sender
+    /// that writes a forged transaction there, it is the smuggling attempt
+    /// itself. The session cannot tell those octets from a fresh envelope
+    /// (both are `MAIL FROM:` lines), so the driver marks the connection
+    /// instead: a `MAIL FROM` that arrives while `refused` is set is answered
+    /// `503 Bad sequence` and opens nothing.
+    ///
+    /// `refused` is cleared by the read that consumes `settling`. Both flags
+    /// arm together in [`Connection::finish_failed_transfer`]:
+    ///
+    /// - `settling` — the *read* that ends settling has its octets dropped, and
+    /// - `refused` — every `MAIL FROM` from that read until the next one is
+    ///   answered `503`.
+    ///
+    /// A command **already** in `read_buf` when the refusal went out is not
+    /// affected: it was written before the drain could have consumed anything
+    /// of it, and it is exactly the "new transaction after the answer" the
+    /// rest of this module promises to serve.
+    fn quarantine_refused_upload(&mut self) {
+        self.session.end_after_refusal();
+        self.refused = true;
+    }
+
+    /// Spends `settling` on one read: the octets that read brought are the
+    /// tail of an upload this connection already refused, so nothing in them is
+    /// executed.
+    ///
+    /// A *complete line* is kept. Nothing about a line's content can tell a
+    /// tail from a command the client wrote — both are just an `LF`-terminated
+    /// line — but a line that arrives **while a forged transaction in it would
+    /// be pointless** is handled by the session instead: the refusal left the
+    /// session with no envelope (see [`Session::end_after_refusal`]), so a
+    /// `MAIL FROM` among them is answered `503 Bad sequence` and runs nothing.
+    /// What survives here is a **new transaction the client starts after the
+    /// refusal** — the case the attacker cannot gain from, because starting a
+    /// transaction requires being allowed to send commands at all.
+    fn settle(&mut self) {
+        self.settling = false;
+        if !self.read_buf.contains(&b'\n') {
+            self.read_buf.clear();
+        }
+    }
+
     /// Throws away what is left of a failed transfer: the octets already
     /// buffered, and then — if the client is still uploading — the stream up
     /// to the terminator, bounded by the transaction timer.
@@ -2094,10 +2227,32 @@ impl Connection {
         drain_stream: bool,
     ) -> Result<(), ServerError> {
         self.discard_buffered_data();
+        self.settling = false;
         if !drain_stream {
             return Ok(());
         }
-        self.drain_until_dot(deadline).await;
+        // The stream is drained up to the client's terminator (or until the
+        // client stops sending), and the drain buffer goes with it: there is
+        // nothing left of the failed transfer to keep.
+        let dbg_end = self.drain_until_dot(deadline).await;
+        match dbg_end {
+            DrainEnd::Terminator => {
+                // The terminator was consumed, so the *next* octets to arrive
+                // belong to a transfer the client wrote before it learned the
+                // transfer failed: a sender that splits its upload across
+                // writes lands here, with the tail of its message behind the
+                // terminator it already sent. Nothing knows where that tail
+                // ends, so nothing of it may be executed — the read that comes
+                // next discards whatever arrived meanwhile
+                // ([`Connection::settle`]).
+                self.settling = true;
+                self.refused = true;
+            }
+            // EOF or the transaction timer: nothing more is coming from this
+            // upload, and a later octet is a new command (a clean transaction
+            // the client starts after the refusal).
+            DrainEnd::NoMore | DrainEnd::TimedOut => {}
+        }
         self.discard = None;
         Ok(())
     }
@@ -2113,6 +2268,7 @@ impl Connection {
     /// never be re-read as commands either).
     async fn upgrade_tls(&mut self) -> Result<(), ServerError> {
         self.read_buf.clear();
+        self.settling = false;
         let acceptor = self
             .config
             .tls
@@ -2199,6 +2355,19 @@ impl Connection {
         &mut self,
     ) -> Result<Option<Result<Vec<u8>, &'static str>>, ServerError> {
         let deadline = tokio::time::Instant::now() + self.config.command_timeout;
+        // A failed transfer whose drain ended on the client's terminator may
+        // still have its tail on the way (`Connection::settling`). Two places
+        // have to discard it, and this is the first: **unterminated** octets
+        // already in `read_buf`. Only those can be a tail. A complete line is a
+        // command the client wrote — pipelined in the same write as the
+        // terminator, or brought by the same `read` — and dropping it would
+        // silently eat the client's next request. Its length is not the
+        // test: a command is whatever ends in a `CRLF`, and the parser is the
+        // thing that answers a line that is too long.
+        if self.settling && !self.read_buf.contains(&b'\n') && !self.read_buf.is_empty() {
+            self.read_buf.clear();
+        }
+
         loop {
             if let Some(position) = self.read_buf.iter().position(|byte| *byte == b'\n') {
                 let mut line: Vec<u8> = self.read_buf.drain(..=position).collect();
@@ -2215,7 +2384,18 @@ impl Connection {
                 return Ok(Some(Err("Line too long")));
             }
             let want = 1024;
+            // Observed **before** the read, because this is the read that ends
+            // `settling`: whatever it brings is the failed transfer's tail, so
+            // it is thrown away with the flag and the loop reads again for the
+            // next message. (Checking the flag *after* the read would always
+            // see `false` — the read cleared it — and the tail would be read
+            // as commands, which is how a second transaction got smuggled
+            // through a connection the server had already refused.)
+            let settled = self.settling;
             let outcome = tokio::time::timeout_at(deadline, self.fill(want, None)).await;
+            if settled {
+                self.settle();
+            }
             match outcome {
                 Err(_) => {
                     self.timeout_close().await?;
@@ -2224,6 +2404,11 @@ impl Connection {
                 Ok(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                 Ok(Err(err)) => return Err(err.into()),
                 Ok(Ok(())) => {
+                    // The settled read is discarded whole: loop for the next
+                    // command rather than treating an empty buffer as EOF.
+                    if settled {
+                        continue;
+                    }
                     if self.read_buf.is_empty() {
                         return Ok(None);
                     }

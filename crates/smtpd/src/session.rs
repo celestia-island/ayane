@@ -855,6 +855,23 @@ impl Session {
         self.abort_pending = true;
     }
 
+    /// Keeps the connection out of a transaction after a refused `DATA`
+    /// transfer until the sender asks for one.
+    ///
+    /// [`Session::end_of_message`] already resets the envelope when the
+    /// transfer fails; what this exists for is the ordering. A sender whose
+    /// upload was refused may still be writing — the octets it had queued
+    /// behind the terminator, which the driver drains and discards — and the
+    /// first of those that *is* a command (`MAIL FROM:…`) must be answered, not
+    /// run. Running it would mean a refused transfer produced a new envelope,
+    /// which is the transaction-level half of the smuggling this guards
+    /// against. Sequencing is the session's business, so the answer is its
+    /// `503` and nothing here decides policy.
+    pub fn end_after_refusal(&mut self) {
+        self.abandon_transaction();
+        self.phase = self.phase_after_reset();
+    }
+
     fn starttls(&mut self) -> Reply {
         if self.phase == Phase::Data || self.phase == Phase::Bdat {
             return self.sequence_error();

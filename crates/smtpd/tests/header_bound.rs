@@ -839,6 +839,17 @@ fn smuggled_transaction_behind(body: &[u8]) -> Vec<u8> {
 /// has no terminator worth trusting: the sender chose those octets, and the
 /// upload was never acknowledged. So everything the drain walks over, and
 /// anything behind it, is discarded — never executed, never queued.
+/// How a client writes the wire matters for this rule, so both writes are
+/// tested: one piece, and split across two writes with a pause between them.
+///
+/// The split is not a variant for coverage's sake. A `DATA` transfer that fails
+/// is drained up to the client's terminator *before* the `554` goes out, so the
+/// only octets the drain does not already hold are the ones a sender writes
+/// **after** its terminator — which a single `write` never produces, because
+/// they arrive together with the terminator. A sender that splits its upload
+/// produces them, and that is the sender the discard rule exists for. A test
+/// that only writes the wire in one piece proves nothing about it: it passed
+/// against a build that was still smuggling.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminator_after_a_bare_lf_does_not_resume_the_session() {
     // Two prefixes, both failing before the terminator: a bare `LF` on the
@@ -866,6 +877,9 @@ async fn a_terminator_after_a_bare_lf_does_not_resume_the_session() {
         // and a test that then waits for a fixed time gets a timing race
         // dressed up as a server behaviour.)
         client.send_raw_pieces(&smuggled_transaction_behind(&body));
+        // The one-piece write above is the shape that reaches the drain
+        // already complete; `a_tail_split_across_writes_is_discarded_too`
+        // covers the one that does not.
 
         let first = client
             .try_read_reply_within(Duration::from_secs(5))
@@ -953,6 +967,120 @@ async fn octets_behind_a_terminator_in_a_failed_transfer_are_discarded() {
     harness.stop();
 }
 
+/// The same failure, written in **two** pieces: the failing octets and the
+/// sender's own terminator, then — after a pause the server can see — the
+/// transaction forged behind it.
+///
+/// This is the shape that got through when the drain's own bookkeeping was the
+/// only thing discarding: the drain consumed the terminator and returned with
+/// the read buffer empty, so the octets that arrived afterwards were read by
+/// the command loop as if the client had waited for the `554` and then started
+/// a new transaction. Measured before the fix: `554 5.6.0`, then
+/// `250 Sender OK` / `250 Recipient OK` / `354` / `250`, with
+/// `evil@example.net` in the queue.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tail_split_across_writes_is_discarded_too() {
+    let harness = Harness::start("s1-split-write", bounded()).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+
+    // First piece: everything up to and including the terminator the sender
+    // wrote. This is what the drain consumes.
+    let mut first = b"From: <a@example.net>\r\nSubject: s1\r\n\r\n".to_vec();
+    first.extend_from_slice(b"prompt\n.\r\n");
+    client.send_raw(&first);
+
+    // The pause is what makes the second piece arrive *after* the drain: with
+    // one write both pieces are in the kernel buffer together and the drain
+    // discards them there, which is why the one-piece test cannot see this.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Second piece: the forged transaction, written by a sender that has not
+    // read the `554` yet.
+    client.send_raw_pieces(
+        b"MAIL FROM:<evil@example.net>\r\nRCPT TO:<inbox@example.com>\r\nDATA\r\nsecond\r\n.\r\n",
+    );
+
+    let first_reply = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the refused transfer is answered");
+    assert_eq!(
+        (first_reply.code, first_reply.text.as_str()),
+        (554, "5.6.0 Transaction failed"),
+        "{first_reply:?}"
+    );
+    // The tail is answered — a server that goes silent on it is a server that
+    // has stopped talking to its client — but answered as what it is: the
+    // commands a refused transfer carried. `MAIL FROM` opens nothing (`503`),
+    // and nothing after it can run without an envelope.
+    while let Some(reply) = client.try_read_reply_within(Duration::from_millis(300)) {
+        assert_ne!(
+            reply.code, 250,
+            "no step of a forged transaction may be accepted: {reply:?}"
+        );
+        assert!(
+            !reply.text.contains("Sender OK") && !reply.text.contains("Recipient OK"),
+            "a forged envelope must not be honoured: {reply:?}"
+        );
+    }
+    let senders: Vec<String> = harness
+        .queued()
+        .iter()
+        .map(|m| m.envelope.mail_from.clone())
+        .collect();
+    assert!(
+        senders.is_empty(),
+        "nothing is queued from a refused transfer, however its writes were \
+         split: {senders:?}"
+    );
+    harness.stop();
+}
+
+/// The same tail, written **after** the client has read the `554`.
+///
+/// A sender that was told its transfer failed cannot then continue that
+/// transfer: what it writes next begins from wherever the server left the
+/// conversation. The connection is still open (a `554` is not a `421`), so the
+/// next bytes must be a new command — and the octets of a forged transaction
+/// are not ones this server will run as a consequence of the transfer it just
+/// refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_tail_sent_after_the_refusal_is_not_executed() {
+    let harness = Harness::start("s1-after-reply", bounded()).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    let mut first = b"From: <a@example.net>\r\nSubject: s1\r\n\r\n".to_vec();
+    first.extend_from_slice(b"prompt\n.\r\n");
+    client.send_raw(&first);
+
+    let reply = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the refused transfer is answered");
+    assert_eq!(
+        (reply.code, reply.text.as_str()),
+        (554, "5.6.0 Transaction failed")
+    );
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    client.send_raw_pieces(
+        b"MAIL FROM:<evil@example.net>\r\nRCPT TO:<inbox@example.com>\r\nDATA\r\nsecond\r\n.\r\n",
+    );
+    while let Some(reply) = client.try_read_reply_within(Duration::from_millis(300)) {
+        assert_ne!(
+            reply.code, 250,
+            "nothing written after a refusal may resume the refused upload: \
+             {reply:?}"
+        );
+    }
+    let senders: Vec<String> = harness
+        .queued()
+        .iter()
+        .map(|m| m.envelope.mail_from.clone())
+        .collect();
+    assert!(senders.is_empty(), "nothing is queued: {senders:?}");
+    harness.stop();
+}
+
 /// R1's exact wire, pinned as **not** a defect — the terminator is where a
 /// `DATA` transfer says it is, bare `LF`s after it are commands, and the
 /// transaction they belong to was never refused.
@@ -960,16 +1088,28 @@ async fn octets_behind_a_terminator_in_a_failed_transfer_are_discarded() {
 /// `…\r\n\r\n.\r\n\nMAIL FROM:<evil@…>\r\n…`
 ///
 /// Read as `DATA`, the `.<CRLF>` right after the blank line **is** the
-/// terminator: the message is the empty body above it, it is valid, it is
-/// acknowledged `250`. The bare `LF` that follows lands in the command stream,
-/// where a line ending in a bare `LF` is an empty command (`500`) — a protocol
-/// fact, not a smuggling hole, because the sender wrote those octets *after*
-/// its own terminator and after the server's `250`. The rest of the wire is a
-/// normal pipelined transaction, which this server has always executed.
+/// terminator: the message is the empty body above it, and it is valid. The
+/// bare `LF` that follows lands in the command stream, where a line ending in a
+/// bare `LF` is an empty command (`500`) — a protocol fact, not a smuggling
+/// hole, because the sender wrote those octets *after* its own terminator and
+/// behind a message the server accepted. The rest of the wire is a normal
+/// pipelined transaction.
+///
+/// **What this test pins is that those octets are executed as commands** — not
+/// when they are answered. Measured, the answers do not come back in the order
+/// they were caused: the `250` for the accepted message and the `500` for the
+/// empty line arrive first, and the pipelined transaction's replies arrive only
+/// after the drain has been asked for and has ended — a transfer is drained
+/// before its answer goes out, and on this wire the drain has nothing to stop
+/// at until the transaction timer, so the forge is answered *after* it. The
+/// bytes are executed either way, which is why this is a legitimate pipelining
+/// client and not a refusal being resumed. (An earlier version of this comment
+/// said the pipeline ran "as it always has", which reads as a claim about
+/// timing; it was not.)
 ///
 /// R1's construction is therefore a `DATA` transfer whose forge lives behind
-/// an **acknowledged** terminator, not one whose forge lives behind a
-/// **refused** one; the smuggling case is the previous test.
+/// an **acknowledged** message, not one whose forge lives behind a **refused**
+/// one; the smuggling case is the two tests above.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forge_behind_an_acknowledged_terminator_is_plain_pipelining() {
     let wire = concat!(
@@ -993,7 +1133,8 @@ async fn a_forge_behind_an_acknowledged_terminator_is_plain_pipelining() {
         (250, "2.0.0 OK: queued"),
         "the `.<CRLF>` after the blank line is the terminator: {first:?}"
     );
-    // The bare `LF` after it is a command line that is empty.
+    // The bare `LF` after it is a command line that is empty. (This one *is*
+    // in order; the transaction behind it is not — see this test's doc.)
     let empty = client
         .try_read_reply_within(Duration::from_secs(5))
         .expect("the empty command line is answered");
