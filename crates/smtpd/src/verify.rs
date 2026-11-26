@@ -1,6 +1,6 @@
 //! Trust verification: SPF, DKIM, ARC and DMARC over the bytes as received.
 //!
-//! # The order, and why it is that order
+//! # The order, and why it is that order (stated, not asserted)
 //!
 //! ```text
 //! SPF  ──►  DKIM  ──►  ARC (informational)  ──►  DMARC  ──►  local policy
@@ -24,11 +24,12 @@
 //! Three hard rules shape the rest of the module:
 //!
 //! 1. **Only the raw octets are verified.** The body is hashed by
-//!    [`BodyHasher`] while it is written to the spool file, so a 25 MiB
-//!    message never exists in memory; the `Received:` and
-//!    `Authentication-Results:` lines come back as [`Verification::prepend`]
-//!    and are written when the spool file is opened, *after* the hashes were
-//!    taken, so they cannot disturb them.
+//!    [`BodyHasher`] as the driver streams it — the same octets it writes to
+//!    the spool file — so a 25 MiB message never exists in memory. Nothing in
+//!    this layer enforces that pairing: the driver owns it, and it writes the
+//!    `Received:` and `Authentication-Results:` lines (which come back as
+//!    [`Verification::prepend`]) when it opens the spool file, *after* the
+//!    hashes were taken, so they cannot disturb them.
 //! 2. **`Received:` is only ever prepended, at the top.** RFC 5321 §4.4 makes
 //!    each hop responsible for its own trace field in front of everything that
 //!    arrived; and a DKIM signature may itself sign `Received:` (RFC 6376
@@ -101,8 +102,9 @@ pub type BodyDigest = (
     Vec<u8>,
 );
 
-/// Hashes a message while it is streamed, to be finished once the whole
-/// message has been written to the spool.
+/// Hashes the **body** of a message while it is streamed — the header
+/// section is buffered whole, which is why the driver must bound it — and is
+/// finished once the whole message has been read.
 ///
 /// ## What it holds
 ///

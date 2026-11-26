@@ -81,18 +81,20 @@
 //! records) and never falls through to the network, which is why a run with no
 //! network measures the verifier instead of an outage.
 //!
-//! ## The verification order is a contract
+//! ## The verification order, and why it is that order
 //!
 //! ```text
 //! SPF (envelope)  ──►  DKIM (message)  ──►  ARC (evidence)  ──►  DMARC  ──►  local policy
 //!                                                                          (the driver)
 //! ```
 //!
-//! The order is not a preference: DMARC's result is a function of SPF's and
-//! DKIM's, so it cannot come earlier; SPF needs no header bytes, so it need not
-//! come later; ARC is evidence *about earlier hops* and never overrides a DKIM
-//! verdict. [`Verifier::verify`] runs all four in that order and returns a
-//! [`Verification`].
+//! The order is not a preference, but it is also not asserted anywhere:
+//! DMARC's result is a function of SPF's and DKIM's, so it cannot come
+//! earlier; SPF needs no header bytes, so it need not come later; ARC is
+//! evidence *about earlier hops* and never overrides a DKIM verdict. The legs
+//! are independent enough that reordering them would not change any verdict —
+//! which is why [`Verifier::verify`] runs them in this order and this section
+//! states the reason, rather than a test claiming to protect it.
 //!
 //! ## `Received:` is only ever prepended, at the top
 //!
