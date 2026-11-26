@@ -1,6 +1,6 @@
 [package]
 name = "ayane-smtpd"
-description = "Inbound SMTP server for the ayane mail service: the RFC 5321 session state machine (PIPELINING/SIZE/CHUNKING/SMTPUTF8) and the crash-safe file spool (a message is acknowledged only after the data and the directory entry are durable)"
+description = "Inbound SMTP server for the ayane mail service: the RFC 5321 session state machine (PIPELINING/SIZE/CHUNKING/SMTPUTF8), the tokio driver that bounds it, and the crash-safe file spool (a message is acknowledged only after the data and the directory entry are durable)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,10 +19,18 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+rustls = { version = "^0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "^0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "^2"
 
 [dev-dependencies]
 tokio = { workspace = true }
 uuid = { workspace = true }
+
+[[bin]]
+name = "ayane-smtpd"
+path = "src/bin/ayane-smtpd.rs"
 
 [lints]
 workspace = true
