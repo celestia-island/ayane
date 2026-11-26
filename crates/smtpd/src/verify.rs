@@ -110,10 +110,13 @@ pub type BodyDigest = (
 /// as it arrives, which is what lets a large message be verified without
 /// living in memory (T-B14). The **header section** is buffered in full —
 /// [`mail_auth::stream::MessageStream`] holds octets until it finds the blank
-/// line that ends it — so the bound here is "body, not headers"; a message
-/// with no blank line at all is buffered whole before [`BodyHasher::finish`]
-/// can tell it has no body. The driver's own size limit is what bounds that,
-/// not this type.
+/// line that ends it — so the bound here is "body, not headers", and **a
+/// `max_header_bytes` has to come from the driver**: this type buffers the
+/// whole header section, and a message with no blank line at all is buffered
+/// whole before [`BodyHasher::finish`] can tell it has no body. Until the
+/// driver stops feeding past its limit, the header section is as large as the
+/// peer's `DATA` is large (`SIZE` is a session-level negotiation, not a bound
+/// on what arrives).
 pub struct BodyHasher {
     stream: MessageStream,
     // The received octets, only when `keep_raw` asked for them.
@@ -225,10 +228,14 @@ impl StreamedMessage {
         let Some(raw) = self.raw.as_deref() else {
             return Vec::new();
         };
-        // Deliberately **relaxed**: strict parsing refuses `l=` signatures
-        // (RFC 6376 §8.2) and the production path never sees them, but the
-        // digest a signature *declares* is a property of its tags, and a
-        // caller asking for it is asking about the recipe, not the verdict.
+        // Deliberately **relaxed** parsing. The production path is strict —
+        // `MessageStream::new()` parses in strict mode, so an `l=` signature
+        // arrives there as a *neutral* error, never as a signature: DKIM comes
+        // out non-passing and DMARC judges on SPF alone. It is still not
+        // "refused": nothing about `l=` reaches `decide`. This accessor is
+        // asked what a signature *declares*, which is a property of its tags
+        // before any verdict, so it parses relaxed and hands back the recipe
+        // either way.
         let Some(message) = mail_auth::AuthenticatedMessage::parse_with_opts(raw, None, false)
         else {
             return Vec::new();
@@ -323,15 +330,21 @@ impl Verifier {
 
     /// A verifier with (or without) a fixed zone.
     ///
-    /// The resolver is always built even when every lookup is answered from
-    /// the zone (a zone miss is an empty answer, not a query): `mail-auth`'s
-    /// verifiers are methods on the resolver type. The parse and signing work
-    /// — which is what a test exercises — never reaches it.
+    /// The resolver is always built, even when every lookup is answered from
+    /// the zone: `mail-auth`'s verifiers are methods on the resolver type, and
+    /// there is no container type without one. With a zone the resolver is
+    /// never *asked* — a name inside the zone's authority is answered by the
+    /// cache, a negative included (see [`FixedZone`]) — so the type is a
+    /// carrier there, not a dependency.
     ///
     /// # Panics
     ///
-    /// Panics on a host with neither Cloudflare's addresses nor a readable
-    /// system resolver configuration; there is no third way to build the type.
+    /// Panics when neither resolver can be constructed. Both are built from a
+    /// hard-coded provider table ([`MessageAuthenticator::new_cloudflare`]
+    /// points at Cloudflare's addresses over UDP/TCP), so this does not read
+    /// `/etc/resolv.conf` and does not depend on the host's network
+    /// configuration; the only way to reach the panic is a `mail-auth` or
+    /// hickory build that cannot build a resolver at all.
     #[must_use]
     pub(crate) fn from_parts(hostname: String, zone: Option<FixedZone>) -> Self {
         let authenticator = MessageAuthenticator::new_cloudflare()
@@ -346,9 +359,11 @@ impl Verifier {
 
     /// Runs SPF, DKIM, ARC and DMARC over a streamed message and decides.
     ///
-    /// `received` is the `Received:` line to prepend (without its own CRLF or
-    /// the `Received: ` field name); it is part of the output only, never of
-    /// the verified bytes.
+    /// `received` is the *value* of the `Received:` field to prepend — the
+    /// text that follows `Received: `, without the field name and without the
+    /// trailing CRLF (`from client.example, by mx.example …`). The returned
+    /// [`Verification::prepend`] supplies both around it; it is part of the
+    /// output only, never of the verified bytes.
     pub async fn verify(
         &self,
         message: StreamedMessage,

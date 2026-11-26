@@ -75,7 +75,11 @@
 //!
 //! [`verify`] answers "what does the message claim, and does the claim hold?"
 //! and [`zone`] is the DNS side of that question: a fixed zone a caller hands
-//! in, so the whole layer runs without a resolver, a network or a listener.
+//! in, authoritative for the names it lists (and for the names below them), so
+//! the whole layer runs without a resolver, a network or a listener. Inside
+//! that authority a lookup that misses is answered *negatively* — no records —
+//! and never falls through to the network, which is why a run with no network
+//! measures the verifier instead of an outage.
 //!
 //! ## The verification order is a contract
 //!

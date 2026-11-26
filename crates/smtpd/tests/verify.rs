@@ -454,15 +454,14 @@ fn chunking_an_eight_megabyte_message_changes_nothing() {
         reference,
         "one write must equal the reference body hash"
     );
-    // And every awkward chunk size, including 1 (the header terminator can
-    // straddle any boundary).
+    // And read-buffer-sized pieces, which is how a driver feeds the spool.
     // `mail-auth` looks for the header terminator from the previous scan
     // point, so a degenerate one-byte feed re-copies the header bytes on every
-    // chunk — quadratic in the header length, which is why the real driver
-    // hands the spool sane read buffers. The sizes below span the boundaries
-    // that matter (three bytes, a line, a page, a batch, the whole message)
-    // without paying for that pathology on an 8 MiB message.
-    for chunk in [1024, 4096, 65_536, 1 << 20] {
+    // chunk — quadratic in the header length — which is why there is
+    // deliberately no one-byte case here: it would measure that pathology, not
+    // the contract. The point of the sizes below is that the body hashes the
+    // same however the reader happened to cut it.
+    for chunk in [1_024, 4_096, 65_536, 1 << 20] {
         assert_eq!(
             digests(chunked_hash(&message, chunk)),
             reference,
@@ -872,27 +871,108 @@ fn spf_failing_alone_does_not_refuse() {
 // ── the zone itself ──────────────────────────────────────────────────────
 
 #[test]
-fn a_name_the_zone_does_not_list_has_no_records() {
-    use mail_auth::dns::{DnsCache, ResolverCache, ToFqdn};
+fn a_name_the_zone_does_not_list_answers_no_records_without_a_query() {
+    // This goes through the decision path, not the cache: a zone that lists a
+    // key but nothing else must produce `dkim=permerror` (record not found)
+    // and `spf=none` — the answers of an authoritative "nothing here", which
+    // are what an offline run gets. A cache miss that fell through to the
+    // resolver would read `temperror` instead as soon as the network is gone,
+    // and `temperror` is a different statement about the world.
+    let pair = key_pair();
+    let (name, record) = pair.record_pair();
+    let zone = zone_with(&[(&name, &record)]);
+    // The zone lists the real key; ask about a domain it does not list.
+    let streamed = StreamedMessage::from_bytes(&rfc6376_message()).expect("message parses");
+    let verifier = Verifier::with_zone("mx.ayane.test", zone);
+    let session = facts("someone@not-in-the-zone.example");
+    let verification = block_on(verifier.verify(streamed, &session, "from client.example.net"));
+    let block = String::from_utf8_lossy(&verification.prepend).to_string();
+
+    assert!(
+        block.contains("dkim=permerror (dns record not found)"),
+        "an absent key is a permanent 'not published', not a transient outage: {block}"
+    );
+    assert!(
+        block.contains("spf=none (mx.ayane.test: no SPF records found"),
+        "an absent SPF record is `none`, not `temperror`: {block}"
+    );
+    assert!(
+        !block.contains("temperror"),
+        "nothing here may read as a temporary DNS failure: {block}"
+    );
+}
+
+#[test]
+fn a_lookup_inside_the_authority_never_reaches_the_resolver() {
+    // The negative answer is what makes the zone authoritative, and this is
+    // the property stated directly rather than through a verdict: every name
+    // the zone can be asked about gets *an answer* — a record or a NODATA —
+    // and only a name it lists nothing for *and* knows nothing about is left
+    // to the resolver. `None` from the cache is "ask the network"; a
+    // `dkim=permerror` test would pass even if a resolver were asked and
+    // happened to answer, this would not.
+    use mail_auth::dns::{DnsCache, Negative, RecordSet, ResolverCache, TxtRecord};
+    use mail_auth::Mx;
+
+    let pair = key_pair();
+    let (name, record) = pair.record_pair();
+    let zone = zone_with(&[(&name, &record)])
+        .with_dmarc(pair.domain, "v=DMARC1; p=reject")
+        .expect("policy record parses");
+
+    // TXT: a listed name has its record, an unlisted one has NODATA.
+    let txt = DnsCache::txt(&zone).expect("txt cache");
+    let listed = format!("{name}.");
+    assert!(
+        ResolverCache::get::<str>(txt, listed.as_str()).is_some(),
+        "the record the fixture published is answered"
+    );
+    for unlisted in [
+        "_dmarc.absent.example.",
+        "_dmarc.other-sender.example.",
+        "_domainkey.sender.example.",
+        "sender.example.",
+        "example.",
+        "no-such-host.invalid.",
+    ] {
+        match ResolverCache::get::<str>(txt, unlisted) {
+            Some(TxtRecord::Error(mail_auth::Error::Dns(mail_auth::DnsError::RecordNotFound(
+                _,
+            )))) => {}
+            Some(_) => panic!("{unlisted} must be NODATA, not a record"),
+            None => panic!("{unlisted} fell through to the resolver"),
+        }
+    }
+
+    // MX: same question, the `Err(Negative)` shape.
+    let mx = DnsCache::mx(&zone).expect("mx cache");
+    match ResolverCache::get::<str>(mx, "sender.example.") {
+        Some(Err(Negative { .. })) => {}
+        _ => panic!("an MX miss inside the authority is a negative answer"),
+    }
+    // A listed MX would be a `RecordSet`; the marker type is enough to keep
+    // the import honest.
+    let _: Option<Result<RecordSet<Mx>, Negative>> =
+        ResolverCache::get::<str>(mx, "sender.example.");
+}
+
+#[test]
+fn an_unlisted_name_is_answered_by_the_zone_not_the_resolver() {
+    // The cache-level half of the contract, and the one property the
+    // decision-path test above cannot show: a *miss inside the authority* must
+    // come back as the NODATA answer. A `None` there means "this cache cannot
+    // answer" to `mail-auth`, which then asks the resolver — so `None` is a
+    // network query wearing the costume of an empty answer.
+    use mail_auth::dns::{DnsCache, ResolverCache};
 
     let pair = key_pair();
     let (name, record) = pair.record_pair();
     let zone = zone_with(&[(&name, &record)]);
-
     let cache = DnsCache::txt(&zone).expect("txt cache");
-    let queried = name.as_str().to_fqdn().into_owned();
-    assert_eq!(
-        queried,
-        format!("{name}."),
-        "a lookup asks for the absolute name, which is how the zone stores it"
-    );
+
     assert!(
-        ResolverCache::get::<str>(cache, queried.as_str()).is_some(),
-        "the record the fixture published is the one a verifier looks up"
-    );
-    assert!(
-        ResolverCache::get::<str>(cache, "absent._domainkey.sender.example.").is_none(),
-        "an unlisted name has no records"
+        ResolverCache::get::<str>(cache, "absent._domainkey.sender.example.").is_some(),
+        "an unlisted name still gets an answer (see the authority test below)"
     );
 }
 
