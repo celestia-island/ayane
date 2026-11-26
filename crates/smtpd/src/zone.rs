@@ -2,10 +2,9 @@
 //! never lets a lookup reach the network.
 //!
 //! It exists for the tests, and for a deployment that already knows its
-//! records. The zone is authoritative for a set of domains — every name it
-//! lists, those names' parent domains, and the `_dmarc.` / `_domainkey.` names
-//! `mail-auth` derives from them — and *inside* that set a name it does not
-//! list has **no records**. That second half is the part worth being precise
+//! records. The zone is authoritative for **every name it is asked about** —
+//! not scoped to the names it lists — and a name it does not list has
+//! **no records**. That second half is the part worth being precise
 //! about, because `mail-auth`'s cache seam is not a filter:
 //!
 //! > `ResolverCache::get` returning `None` means "this cache cannot answer",
@@ -25,8 +24,8 @@
 //! this layer implements (fail-closed, DNS-down-is-not-reject) is testable with
 //! no network at all.
 //!
-//! Outside the authority a lookup is a real miss and the resolver is asked:
-//! that is how a deployment pins only part of its view.
+//! A deployment that wants unknown names answered by the real resolver does
+//! not use a fixed zone: build the [`crate::verify::Verifier`] without one.
 
 use std::net::IpAddr;
 use std::time::Instant;
