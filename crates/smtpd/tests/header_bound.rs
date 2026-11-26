@@ -210,6 +210,34 @@ async fn the_bound_applies_without_a_verifier() {
     harness.stop();
 }
 
+/// Sends `message` over both transports, on separate listeners with the same
+/// bound, and returns `(DATA reply code, DATA queued, BDAT reply code, BDAT
+/// queued)`.
+///
+/// Every test in this module that is about *agreement* goes through here, so
+/// the two paths are exercised by the same octets, the same fixture and the
+/// same limit — the only thing that differs is the transport.
+async fn both_ways(tag: &str, message: &[u8]) -> (u16, usize, u16, usize) {
+    let data_harness = Harness::start(&format!("{tag}-data"), bounded()).await;
+    let mut client = transaction(&data_harness);
+    client.expect("DATA", 354);
+    let mut wire = message.to_vec();
+    wire.extend_from_slice(b".\r\n");
+    client.send_raw(&wire);
+    let over_data = client.read_reply().code;
+    let queued_over_data = data_harness.queued().len();
+    data_harness.stop();
+
+    let bdat_harness = Harness::start(&format!("{tag}-bdat"), bounded()).await;
+    let mut client = transaction(&bdat_harness);
+    client.pending(message);
+    let over_bdat = client.command(&format!("BDAT {} LAST", message.len())).code;
+    let queued_over_bdat = bdat_harness.queued().len();
+    bdat_harness.stop();
+
+    (over_data, queued_over_data, over_bdat, queued_over_bdat)
+}
+
 /// The two transports refuse the same message, which is what makes the bound
 /// a policy instead of a per-transport accident.
 ///
@@ -222,14 +250,8 @@ async fn the_bound_applies_without_a_verifier() {
 /// and was refused with `552`. Same limit, same message, two answers: a
 /// difference a sender can probe for, and a refusal a legitimate chunking
 /// client cannot act on.
-///
-/// Both transports are driven here, over one `max_header_bytes`, so the
-/// assertion is that the answers **match** — not that each is whatever it was
-/// last time.
 #[tokio::test(flavor = "multi_thread")]
 async fn both_transports_answer_the_same_message_the_same_way() {
-    const SMALL_HEAD: &str = "From: <a@example.net>\r\nSubject: dual\r\n\r\n";
-
     /// A body several times the header bound, as a string.
     fn big_body() -> String {
         let mut body = String::new();
@@ -240,11 +262,12 @@ async fn both_transports_answer_the_same_message_the_same_way() {
         body
     }
 
-    let head_len = SMALL_HEAD.len();
+    let head = "From: <a@example.net>\r\nSubject: dual\r\n\r\n";
     let body = big_body();
     assert!(
-        (head_len as u64) <= LIMIT,
-        "the section must fit under the bound: {head_len} vs {LIMIT}"
+        (head.len() as u64) <= LIMIT,
+        "the section must fit under the bound: {} vs {LIMIT}",
+        head.len()
     );
     assert!(
         body.len() as u64 > 2 * LIMIT,
@@ -252,24 +275,8 @@ async fn both_transports_answer_the_same_message_the_same_way() {
         body.len()
     );
 
-    // DATA: a hundred-octet head, then a body several times the bound.
-    let data_harness = Harness::start("dual-data", bounded()).await;
-    let mut client = transaction(&data_harness);
-    client.expect("DATA", 354);
-    client.send_raw(format!("{SMALL_HEAD}{body}.\r\n").as_bytes());
-    let over_data = client.read_reply().code;
-    let queued_over_data = data_harness.queued().len();
-    data_harness.stop();
-
-    // BDAT: the same octets, one chunk, `LAST`.
-    let bdat_harness = Harness::start("dual-bdat", bounded()).await;
-    let mut client = transaction(&bdat_harness);
-    let message = format!("{SMALL_HEAD}{body}").into_bytes();
-    client.pending(&message);
-    let over_bdat = client.command(&format!("BDAT {} LAST", message.len())).code;
-    let queued_over_bdat = bdat_harness.queued().len();
-    bdat_harness.stop();
-
+    let (over_data, queued_data, over_bdat, queued_bdat) =
+        both_ways("dual", format!("{head}{body}").as_bytes()).await;
     assert_eq!(
         over_data, 250,
         "a small head over DATA is accepted, whatever the body weighs"
@@ -282,17 +289,119 @@ async fn both_transports_answer_the_same_message_the_same_way() {
         over_bdat, over_data,
         "the two transports must not disagree about the same message"
     );
-    assert_eq!(queued_over_data, 1, "the DATA copy is queued");
-    assert_eq!(queued_over_bdat, 1, "the BDAT copy is queued");
+    assert_eq!(queued_data, 1, "the DATA copy is queued");
+    assert_eq!(queued_bdat, 1, "the BDAT copy is queued");
 }
 
-/// The same pair, on the refusing side: **no blank line at all** past the
-/// bound is a header section over the bound over either transport.
+/// The empty-header message: the very first line is already the blank line.
 ///
-/// This is the other half of the duality — the fix above must not have made
-/// `BDAT` permissive, only *symmetric*. A message whose head never ends is
-/// refused by `DATA` for the reason the bound exists (the verifier would hold
-/// it whole), and `BDAT` has to say the same.
+/// This is the shape a `CRLFCRLF` search cannot size. `<CRLF><CRLF>` occurs at
+/// offset 0 there — but the second of those CRLFs is the **body's first line
+/// ending**, not a blank line, and taking it as one charges the section four
+/// octets where `DATA` charges two. Every message with an empty header was
+/// then charged two octets too much over `BDAT`, and the two transports
+/// diverged for any bound within two octets of the real section.
+///
+/// Hence the **exact** body: `2 * limit - 4` octets, so the section plus the
+/// body's first line lands two octets past the limit. A small body would make
+/// this test pass under both readings — which is how the defect survived a
+/// full suite the first time. Under the `CRLFCRLF` reading the charged
+/// "section" is the blank line *plus* that first body line, which is
+/// `limit + 2`: refused. Under the line rule it is two octets: accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_header_is_the_same_two_octets_over_both_transports() {
+    // `\r\n` (the whole section) + `q` repeated + `\r\n` (the body's first
+    // line) + `tail\r\n`. The first body line must end `limit - 2` octets
+    // into the body, so `4 + (limit - 2) = limit + 2` is what a `CRLFCRLF`
+    // search would charge.
+    let limit = LIMIT as usize;
+    let mut message = b"\r\n".to_vec();
+    message.extend(std::iter::repeat_n(b'q', limit + 2 - 4 - 2));
+    message.extend_from_slice(b"\r\ntail\r\n");
+
+    let (over_data, queued_data, over_bdat, queued_bdat) = both_ways("dual-empty", &message).await;
+    assert_eq!(over_data, 250, "an empty header over DATA: {over_data}");
+    assert_eq!(
+        over_bdat, 250,
+        "an empty header over BDAT — a `CRLFCRLF` search would charge the \
+         body's first line as part of the section and answer 552: {over_bdat}"
+    );
+    assert_eq!(over_bdat, over_data, "same message, same answer");
+    assert_eq!(queued_data, 1);
+    assert_eq!(queued_bdat, 1);
+}
+
+/// The same, one line further in: `<CRLF>` (the empty first line ends the
+/// section there) then a body whose first line is long enough that a
+/// `CRLFCRLF` search would swallow it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_header_over_a_long_first_body_line_agrees() {
+    let limit = LIMIT as usize;
+    let mut message = b"\r\n".to_vec();
+    message.extend(std::iter::repeat_n(b'z', limit + 8));
+    message.extend_from_slice(b"\r\nmore body\r\n");
+    let (over_data, _, over_bdat, _) = both_ways("dual-short", &message).await;
+    assert_eq!(over_data, 250, "two octets of head over DATA");
+    assert_eq!(over_bdat, 250, "and over BDAT");
+    assert_eq!(over_bdat, over_data);
+}
+
+/// The boundary, **derived** rather than assumed: `limit` octets of section
+/// is accepted and `limit + 1` is refused, over both transports.
+///
+/// A section of exactly `limit` is not over a bound of `limit` — the
+/// comparison is strict — and the two transports have to agree about that
+/// too. The earlier plan for this test pinned `limit` on the refusing side;
+/// running it showed the boundary is one octet further out, which is the
+/// reason a calibration test exists rather than a comment saying where the
+/// line is.
+///
+/// The octets are asserted before the replies are: a fixture that is off by
+/// one would quietly move the boundary the test is supposed to measure, and
+/// the failure would look like a server bug.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bound_is_a_strict_inequality_on_both_transports() {
+    /// A header section of exactly `section` octets: one field line, then the
+    /// blank line, both counted.
+    fn head_of(section: usize) -> Vec<u8> {
+        // `X:` + padding + CRLF (the field), then the blank line's CRLF.
+        let overhead = b"X:".len() + 2 + 2;
+        assert!(section >= overhead, "a field and a blank line");
+        let mut head = b"X:".to_vec();
+        head.extend(std::iter::repeat_n(b'p', section - overhead));
+        head.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(head.len(), section, "the fixture must be exact");
+        head
+    }
+
+    let limit = LIMIT as usize;
+    // `limit` fits; the octet after it does not.
+    for (section, expected) in [(limit - 1, 250), (limit, 250), (limit + 1, 552)] {
+        let mut message = head_of(section);
+        message.extend_from_slice(b"body\r\n");
+        let (over_data, _, over_bdat, _) = both_ways(&format!("edge-{section}"), &message).await;
+        assert_eq!(
+            over_data, expected,
+            "a {section}-octet head over DATA (bound {limit}): \
+             `section > limit` is the rule"
+        );
+        assert_eq!(
+            over_bdat, expected,
+            "a {section}-octet head over BDAT (bound {limit}): same rule"
+        );
+        assert_eq!(
+            over_bdat, over_data,
+            "the boundary is the same both ways at {section} octets"
+        );
+    }
+}
+
+/// The refusing side of the duality: **no blank line at all** past the bound
+/// is a header section over the bound over either transport.
+///
+/// The fix above must not have made `BDAT` permissive, only *symmetric*. A
+/// message whose head never ends is refused by `DATA` for the reason the bound
+/// exists (the verifier would hold it whole), and `BDAT` has to say the same.
 #[tokio::test(flavor = "multi_thread")]
 async fn both_transports_refuse_a_head_that_never_ends() {
     let mut endless = String::from("From: <a@example.net>\r\n");
@@ -303,28 +412,14 @@ async fn both_transports_refuse_a_head_that_never_ends() {
         endless.len()
     );
 
-    let data_harness = Harness::start("dual-refuse-data", bounded()).await;
-    let mut client = transaction(&data_harness);
-    client.expect("DATA", 354);
-    client.send_raw(format!("{endless}.\r\n").as_bytes());
-    let over_data = client.read_reply();
-    data_harness.stop();
-
-    let bdat_harness = Harness::start("dual-refuse-bdat", bounded()).await;
-    let mut client = transaction(&bdat_harness);
-    let message = endless.into_bytes();
-    client.pending(&message);
-    let over_bdat = client.command(&format!("BDAT {} LAST", message.len()));
-    bdat_harness.stop();
-
-    for (transport, reply) in [("DATA", &over_data), ("BDAT", &over_bdat)] {
-        assert_eq!(reply.code, 552, "{transport}: {reply:?}");
-        assert_eq!(
-            reply.text, "5.3.4 Header section too large",
-            "{transport}: {reply:?}"
-        );
+    let (over_data, queued_data, over_bdat, queued_bdat) =
+        both_ways("dual-refuse", endless.as_bytes()).await;
+    for (transport, code) in [("DATA", over_data), ("BDAT", over_bdat)] {
+        assert_eq!(code, 552, "{transport}: a head with no blank line");
     }
-    assert_eq!(over_bdat.code, over_data.code, "same answer, both ways");
+    assert_eq!(over_bdat, over_data, "same answer, both ways");
+    assert_eq!(queued_data, 0);
+    assert_eq!(queued_bdat, 0);
 }
 
 /// One chunk that is *itself* larger than the bound, holding a short head and

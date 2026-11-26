@@ -655,25 +655,28 @@ impl HeaderBudget {
         }
     }
 
-    /// Counts a **whole** message assembled from elsewhere.
+    /// Charges the header section of a **whole** message assembled elsewhere.
     ///
     /// A `BDAT` chain is raw octets: by the time it is whole there are no line
-    /// boundaries left to hand to [`HeaderBudget::consume`], and feeding it the
-    /// message as one "line" would make every chained message look like a
-    /// header section the size of the message. So the section is found the way
-    /// RFC 5322 defines it — everything up to the first blank line, that line
-    /// included — and only that prefix is charged. A message with no blank
-    /// line at all has no body, and its whole length is the section, which is
-    /// the case the bound exists for.
+    /// boundaries left to hand to [`HeaderBudget::consume`], so the section is
+    /// measured over the message itself — [`header_len`] counts what `DATA`
+    /// would have charged line by line, the blank line included.
     ///
-    /// This is the same rule `DATA` applies, reached from the other side: the
-    /// two transports must refuse the same messages, or a client can pick the
-    /// one that answers what it likes.
-    fn consume_message(&mut self, message: &[u8]) {
+    /// A head whose lines do not all end in `CRLF` is not a section this
+    /// server will size, and it is not one it should accept either: `DATA`
+    /// refuses a bare `LF` outright (RFC 5321 §2.3.8; guessing at it is the
+    /// smuggling hole, CVE-2023-51764), and a chained message is the same
+    /// octets. Answering "how big is the head" for a message the other
+    /// transport would not read at all is how the two of them drift apart, so
+    /// an unreadable head reports the whole message — never under the limit,
+    /// which is what a caller must not be told about a message it cannot
+    /// parse.
+    fn charge_message(&mut self, message: &[u8]) {
         if self.ended {
             return;
         }
-        self.consumed = self.consumed.saturating_add(header_len(message) as u64);
+        let section = header_len(message).unwrap_or(message.len());
+        self.consumed = self.consumed.saturating_add(section as u64);
         self.ended = true;
     }
 
@@ -684,17 +687,65 @@ impl HeaderBudget {
 }
 
 /// How many octets of `message` are header section: up to and including the
-/// blank line that ends the section, or the whole message when it has none.
+/// blank line that ends it, or the whole message when it has none. `None` when
+/// a line in the section does not end in `CRLF` — the message is not one
+/// `DATA` would read (bare `LF` is refused outright), so there is no section
+/// to measure.
 ///
-/// The blank line is `<CRLF><CRLF>`; a message whose very first octets are the
-/// blank line has an empty header section of two octets, and a message with no
-/// such pair anywhere is all header.
-fn header_len(message: &[u8]) -> usize {
-    const BLANK_LINE: &[u8] = b"\r\n\r\n";
-    message
-        .windows(BLANK_LINE.len())
-        .position(|window| window == BLANK_LINE)
-        .map_or(message.len(), |offset| offset + BLANK_LINE.len())
+/// **It is written to agree with the `DATA` path line for line**, because the
+/// two transports must refuse the same message or a sender can shop for the
+/// answer it likes:
+///
+/// | message | section | why |
+/// |---|---|---|
+/// | `\r\n<body>` | 2 | the first line is already the blank line, and a line's `CRLF` counts |
+/// | `h\r\n\r\n<body>` | 5 | `h` + `CRLF`, then the blank line |
+/// | `h1\r\n h2\r\n\r\n<body>` | 11 | a folded field is one line, and only the empty one ends the section |
+/// | `no blank line` | all of it | no body, so the head is the message |
+///
+/// The blank line is the `CRLF` that *ends* an empty line — not the `CRLFCRLF`
+/// you get by looking for two in a row, which swallows the first octets of the
+/// body when the message starts with the blank line itself (that is the one
+/// case the two searches disagree on, and it is exactly the empty-header
+/// message). Walking line by line, an empty line is one whose `CRLF` sits
+/// immediately at the line's start, which is one forward scan and needs no
+/// look-behind.
+///
+/// That scan is single-pass and allocation-free, but it is one comparison per
+/// octet: on a 25 MiB message that is tens of milliseconds in a release build
+/// and **hundreds of milliseconds in a debug one**. It runs once per accepted
+/// chained message, after the chunks are in memory already; it is not on the
+/// `DATA` path, where lines are counted as they arrive.
+fn header_len(message: &[u8]) -> Option<usize> {
+    let mut line_start = 0usize;
+    loop {
+        // The end of the line starting at `line_start`: the next `CRLF`.
+        let line_end = match message[line_start..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        {
+            Some(found) => line_start + found + 2,
+            // No `CRLF` left. A line of content running to the end without one
+            // means the message has no blank line, so what is left is all
+            // header — the case the bound exists for. (A message that ends
+            // mid-line is the same answer: there is no body after a section
+            // that never ended.)
+            None => return Some(message.len()),
+        };
+        // The line is empty when there is nothing between its start and its
+        // own `CRLF` — and it is the blank line that ends the section.
+        if line_end - 2 == line_start {
+            return Some(line_end);
+        }
+        // A section line may not carry a bare `LF`: `DATA` refuses the whole
+        // transfer on one (RFC 5321 §2.3.8, CVE-2023-51764), so a chained
+        // message with one is not a message this server reads, and there is no
+        // section to measure.
+        if message[line_start..line_end - 2].contains(&b'\n') {
+            return None;
+        }
+        line_start = line_end;
+    }
 }
 
 /// Whether a received line (CRLF included) is the blank line that ends the
@@ -1479,13 +1530,13 @@ impl Connection {
         // charged line by line the way `DATA` charges it — a chunk is raw
         // octets with no line structure until the chain is whole — so the
         // blank line is located *in* the message here and only the section it
-        // closes is charged ([`HeaderBudget::consume_message`]). Charging the
+        // closes is charged ([`HeaderBudget::charge_message`]). Charging the
         // whole record instead would count every chained message's body as
         // header: the same message would be refused over `BDAT` and accepted
         // over `DATA`, which is a discrepancy a sender can see and a refusal a
         // legitimate chunking client can do nothing about.
         self.header = HeaderBudget::default();
-        self.header.consume_message(&record);
+        self.header.charge_message(&record);
         if self.header.over(self.config.max_header_bytes) {
             tracing::info!(
                 consumed = self.header.consumed,
@@ -2652,6 +2703,65 @@ mod tests {
         assert_eq!(max_bdat_total(25 * 1024 * 1024), 25 * 1024 * 1024);
         // A limit below what one chunk may hold cannot refuse that chunk.
         assert_eq!(max_bdat_total(1024), MAX_BDAT_BUFFER as u64);
+    }
+
+    #[test]
+    fn the_header_section_ends_with_the_blank_line_and_not_before_it() {
+        // The table the `DATA` path produces, line by line: every line of the
+        // section counts with its CRLF, and the blank line is one of them.
+        // The first row is the one a `CRLFCRLF` search gets wrong — it takes
+        // the blank line's own CRLF *and* the body's first one, so a message
+        // with no header fields at all is charged four octets over `BDAT`
+        // where `DATA` charges two.
+        let cases: &[(&str, usize)] = &[
+            // The blank line is the message's first line here, and it is the
+            // whole section: two octets. A `CRLFCRLF` search would answer four.
+            ("\r\nbody\r\n", 2),
+            ("h\r\n\r\nbody\r\n", 5),
+            ("h1\r\nh2\r\n\r\nbody\r\n", 10),
+            ("h1: a\r\n h2: b\r\n\r\nbody\r\n", 17),
+            // No blank line: the whole message is header section, and that is
+            // the shape the bound exists for.
+            ("no blank line anywhere\r\n", 24),
+            // A trailing CRLF that the body happens to start with is not a
+            // blank line of its own: the section ended at the *first* one.
+            ("h\r\n\r\n\r\nstill body\r\n", 5),
+            // Empty message: nothing to measure.
+            ("", 0),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                header_len(message.as_bytes()),
+                Some(*expected),
+                "{message:?} is {expected} octets of header section"
+            );
+        }
+    }
+
+    #[test]
+    fn a_head_with_a_bare_lf_has_no_measurable_section() {
+        // `DATA` refuses a bare LF outright (RFC 5321 §2.3.8, CVE-2023-51764),
+        // so a chained message carrying one has no header section this server
+        // would size — and it must not be reported as a small one either.
+        assert_eq!(header_len(b"h\n\r\nbody\r\n"), None);
+        assert_eq!(header_len(b"h\r\nfold\n\r\nbody\r\n"), None);
+        // A bare LF *after* the section does not matter: the section ended
+        // before it, and `DATA` would have accepted the same split.
+        assert_eq!(header_len(b"h\r\n\r\nbo\ndy\r\n"), Some(5));
+    }
+
+    #[test]
+    fn a_message_of_one_hundred_thousand_lines_is_measured_in_one_pass() {
+        // The scan is linear; this pins that it stays linear (a quadratic
+        // re-scan from every line start would take minutes here).
+        let mut message = String::with_capacity(3 * 100_000);
+        for _ in 0..100_000 {
+            message.push_str("x\r\n");
+        }
+        message.push_str("\r\nbody\r\n");
+        // 100 000 lines of `x` + CRLF, then the blank line: 3 octets each, and
+        // the blank line's own `CRLF` ends the section at 300 002.
+        assert_eq!(header_len(message.as_bytes()), Some(300_002));
     }
 
     #[test]
