@@ -537,6 +537,56 @@ fn a_chunk_over_the_buffer_is_refused_before_its_octets_are_read() {
 
 // ── AUTH (the verdicts come from the caller) ─────────────────────────────
 
+/// A submission-shaped listener that has NOT gone through STARTTLS must
+/// refuse to take a password in the clear — this is MAP rule 9, and it is
+/// the branch a configuration mistake (auth advertised, TLS forgotten)
+/// would silently walk past.
+#[test]
+fn auth_in_the_clear_is_refused_even_where_auth_is_offered() {
+    let mut session = Session::new(
+        extensions("mx.test", false, true),
+        Limits::default(),
+        AddressPolicy::from_state(&state()),
+    );
+    session.command(&Command::Ehlo("client.test".to_owned()));
+    let reply = line(&mut session, "AUTH PLAIN AHRlc3QA");
+    assert_eq!(reply.code, 538, "{reply:?}");
+    assert_eq!(session.authenticated(), None);
+}
+
+/// The bare `postmaster` spelling is qualified case-insensitively: the
+/// exemption RFC 5321 gives the name does not depend on how the client
+/// spelled it. (The parse-level acceptance is `Mailbox::parse`'s; this
+/// pins the qualification the session applies to what it accepted.)
+#[test]
+fn the_bare_postmaster_is_qualified_the_same_however_it_is_spelled() {
+    let session = greeted_inbound();
+    // Built as literals rather than through `Mailbox::parse`: the parser
+    // normalizes the bare name to lowercase on the way in, so only a
+    // hand-built path reaches `qualify` with a mixed spelling intact —
+    // and the case-insensitive rule lives in `qualify`, not the parser.
+    for spelling in ["Postmaster", "POSTMASTER", "postmaster"] {
+        let path = Mailbox::Address {
+            local: spelling.to_owned(),
+            domain: String::new(),
+            utf8: false,
+            routed: false,
+        };
+        assert_eq!(
+            session.qualify(&path).as_text(),
+            "postmaster@mx.test",
+            "{spelling} qualified wrong"
+        );
+    }
+    // A spelled-out postmaster with a domain is qualified as itself, and
+    // so is every other address.
+    let with_domain = Mailbox::parse("postmaster@example.com", false).unwrap();
+    assert_eq!(
+        session.qualify(&with_domain).as_text(),
+        "postmaster@example.com"
+    );
+}
+
 #[test]
 fn auth_is_not_offered_on_the_inbound_listener() {
     let mut session = greeted_inbound();
