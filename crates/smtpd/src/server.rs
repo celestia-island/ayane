@@ -666,18 +666,23 @@ impl HeaderBudget {
     /// server will size, and it is not one it should accept either: `DATA`
     /// refuses a bare `LF` outright (RFC 5321 §2.3.8; guessing at it is the
     /// smuggling hole, CVE-2023-51764), and a chained message is the same
-    /// octets. Answering "how big is the head" for a message the other
-    /// transport would not read at all is how the two of them drift apart, so
-    /// an unreadable head reports the whole message — never under the limit,
-    /// which is what a caller must not be told about a message it cannot
-    /// parse.
-    fn charge_message(&mut self, message: &[u8]) {
+    /// octets. So an unmeasurable head is reported as [`MalformedHead`] and the
+    /// caller refuses the message with the code `DATA` refuses it with — the
+    /// two transports must reject the same message for the same reason, not
+    /// merely agree about its size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MalformedHead`] when a line of the section does not end in
+    /// `CRLF`.
+    fn charge_message(&mut self, message: &[u8]) -> Result<(), MalformedHead> {
         if self.ended {
-            return;
+            return Ok(());
         }
-        let section = header_len(message).unwrap_or(message.len());
+        let section = header_len(message).ok_or(MalformedHead)?;
         self.consumed = self.consumed.saturating_add(section as u64);
         self.ended = true;
+        Ok(())
     }
 
     /// Whether the header section has taken more than `limit` octets.
@@ -747,6 +752,14 @@ fn header_len(message: &[u8]) -> Option<usize> {
         line_start = line_end;
     }
 }
+
+/// A reassembled message whose header section cannot be measured: one of its
+/// lines does not end in `CRLF`.
+///
+/// A unit rather than a `bool`, so a caller cannot reach the "measurable" case
+/// by forgetting to look at the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MalformedHead;
 
 /// Whether a received line (CRLF included) is the blank line that ends the
 /// message's header section.
@@ -1536,7 +1549,18 @@ impl Connection {
         // over `DATA`, which is a discrepancy a sender can see and a refusal a
         // legitimate chunking client can do nothing about.
         self.header = HeaderBudget::default();
-        self.header.charge_message(&record);
+        if self.header.charge_message(&record).is_err() {
+            // The same message over `DATA` would have been refused while it
+            // was being read; refusing it here answers the same way. `554` is
+            // the reply the session gives a transaction it did not complete
+            // (`end_of_message(false)`), which is exactly what the `DATA` path
+            // sends for a bare `LF` — so a client sees one answer per
+            // transport, and not a `250` from the transport that never looked.
+            tracing::info!("chained message has a bare LF in its header section, refusing");
+            staged.abandon();
+            self.session.fail_data();
+            return self.reply_end(false).await;
+        }
         if self.header.over(self.config.max_header_bytes) {
             tracing::info!(
                 consumed = self.header.consumed,

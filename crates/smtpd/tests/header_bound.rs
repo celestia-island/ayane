@@ -346,6 +346,49 @@ async fn an_empty_header_over_a_long_first_body_line_agrees() {
     assert_eq!(over_bdat, over_data);
 }
 
+/// A head with a bare `LF` is refused by both transports, with the same code.
+///
+/// `DATA` refuses a bare `LF` outright rather than guessing at it — treating
+/// it as a line break is the SMTP smuggling hole (CVE-2023-51764), so the
+/// whole transfer fails with the transaction's `554 5.6.0`. A chained message
+/// carrying the same octets has to be refused too, and for the same reason:
+/// answering it `250` because the chunk arrived in one piece would make the
+/// two transports disagree about whether the message is readable at all —
+/// a larger disagreement than the size one, since here one of them would be
+/// accepting octets the other will not parse.
+///
+/// The message is small on purpose (25 octets): the refusal must come from
+/// the malformed line, not from any size bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_lf_in_the_head_is_refused_by_both_transports() {
+    let message = b"Subject: x\nfake\r\n\r\nbody\r\n";
+    assert_eq!(message.len(), 25, "small enough that no bound applies");
+    let (over_data, queued_data, over_bdat, queued_bdat) = both_ways("dual-bare-lf", message).await;
+    assert_eq!(
+        over_data, 554,
+        "DATA fails the transaction on a bare LF: {over_data}"
+    );
+    assert_eq!(
+        over_bdat, 554,
+        "and BDAT must not answer 250 to octets DATA refuses: {over_bdat}"
+    );
+    assert_eq!(over_bdat, over_data, "one answer per transport");
+    assert_eq!(queued_data, 0, "nothing is queued over DATA");
+    assert_eq!(queued_bdat, 0, "nothing is queued over BDAT");
+}
+
+/// The same, with the bare `LF` in a folded line rather than the first field:
+/// the rejection cannot be a "the first line looks odd" shortcut.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_lf_in_a_folded_head_line_is_refused_by_both_transports() {
+    let message = b"Subject: ok\r\n bad\nline\r\n\r\nbody\r\n";
+    let (over_data, _, over_bdat, queued_bdat) = both_ways("dual-bare-lf-fold", message).await;
+    assert_eq!(over_data, 554, "DATA: {over_data}");
+    assert_eq!(over_bdat, 554, "BDAT: {over_bdat}");
+    assert_eq!(over_bdat, over_data);
+    assert_eq!(queued_bdat, 0);
+}
+
 /// The boundary, **derived** rather than assumed: `limit` octets of section
 /// is accepted and `limit + 1` is refused, over both transports.
 ///
