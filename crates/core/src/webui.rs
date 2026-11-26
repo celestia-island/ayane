@@ -15,6 +15,24 @@ use rust_embed::RustEmbed;
 #[folder = "$CARGO_MANIFEST_DIR/../../packages/webui/dist"]
 struct Assets;
 
+/// The SPA shell as a string: exactly the bytes `GET /` and every SPA
+/// route are answered with.
+///
+/// The error landing hands this to
+/// [`plana_error_landing::ErrorLanding`], which embeds the failed
+/// navigation's status, code and copy as a `<script type="application/json"
+/// id="hk-server-error">` island inside it. Reading the same asset the SPA
+/// is served from is what keeps the landing and the app one document.
+///
+/// `None` when the front end was never built — the layer is then
+/// [`plana_error_landing::ErrorLanding::disabled`] and every error keeps
+/// its plain JSON body.
+#[must_use]
+pub fn index_shell() -> Option<String> {
+    let index = Assets::get("index.html")?;
+    String::from_utf8(index.data.into_owned()).ok()
+}
+
 /// Serve one static asset, or `index.html` for SPA routes.
 ///
 /// A path under `/api/` that reached this fallback matched no API route

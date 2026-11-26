@@ -109,6 +109,14 @@ name = "kirino-macro"
 expression = "LicenseRef-SySL-1.0"
 license-files = [{ path = "LICENSE", hash = 0x629cea03 }]
 
+# The family error landing (plana, git master): the same SySL 1.0 text as the
+# rows above, read from the workspace root it shares (hash = plana's own
+# LICENSE at 0.8.1, the file the sibling repos pin for the same purpose).
+[[licenses.clarify]]
+name = "plana-error-landing"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0xda2b7c13 }]
+
 [[licenses.clarify]]
 name = "ring"
 expression = "MIT AND ISC AND OpenSSL"
@@ -125,3 +133,8 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# plana's error landing is not published on crates.io, so it rides the plana
+# master branch (same allow-list entry as the sibling repos).
+allow-git = [
+    "https://github.com/celestia-island/plana",
+]

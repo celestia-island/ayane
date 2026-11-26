@@ -236,6 +236,7 @@ dependencies = [
  "hickory-resolver",
  "kirino",
  "lettre",
+ "plana-error-landing",
  "reqwest",
  "rust-embed",
  "serde",
@@ -2402,6 +2403,20 @@ checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
 dependencies = [
  "der 0.8.3",
  "spki 0.8.1",
+]
+
+[[package]]
+name = "plana-error-landing"
+version = "0.8.1"
+source = "git+https://github.com/celestia-island/plana?branch=master#68e554f37c1f90242b2605f4aaab1be6da74e0d7"
+dependencies = [
+ "axum",
+ "http",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
