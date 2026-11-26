@@ -102,6 +102,53 @@ const NAVIGATION: &[(&str, &str)] = &[
 const UNAUTHORIZED_JSON: &str = "/api/v1/state";
 
 #[tokio::test]
+async fn the_landing_shell_is_the_document_the_spa_is_served() {
+    // The landing must not carry a copy of the shell: the bytes the layer
+    // wraps are `index_shell()`, and `GET /` answers from the same asset.
+    let app = fixture("shell");
+    let served = send(&app, "GET", "/", NAVIGATION).await;
+    assert_eq!(served.status(), StatusCode::OK);
+    let served_bytes = to_bytes(served.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let handed = ayane::webui::index_shell().expect("the front end is built");
+    assert_eq!(
+        served_bytes.to_vec(),
+        handed.as_bytes(),
+        "`GET /` and `index_shell()` must be the same bytes"
+    );
+
+    // And the shell the landing embeds starts from exactly those bytes:
+    // the island is inserted into the document, nothing is rewritten.
+    let landed = send(&app, "GET", UNAUTHORIZED_JSON, NAVIGATION).await;
+    assert_eq!(landed.status(), StatusCode::UNAUTHORIZED);
+    let landed_body = body_text(landed).await;
+    let island_at = landed_body
+        .find("</head>")
+        .expect("the shell keeps its head");
+    let without_island: String = {
+        // Drop the injected island element, then the body must be the
+        // served document again.
+        let start = landed_body
+            .find(r#"<script type="application/json" id="hk-server-error">"#)
+            .expect("the island is in the landing");
+        let end = landed_body[start..]
+            .find("</script>")
+            .map(|offset| start + offset + "</script>".len())
+            .expect("the island is closed");
+        format!("{}{}", &landed_body[..start], &landed_body[end..])
+    };
+    assert!(
+        island_at < landed_body.len(),
+        "the island sits inside the shell's head"
+    );
+    assert_eq!(
+        without_island, handed,
+        "the landing is the served shell plus the island, byte for byte"
+    );
+}
+
+#[tokio::test]
 async fn a_navigation_to_a_json_error_lands_on_the_shell() {
     let app = fixture("document");
     let response = send(&app, "GET", UNAUTHORIZED_JSON, NAVIGATION).await;
@@ -259,26 +306,50 @@ async fn the_socket_and_machine_surfaces_keep_their_bodies() {
         "the machine surface keeps its JSON-RPC error"
     );
 
-    // The socket upgrade is refused by its own cross-origin guard as a
-    // plain-text 403 — and an upgrade is never a navigation, so the
-    // refusal reaches the caller as text. (A handshake needs a real
-    // server: the upgrade extractor takes an extension only the HTTP
-    // connection inserts, so `oneshot` answers 426 to every handshake.)
+    // An Upgrade request WITHOUT `Sec-Fetch-Dest` and WITHOUT an `Accept`
+    // naming HTML: the Accept fallback is false too, so the only thing that
+    // can keep this out of the landing is plana's Upgrade short-circuit —
+    // the point of this pin. (A handshake needs a real server: the upgrade
+    // extractor takes an extension only the HTTP connection inserts, so
+    // `oneshot` answers 426 to every handshake.)
     let addr = serve(app).await;
-    let head = upgrade_head(addr, "mail.example.test", Some("https://evil.test")).await;
+
+    let bare = upgrade_head(addr, "mail.example.test", Some("https://evil.test"), false).await;
     assert_eq!(
-        status_of(&head),
+        status_of(&bare),
         403,
-        "a foreign origin is refused by the handler, got {head:?}"
+        "a foreign origin is refused by the handler, got {bare:?}"
     );
     assert!(
-        head.to_ascii_lowercase()
+        bare.to_ascii_lowercase()
             .contains("content-type: text/plain"),
-        "the refusal keeps its plain-text content type: {head:?}"
+        "the bare upgrade keeps its plain-text refusal: {bare:?}"
     );
     assert!(
-        !head.contains("hk-server-error"),
-        "an upgrade is never rewritten into a document: {head:?}"
+        !bare.contains("hk-server-error") && !bare.to_ascii_lowercase().contains("text/html"),
+        "an upgrade with neither Sec-Fetch-Dest nor an HTML Accept is never \
+         rewritten into the landing: {bare:?}"
+    );
+
+    // The same shape on a GOOD origin: the handshake succeeds (101), which
+    // also proves the layer let the upgrade through untouched.
+    let accepted = upgrade_head(
+        addr,
+        "mail.example.test",
+        Some("https://mail.example.test"),
+        false,
+    )
+    .await;
+    assert_eq!(
+        status_of(&accepted),
+        101,
+        "a same-origin upgrade still upgrades: {accepted:?}"
+    );
+    assert!(
+        accepted
+            .to_ascii_lowercase()
+            .contains("sec-websocket-accept:"),
+        "the upgrade is the socket's, not a document: {accepted:?}"
     );
 }
 
@@ -297,17 +368,23 @@ async fn serve(app: Router) -> std::net::SocketAddr {
 /// One WebSocket handshake as a browser opens it — a raw HTTP/1.1 upgrade
 /// with every header the upgrade needs, the browser's `Sec-Fetch-Dest`
 /// included. Answers the head of the reply (status line and headers).
-async fn upgrade_head(addr: std::net::SocketAddr, host: &str, origin: Option<&str>) -> String {
+async fn upgrade_head(
+    addr: std::net::SocketAddr,
+    host: &str,
+    origin: Option<&str>,
+    browser_fetch_headers: bool,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let mut request = format!(
         "GET /api/ws HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
-         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-         Sec-Fetch-Dest: websocket\r\n\
-         Sec-Fetch-Mode: websocket\r\n\
-         Accept: */*\r\n"
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
     );
+    if browser_fetch_headers {
+        request
+            .push_str("Sec-Fetch-Dest: websocket\r\nSec-Fetch-Mode: websocket\r\nAccept: */*\r\n");
+    }
     if let Some(origin) = origin {
         request.push_str(&format!("Origin: {origin}\r\n"));
     }
