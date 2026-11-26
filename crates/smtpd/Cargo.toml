@@ -13,6 +13,7 @@ readme = "../../README.md"
 ayane-mail = { workspace = true }
 ayane-proto = { workspace = true }
 base64 = { workspace = true }
+mail-auth = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -20,6 +21,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true }
 uuid = { workspace = true }
 
 [lints]

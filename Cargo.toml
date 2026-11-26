@@ -41,6 +41,9 @@ futures-util = { version = "^0.3", default-features = false }
 # mail: client side only — the MTA stays Postfix, so nothing here listens on 25.
 lettre = { version = "^0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1"] }
 # message parsing + safe html + hashing + dns
+# trust verification (SPF / DKIM / ARC / DMARC) — the second consumer of
+# hickory-resolver, pinned to the same 0.26 line the workspace already resolves.
+mail-auth = { version = "^0.16", default-features = false, features = ["dns-hickory", "webpki-roots", "rust-crypto", "arc"] }
 mail-parser = "^1"
 ammonia = "^4"
 hickory-resolver = { version = "^0.26", features = ["tokio", "system-config"] }
