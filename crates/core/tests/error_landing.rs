@@ -5,7 +5,7 @@
 //! hikari's `createErrorReporting` paints the unified card instead of the
 //! browser showing a tab of raw JSON. Everything that is not a navigation
 //! keeps its bytes: a `fetch` caller still reads `{"error": …}`, a socket
-//! upgrade is never rewritten, and a success is untouched.
+//! upgrade stays out of the rewrite path, and a success is untouched.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -422,7 +422,7 @@ async fn upgrade_head(
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await.expect("send");
     // The head ends at the first empty line; the body (for an accepted
-    // upgrade, the socket itself) is never read.
+    // upgrade, the socket itself) stays unread.
     let mut head = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
