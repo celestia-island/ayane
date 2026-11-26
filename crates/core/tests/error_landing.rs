@@ -10,10 +10,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
+use axum::Router;
 use tower::ServiceExt;
 
 use ayane::config::Config;
@@ -193,7 +193,7 @@ async fn a_client_without_fetch_metadata_is_judged_by_its_accept() {
     // this a navigation, so the landing answers it.
     let app = fixture("accept-only");
     let accepted: &[(&str, &str)] = &[("accept", "text/html,application/xhtml+xml,*/*;q=0.8")];
-    let served = send(&app, "GET", UNAUTHORIZED_JSON, &accepted).await;
+    let served = send(&app, "GET", UNAUTHORIZED_JSON, accepted).await;
     assert_eq!(served.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         header_of(&served, "content-type"),
@@ -209,7 +209,7 @@ async fn a_client_without_fetch_metadata_is_judged_by_its_accept() {
     // metadata and no html range is not a navigation.
     let app = fixture("accept-json");
     let json_only: &[(&str, &str)] = &[("accept", "application/json, text/plain")];
-    let kept = send(&app, "GET", UNAUTHORIZED_JSON, &json_only).await;
+    let kept = send(&app, "GET", UNAUTHORIZED_JSON, json_only).await;
     assert_eq!(
         header_of(&kept, "content-type"),
         "application/json",
