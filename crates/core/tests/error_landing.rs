@@ -10,10 +10,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::{to_bytes, Body};
+use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
-use axum::Router;
 use tower::ServiceExt;
 
 use ayane::config::Config;
@@ -183,6 +183,37 @@ async fn a_navigation_to_a_json_error_lands_on_the_shell() {
     assert!(
         body.trim_start().starts_with("<!doctype html") || body.trim_start().starts_with("<html"),
         "a navigation gets the shell, not the bare JSON document: {body:.200}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_without_fetch_metadata_is_judged_by_its_accept() {
+    // The pre-Sec-Fetch shape (an old proxy strips the header, a text
+    // browser sends none): the Accept range naming text/html is what makes
+    // this a navigation, so the landing answers it.
+    let app = fixture("accept-only");
+    let accepted: &[(&str, &str)] = &[("accept", "text/html,application/xhtml+xml,*/*;q=0.8")];
+    let served = send(&app, "GET", UNAUTHORIZED_JSON, &accepted).await;
+    assert_eq!(served.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        header_of(&served, "content-type"),
+        "text/html; charset=utf-8",
+        "an Accept naming text/html is a navigation"
+    );
+    assert!(
+        body_text(served).await.contains("hk-server-error"),
+        "the island rides the shell"
+    );
+
+    // The same client type asking for JSON keeps the JSON: no Sec-Fetch
+    // metadata and no html range is not a navigation.
+    let app = fixture("accept-json");
+    let json_only: &[(&str, &str)] = &[("accept", "application/json, text/plain")];
+    let kept = send(&app, "GET", UNAUTHORIZED_JSON, &json_only).await;
+    assert_eq!(
+        header_of(&kept, "content-type"),
+        "application/json",
+        "an Accept without text/html is not a navigation"
     );
 }
 
