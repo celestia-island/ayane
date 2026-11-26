@@ -264,6 +264,31 @@ impl Spool {
         }
     }
 
+    /// `fsync` the message file, reporting it to the observer *only when the
+    /// call succeeded* — the same shape as [`Spool::sync_dir`], so the report
+    /// and the sync are one event.
+    ///
+    /// The handle is taken by value so this is the only place a message file
+    /// can be synced: a commit cannot report `FsyncKind::File` while syncing
+    /// somewhere else, because it no longer has anything to sync.
+    ///
+    /// # Test reach
+    ///
+    /// Deleting the `sync_all` below is **not** observable from a test: with
+    /// an honest observer the file report comes from here, and the file report
+    /// is the only evidence any test in this crate can see — an in-process
+    /// test cannot observe whether a `fsync` really reached the medium (no
+    /// allocator hook, no `/proc` state and no `fdinfo` field moves). The
+    /// direction that *is* guarded is the honest one: no sync, no report.
+    /// The reverse — a report without a sync — is guarded by construction
+    /// (one sync site, taking the handle) and by review, not by a test.
+    fn sync_file(&self, file: File) -> io::Result<()> {
+        file.sync_all()?;
+        drop(file);
+        self.note_fsync(FsyncKind::File);
+        Ok(())
+    }
+
     /// `fsync` the directory `dir`, reporting it to the observer.
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         let result = fsync_dir(dir);
@@ -675,17 +700,14 @@ impl StagedMessage {
         //    exactly `offset` octets at 0 fills that hole rather than
         //    clobbering the message — the single head is clarity, not a
         //    correctness fix.)
-        if let Err(err) = file.sync_all() {
-            drop(file);
+        // The contract's first half: the octets are on the medium before any
+        // name points at them. `sync_file` takes the handle and reports the
+        // call *only when it succeeded* — the file half of the same rule
+        // `Spool::sync_dir` applies to the directory half.
+        if let Err(err) = self.spool.sync_file(file) {
             self.discard();
             return Err(err);
         }
-        drop(file);
-        // The contract's first half: the octets are on the medium before any
-        // name points at them. The call is reported to the observer *only when
-        // it succeeded*, so a test asserting the order is also asserting that
-        // a returned `Ok` means the sync happened.
-        self.spool.note_fsync(FsyncKind::File);
         if let Some(hook) = self.spool.hooks.after_file_sync() {
             hook(&self.id);
         }
@@ -1080,10 +1102,12 @@ mod tests {
         // The durability contract is an order, so the test asserts the order:
         // `fsync(file)` before the renames (the octets must be on the medium
         // before a name points at them) and `fsync(dir)` after them (the names
-        // must be on the medium before the client is told). Deleting either
-        // call leaves this list short, which no crash test can observe because
-        // a crash between the two only differs when the page cache is really
-        // lost.
+        // must be on the medium before the client is told). No crash test can
+        // observe either call — a crash between the two only differs when the
+        // page cache is really lost — so the report is the evidence, and the
+        // report is only issued by a successful sync (`Spool::sync_file`,
+        // `Spool::sync_dir`). Deleting either call therefore deletes its entry
+        // here. `a_failed_stage_syncs_nothing` is the negative control.
         let root = temp_root("fsync-order");
         let spool = Spool::open(&root).expect("spool");
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -1101,6 +1125,31 @@ mod tests {
             order,
             vec![FsyncKind::File, FsyncKind::Dir],
             "the commit must fsync the message, then the directory, in that order"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn commit_with_prepend_reports_the_same_sync_order() {
+        // The prepend path has its own `fsync(file)` call site; both files of
+        // the contract must be reported there too, in the same order.
+        let root = temp_root("fsync-order-prepend");
+        let spool = Spool::open(&root).expect("spool");
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        spool.set_fsync_observer(Arc::new(move |kind| {
+            sink.lock().expect("observer").push(kind);
+        }));
+        let id = spool.next_id();
+        let mut staged = spool.stage(&id, envelope(&id)).expect("stage");
+        staged.write(b"Subject: hi\r\n\r\nbody\r\n").expect("write");
+        staged
+            .commit_with_prepend(b"Received: from client.test\r\n")
+            .expect("prepend commit");
+        assert_eq!(
+            recorded.lock().expect("observer").clone(),
+            vec![FsyncKind::File, FsyncKind::Dir],
+            "the prepend commit must fsync the message, then the directory"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1431,6 +1480,44 @@ mod tests {
             "two hours untouched makes it a leftover"
         );
         assert!(!young.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_keeps_a_file_that_is_open_even_when_its_pid_is_dead() {
+        // S2-2: the order of the rules is load-bearing. A file somebody holds
+        // open is live no matter what its id says — the pid can be dead (a
+        // pid reused by another tool, a file copied in) or the mtime can be
+        // ancient (a slow writer). The open-handle check must win over both,
+        // or the sweep deletes a descriptor that is still being written.
+        let root = temp_root("open-beats-pid");
+        let spool = Spool::open(&root).expect("spool");
+        let tmp = root.join("tmp");
+        let dead = dead_id();
+        let held = tmp.join(format!("{dead}.eml"));
+        write_residue(&held);
+        age_to(&held, TMP_RESIDUE_AGE + Duration::from_secs(3600));
+        // Held open for the duration of the recovery below (as a writer
+        // mid-receive would hold it), with a dead id and a stale mtime.
+        let handle = File::options()
+            .write(true)
+            .open(&held)
+            .expect("hold it open");
+
+        let report = spool.recover().expect("recover");
+        assert_eq!(
+            report.tmp_removed, 0,
+            "an open file is live, whatever its id and age say"
+        );
+        assert!(report.failed.is_empty());
+        assert!(held.exists(), "the open file must still be there");
+        drop(handle);
+
+        // The control: the same file, no longer held, is swept now that the
+        // id is dead — the age and id rules do fire once nobody holds it.
+        let report = spool.recover().expect("recover");
+        assert_eq!(report.tmp_removed, 1);
+        assert!(!held.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
