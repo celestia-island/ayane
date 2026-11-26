@@ -28,21 +28,58 @@
 //! A message may arrive either as lines followed by `.` or as a chain of
 //! opaque octets, and everything this module decides about it — the size, the
 //! header section, the bare `LF` — is decided over the **same bytes**. So the
-//! invariant is stronger than "both transports work": **for any byte sequence,
-//! `DATA` and `BDAT` accept or reject it identically, with the same code and
-//! the same text.** Anything less is a probe a sender can run: send the shape
-//! that gets `250` from one transport and the octets are in the queue without
-//! ever meeting the rule the other transport applies, which is exactly the
-//! shape of CVE-2023-51764 (an octet sequence that is one message to a lenient
-//! reader and two to a strict one).
+//! invariant is stronger than "both transports work": **for one wire form of a
+//! message — its octets followed by a `.<CRLF>` terminator — `DATA` and `BDAT`
+//! accept or reject it identically, with the same code, the same text and the
+//! same effect on the queue.** Anything less is a probe a sender can run: send
+//! the shape that gets `250` from one transport and the octets are in the queue
+//! without ever meeting the rule the other transport applies, which is exactly
+//! the shape of CVE-2023-51764 (an octet sequence that is one message to a
+//! lenient reader and two to a strict one).
+//!
+//! # Where the two transports genuinely differ
+//!
+//! "One wire form" is doing real work in that sentence, and the difference is
+//! protocol, not policy — no implementation can make it go away:
+//!
+//! - **`DATA` has a terminator and framing; `BDAT` has neither.** A `DATA`
+//!   transfer ends at a `.<CRLF>` line, and a line that starts with `.` on the
+//!   wire lost one dot to dot-stuffing. A chunk is opaque octets: a `.<CRLF>`
+//!   inside one is message *content*, and `BDAT … LAST` is what ends the
+//!   message. So a wire that contains a `.<CRLF>` is two different things to
+//!   the two transports — which is why the duality above is stated for the
+//!   octets **plus** a terminator, and why `tests/header_bound.rs` sends every
+//!   compared message that way.
+//! - **What may follow the end of a transfer.** In `DATA`, commands may
+//!   already be pipelined behind the terminator, and a server must not read
+//!   them as message content. In `BDAT`, the octets of the next chunk follow
+//!   the command that asked for them, and nothing else does.
+//!
+//! What is **not** a license for the two to differ is the bytes of the message
+//! itself: a bare `LF` anywhere in what the sender calls one message is refused
+//! by both, in the head and in the body alike. That is the rule this module's
+//! scans exist to keep symmetrical.
+//!
+//! One more boundary, because it reads like a violation and is not: after a
+//! **failed** `DATA` transfer, the octets the sender wrote up to (and behind)
+//! the next `<CRLF>.<CRLF>` are discarded rather than executed — the upload of
+//! a refused message is never a channel for commands. That is stricter than
+//! "what follows a terminator is commands", and deliberately so: nothing in a
+//! failed transfer was acknowledged, so nothing in it can be trusted to be a
+//! command. See `Connection::discard_buffered_data`.
 //!
 //! | Decision | `DATA` | `BDAT` |
 //! |---|---|---|
-//! | bare `LF` in the header section | refused on the line (`554 5.6.0`) | [`header_len`], through [`MalformedHead`] |
-//! | bare `LF` in the body | refused on the line (`554 5.6.0`) | [`scan_record`], through [`MalformedBody`] |
-//! | header section past the bound | charged per line (`552 5.3.4`) | [`HeaderBudget::charge_message`] (`552 5.3.4`) |
+//! | bare `LF` in the header section | refused on the line (`554 5.6.0`) | `header_len`, reported as `MalformedHead` |
+//! | bare `LF` in the body | refused on the line (`554 5.6.0`) | `scan_record`, reported as `MalformedBody` |
+//! | header section past the bound | charged per line (`552 5.3.4`) | `HeaderBudget::charge_message` (`552 5.3.4`) |
 //! | message past the size | refused while reading (`552`) | declared size, by the session |
 //! | a valid message | `250`, queued | `250`, queued |
+//!
+//! The names in the `BDAT` column are private functions of this module, so they
+//! are plain code here rather than links: the table is about *where* the
+//! decision is made, and the public surface does not need a second name for
+//! any of it.
 //!
 //! The body row is the one that is easy to lose: a chunk has no line
 //! structure, so nothing refuses a `LF` inside it unless a scan is written for
@@ -643,6 +680,11 @@ struct Connection {
     session: Session,
     /// Octets read from the socket but not yet consumed. STARTTLS discards it.
     read_buf: Vec<u8>,
+    /// The rest of a message transfer that is being thrown away: octets read
+    /// from the socket while a `DATA` upload is drained go here and nowhere
+    /// else, so nothing in them is ever executed as a command. `None` outside
+    /// a failed transfer.
+    discard: Option<Vec<u8>>,
     auth_state: Option<AuthState>,
     tls: bool,
     /// A second handle on the socket, for the failed-handshake close.
@@ -1090,6 +1132,7 @@ impl Connection {
             config,
             session,
             read_buf: Vec::with_capacity(4096),
+            discard: None,
             auth_state: None,
             tls: secure,
             socket,
@@ -1471,15 +1514,15 @@ impl Connection {
                 Err(reason) => {
                     tracing::info!(reason, "DATA transfer rejected");
                     staged.abandon();
-                    // A bare-LF failure happens *on* the terminator the client
-                    // sent: there is nothing buffered ahead of it to throw
-                    // away, and the client is waiting for the answer. Every
-                    // other failure sees an uploading client.
-                    // A bare-LF failure happens on the terminator the client
-                    // sent; every other failure sees an uploading client.
-                    let saw_terminator = !reason.starts_with("Bare LF");
-                    self.finish_failed_transfer(saw_terminator, deadline, true)
-                        .await?;
+                    // The rest of the upload is body, including any `.<CRLF>`
+                    // line in it and everything behind that line: it is all
+                    // drained into the discard buffer, never read back as
+                    // commands. A bare `LF` is not a terminator, so a sender
+                    // that puts one on the wire chooses where this drain ends
+                    // — and for exactly that reason what it drains is thrown
+                    // away rather than transacted (see
+                    // [`Connection::discard_buffered_data`]).
+                    self.finish_failed_transfer(deadline, true).await?;
                     self.session.fail_data();
                     return self.reply_end(false).await;
                 }
@@ -1494,7 +1537,7 @@ impl Connection {
                 staged.abandon();
                 // The refused message's remaining octets are body: they are
                 // drained, never executed.
-                self.finish_failed_transfer(true, deadline, false).await?;
+                self.finish_failed_transfer(deadline, false).await?;
                 self.session.fail_data();
                 return self.reply_end(false).await;
             }
@@ -1516,7 +1559,7 @@ impl Connection {
                 // The message is refused at the point its head outgrew the
                 // bound; the rest of the upload is still body and is drained,
                 // never executed.
-                self.finish_failed_transfer(true, deadline, false).await?;
+                self.finish_failed_transfer(deadline, false).await?;
                 self.session.fail_data();
                 let reply = header_too_large();
                 self.write(&reply).await?;
@@ -1525,7 +1568,7 @@ impl Connection {
             if let Err(err) = staged.write(&octets) {
                 tracing::error!(%err, "spool write failed");
                 staged.abandon();
-                self.finish_failed_transfer(true, deadline, false).await?;
+                self.finish_failed_transfer(deadline, false).await?;
                 self.session.fail_data();
                 return self.reply_end(false).await;
             }
@@ -1781,40 +1824,46 @@ impl Connection {
     /// reading from the socket as needed. Returns `false` when the client
     /// stopped sending (EOF or the transaction timer), which the caller
     /// answers by closing rather than by waiting.
-    async fn drain_until_dot(&mut self, from: usize, deadline: tokio::time::Instant) -> bool {
+    async fn drain_until_dot(&mut self, deadline: tokio::time::Instant) -> bool {
         // A single read may return less than everything the client wrote, so
         // keep reading until the terminator is in the buffer or the stream
         // ends; the buffer is scanned before every read.
+        //
+        // Each pass starts three octets back from where the last one stopped
+        // looking, which is all a terminator arriving in pieces needs: `\r`,
+        // `\r\n` and `\r\n.` are the only prefixes that can turn into a hit
+        // when more octets arrive, and the longest is three. The first pass
+        // starts at 0 — the buffer's front is exactly where a `.<CRLF>` line
+        // already sits when the failing transfer had one buffered
+        // ([`Connection::discard_buffered_data`] hands this drain everything
+        // that was ahead of it), and a cursor that started at the buffer's
+        // length would step over that terminator: the drain would then wait out
+        // the transaction timer for an answer the client had already supplied.
         let mut prefill = 64 * 1024;
-        let mut start = from;
+        let mut scanned = 0usize;
         loop {
-            if start >= 3 {
-                start -= 3;
-            } else {
-                start = 0;
-            }
-            if let Some(position) = self.find_terminator_from(start) {
-                self.read_buf.drain(..position);
+            let discard = self.discard.as_deref().unwrap_or_default();
+            if let Some(position) = find_terminator(discard, scanned) {
+                if let Some(buffer) = &mut self.discard {
+                    buffer.drain(..position);
+                }
                 return true;
             }
-            if prefill > 0 {
-                let before = self.read_buf.len();
-                match self.fill_available(prefill, deadline).await {
-                    Ok(0) => return false,
-                    Ok(read) => {
-                        // Continue the scan from where the last one stopped and
-                        // widen each read so a big body is not read a page at
-                        // a time.
-                        start = before;
-                        prefill = read.saturating_mul(4).min(1024 * 1024);
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::TimedOut => return false,
-                    Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return false,
-                    Err(_) => return false,
-                }
-                continue;
+            scanned = discard.len().saturating_sub(3);
+            if prefill == 0 {
+                return false;
             }
-            return false;
+            match self.fill_available(prefill, deadline).await {
+                Ok(0) => return false,
+                Ok(read) => {
+                    // Widen each read so a big body is not read a page at a
+                    // time.
+                    prefill = read.saturating_mul(4).min(1024 * 1024);
+                }
+                Err(err) if err.kind() == io::ErrorKind::TimedOut => return false,
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return false,
+                Err(_) => return false,
+            }
         }
     }
 
@@ -1850,7 +1899,16 @@ impl Connection {
             Ok(Ok(read)) => read,
             Ok(Err(err)) => return Err(err),
         };
-        self.read_buf.extend_from_slice(&buffer[..read]);
+        // While a failed transfer is being drained, what arrives is message
+        // octets, not commands: it goes to the discard buffer, which the
+        // command reader never looks at. Reading it into `read_buf` would make
+        // the octets a client sent *after* its terminator executable, which is
+        // the second half of the smuggling this drain exists to prevent (see
+        // [`Connection::discard_buffered_data`]).
+        match &mut self.discard {
+            Some(discard) => discard.extend_from_slice(&buffer[..read]),
+            None => self.read_buf.extend_from_slice(&buffer[..read]),
+        }
         Ok(read)
     }
 
@@ -1973,34 +2031,49 @@ impl Connection {
         Ok(())
     }
 
-    /// Throws away everything already read past the end of `DATA`, up to and
-    /// including the terminator.
+    /// Throws away everything already read past the end of a **failed**
+    /// `DATA` transfer, up to and including the terminator, and stops the
+    /// command reader from seeing anything the client sends after it.
     ///
-    /// A body over a line bound is failed *after* it was received; what the
-    /// client already sent past the failing point is still in the read buffer
-    /// and would otherwise be executed as commands — the exact desync a
-    /// smuggling test looks for. Draining here makes the reset complete before
-    /// the 554 goes out.
-    fn drain_buffered_data(&mut self, saw_terminator: bool) {
-        // When the terminator is already here, the body is complete: cut it
-        // there and keep whatever follows (a pipelined next command).
-        if let Some(position) = self.find_terminator_from(0) {
-            self.read_buf.drain(..position);
-            return;
-        }
-        // It is not here. When the transfer failed on a line, the client is
-        // still uploading, and those octets are body that must never be
-        // executed as commands: the buffer goes, up to a possible prefix of
-        // the terminator (`\r`, `\r\n`, `\r\n.`), and `drain_until_dot` throws
-        // away the rest. When the transfer failed on the terminator itself (a
-        // bare LF) nothing ahead of it was received, so nothing is thrown
-        // away and the client is answered at once.
-        if !saw_terminator {
-            return;
-        }
-        let keep = prefix_of_terminator(&self.read_buf);
-        let drain = self.read_buf.len() - keep;
-        self.read_buf.drain(..drain);
+    /// A body over a line bound, or a line with a bare `LF`, is failed *after*
+    /// it was received; what the client already sent past the failing point is
+    /// still in the read buffer and would otherwise be executed as commands —
+    /// the exact desync a smuggling test looks for. Draining here makes the
+    /// reset complete before the `554` goes out.
+    ///
+    /// # Why the octets after the terminator are discarded too
+    ///
+    /// The terminator that ends this drain is a **`.<CRLF>` line**, whatever
+    /// came before it. A `DATA` transfer that is already failing therefore
+    /// stops at the first `.<CRLF>` in the stream — including one the sender
+    /// put behind a bare `LF` (`…\r\nprompt\n.\r\nMAIL FROM:<evil@…>\r\n…`),
+    /// where the drain's first terminator candidate is that line. Everything
+    /// from the failing octet to that line is body: it was never acknowledged,
+    /// never queued, and it is being thrown away right here. Handing it, or
+    /// what follows it, back to the command reader would turn "the server
+    /// refused this transfer" into "the server transacted whatever the sender
+    /// put behind its terminator", and a sender that controls the terminator
+    /// can put a whole forged transaction there. So the drain's octets go to
+    /// [`Connection::discard`] instead of [`Connection::read_buf`], and the
+    /// buffer — including whatever `read_buf` already held past the failing
+    /// point — is dropped.
+    ///
+    /// What that costs is pipelining *behind a failed transfer*, and that is
+    /// the point: after a failure the only safe thing for a transfer to leave
+    /// in the stream is nothing. A client that pipelines its next command
+    /// behind an upload it has not been told about yet is not a client this
+    /// server can keep in step — the connection is already in the middle of a
+    /// message that is going to be discarded, and the next thing it would
+    /// read is command text chosen by whoever wrote that message.
+    ///
+    /// When the transfer failed **on** the octets it sent, this is the same
+    /// thing with a shorter drain: the `.<CRLF>` is the next thing in the
+    /// buffer, so the drain ends immediately and the client is answered at
+    /// once. There is deliberately no short-cut that skips the drain for that
+    /// case — a bare `LF` is not a terminator, and the octets behind the one
+    /// that follows it have to be discarded either way.
+    fn discard_buffered_data(&mut self) {
+        self.discard = Some(std::mem::take(&mut self.read_buf));
     }
 
     /// Throws away what is left of a failed transfer: the octets already
@@ -2012,72 +2085,21 @@ impl Connection {
     /// tens of megabytes left to send and waiting for its terminator would let
     /// one connection hold the server's bandwidth for as long as the timer
     /// allows (the connection stays in the read-then-validate loop, which is
-    /// what W2's size handling will keep).
+    /// what W2's size handling will keep). Its refusal ends the transaction on
+    /// its own: the session has already failed it, so the next command the
+    /// client sends is answered `554` rather than run.
     async fn finish_failed_transfer(
         &mut self,
-        saw_terminator: bool,
         deadline: tokio::time::Instant,
         drain_stream: bool,
     ) -> Result<(), ServerError> {
-        self.drain_buffered_data(saw_terminator);
+        self.discard_buffered_data();
         if !drain_stream {
             return Ok(());
         }
-        let from = self.read_buf.len();
-        if !self.drain_until_dot(from, deadline).await {
-            self.read_buf.clear();
-            return Ok(());
-        }
+        self.drain_until_dot(deadline).await;
+        self.discard = None;
         Ok(())
-    }
-
-    /// Finds the end of the `<CRLF>.<CRLF>` that terminates `DATA` inside the
-    /// read buffer, starting the search at `from`, and returns the index just
-    /// past it.
-    fn find_terminator_from(&self, from: usize) -> Option<usize> {
-        // A terminator that starts the buffer is a bare `.` line: only
-        // possible when the reader has already consumed its `<CRLF>`.
-        if self
-            .read_buf
-            .get(from..)
-            .is_some_and(|tail| tail.starts_with(b".\r\n"))
-        {
-            return Some(from + 3);
-        }
-        // `.\r\n` can also be the buffer's first three octets after a CRLF
-        // was consumed; the loop below catches `\n.` and this catches `.`
-        // alone only when followed by the full ending.
-        let mut search_from = from;
-        while let Some(relative) = self.read_buf[search_from..]
-            .windows(2)
-            .position(|window| window == b"\n.")
-        {
-            let newline = search_from + relative;
-            if !(newline >= 1 && self.read_buf[newline - 1] == b'\r') {
-                // `\n.` in the middle of a line is data; skip it.
-                search_from = newline + 1;
-                continue;
-            }
-            let line_start = newline + 1;
-            let after = line_start + 1;
-            // The terminator is `\n.\r\n` — `newline` is the CRLF's LF, the
-            // dot is at `line_start`, and the end is `after + 1`.
-            if self.read_buf[after..].starts_with(b"\r\n") {
-                return Some(after + 2);
-            }
-            if self.read_buf[after..].starts_with(b"\n") {
-                // A bare LF is not a legal terminator, but the client meant
-                // one; treat it as the end so nothing after it is executed.
-                return Some(after + 1);
-            }
-            // A dot that is still waiting for its CRLF is not a terminator
-            // yet: the caller keeps reading.
-            if after >= self.read_buf.len() {
-                return None;
-            }
-            search_from = line_start;
-        }
-        None
     }
 
     // ── TLS ──────────────────────────────────────────────────────────────
@@ -2313,16 +2335,71 @@ fn terminator_stub(buffer: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// How many trailing octets of `buffer` are a prefix of `<CRLF>.<CRLF>` but
-/// not the whole terminator (at most three: `\r`, `\r\n`, `\r\n.`).
-fn prefix_of_terminator(buffer: &[u8]) -> usize {
-    const TERMINATOR: &[u8] = b"\r\n.\r\n";
-    (1..TERMINATOR.len())
-        .rev()
-        .find(|length| {
-            buffer.len() >= *length && TERMINATOR.starts_with(&buffer[buffer.len() - length..])
-        })
-        .unwrap_or(0)
+/// Finds the end of the `<CRLF>.<CRLF>` that terminates `DATA` inside
+/// `buffer`, starting at `from`, and returns the index just past it.
+///
+/// This is the body of [`Connection::drain_until_dot`], written over a slice so
+/// it can be read and tested on its own. It accepts the three endings a client
+/// may mean: `\r\n.\r\n`, `\r\n.\n` (a bare `LF` where the last `CRLF` should
+/// be) and a `.\r\n` at the very front of the scan. A drain must stop at
+/// everything a client could mean by "end of message", so that the octets after
+/// it — whatever they are — are thrown away rather than executed.
+fn find_terminator(buffer: &[u8], from: usize) -> Option<usize> {
+    // A terminator that starts the scan is a bare `.` line: only possible when
+    // the reader has already consumed the `<CRLF>` that would have preceded it.
+    if buffer
+        .get(from..)
+        .is_some_and(|tail| tail.starts_with(b".\r\n"))
+    {
+        return Some(from + 3);
+    }
+    // Every `\r\n.` candidate: `\n.` is what a terminator looks like once the
+    // CRLF before it is accounted for, and an `LF` that is **not** preceded by
+    // a `\r` is line content, not a line end — it can never start a terminator.
+    // (An earlier version walked `\n` and skipped the bare ones one octet at a
+    // time; alongside the `\n.` search that skipped a legitimate terminator
+    // sitting right after a bare `LF`, it restarted the scan *inside* the
+    // candidate line it had just examined, so whether the drain ever ended
+    // depended on which `seek_from` reported first. Two searches for one
+    // thing is how a drain stops being a drain.)
+    let mut at = from;
+    while at + 1 < buffer.len() {
+        let relative = memchr::memchr(b'\n', buffer.get(at..)?)?;
+        let newline = at + relative;
+        if newline == 0 || buffer[newline - 1] != b'\r' {
+            at = newline + 1;
+            continue;
+        }
+        if buffer.get(newline + 1) != Some(&b'.') {
+            at = newline + 1;
+            continue;
+        }
+        // The terminator is `\n.\r\n`: `newline` is the LF that ended the line
+        // before it, the dot is at `newline + 1`, and the ending starts at
+        // `newline + 2`.
+        let ending = newline + 2;
+        if buffer
+            .get(ending..)
+            .is_some_and(|tail| tail.starts_with(b"\r\n"))
+        {
+            return Some(ending + 2);
+        }
+        if buffer
+            .get(ending..)
+            .is_some_and(|tail| tail.starts_with(b"\n"))
+        {
+            // A bare LF is not a legal terminator, but the client meant one;
+            // treat it as the end so nothing after it is executed.
+            return Some(ending + 1);
+        }
+        // A dot that is still waiting for its ending is not a terminator yet:
+        // the caller keeps reading.
+        if ending >= buffer.len() {
+            return None;
+        }
+        at = newline + 1;
+    }
+    None
 }
 
 /// Removes and returns up to `count` octets from the front of `buffer`.
@@ -2959,6 +3036,45 @@ mod tests {
         // "how many octets are the section", never "is the body clean".
         assert_eq!(header_len(b"h\r\n\r\nbo\ndy\r\n"), Some(5));
         assert_eq!(scan_record(b"h\r\n\r\nbo\ndy\r\n", 5), Err(MalformedBody));
+    }
+
+    #[test]
+    fn the_drain_finds_the_terminator_wherever_it_starts() {
+        // The drain a failed `DATA` transfer runs stops at the first ending a
+        // client could mean by "end of message". `.<CRLF>` at the buffer's
+        // front is the case a sender reaches by putting a bare `LF` before it
+        // (the `LF` is not a line break, so the `.` is at the start of what the
+        // reader has left) — and a scan that started at the buffer's length
+        // stepped over exactly that case, which is how the answer to a refused
+        // transfer came to wait for the transaction timer.
+        assert_eq!(find_terminator(b".\r\nrest", 0), Some(3));
+        assert_eq!(find_terminator(b".\r\nrest", 1), None, "not at 1");
+        // The ordinary shape: a line, then the terminator.
+        assert_eq!(find_terminator(b"prompt\r\n.\r\nMAIL", 0), Some(11));
+        assert_eq!(find_terminator(b"prompt\r\n.\r\nMAIL", 3), Some(11));
+        // A bare `LF` *before* the dot does not stop the search: the dot line
+        // is still the next `.<CRLF>` in the stream. (`\n` at index 0 has no
+        // `\r` before it, so it is line content; the `.` after it is not at
+        // the start of a line and is not a terminator candidate — the caller
+        // arrives here with the bare `LF` already consumed.)
+        assert_eq!(
+            find_terminator(b"\n.\r\nMAIL", 0),
+            None,
+            "a `\n` with no `\r` before it is content, so this `.` is not a line"
+        );
+        // The two lenient endings a client may mean by the terminator.
+        assert_eq!(
+            find_terminator(b"x\r\n.\r\n", 0),
+            Some(6),
+            "past `x\r\n.\r\n`"
+        );
+        assert_eq!(find_terminator(b"x\r\n.\n", 0), Some(5), "bare LF ending");
+        // A dot in line content is data, not a terminator.
+        assert_eq!(find_terminator(b"a.b\r\n..c\r\n", 0), None);
+        // Nothing at all, and a dot still waiting for its ending.
+        assert_eq!(find_terminator(b"", 0), None);
+        assert_eq!(find_terminator(b"x\r\n.", 0), None);
+        assert_eq!(find_terminator(b"x\r\n.\r", 0), None);
     }
 
     #[test]

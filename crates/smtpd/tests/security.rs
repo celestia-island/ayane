@@ -571,12 +571,19 @@ async fn tb15_bare_lf_smuggling_produces_no_second_envelope() {
         b"Subject: smuggle\r\n\r\nfirst\r\n\n.\nMAIL FROM:<evil@example.net>\r\nRCPT TO:<someone@gmail.com>\r\nDATA\r\nsecond\r\n.\r\n",
     );
     // A bare LF is data, not the end of the transfer: the server fails the
-    // transaction and stops waiting (554, or 421 when the transaction timer
-    // fires first because the client never sends a real terminator).
+    // transaction. The reply is `554 5.6.0 Transaction failed` either way —
+    // measured — but *when* it arrives depends on the drain a failed transfer
+    // runs first: with a `.<CRLF>` somewhere ahead in this wire the drain ends
+    // there and the answer is immediate (about a millisecond), and with nothing
+    // the client ever means as a terminator the answer waits for the drain to
+    // give up at the transaction timer (here 1.5 s). Both are the same refusal;
+    // the code is neither `421` (the connection is not closed) nor a second
+    // answer to an answered command.
     if let Some(reply) = client.try_read_reply() {
-        assert!(
-            matches!(reply.code, 554 | 421),
-            "a bare LF must fail the transfer, got {reply:?}"
+        assert_eq!(
+            (reply.code, reply.text.as_str()),
+            (554, "5.6.0 Transaction failed"),
+            "a bare LF must fail the transfer: {reply:?}"
         );
     }
     // Exactly zero messages, and certainly no relayed envelope.
