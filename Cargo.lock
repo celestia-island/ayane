@@ -297,6 +297,7 @@ dependencies = [
  "ayane-proto",
  "base64 0.22.1",
  "mail-auth",
+ "memchr",
  "rustls",
  "rustls-pemfile",
  "serde",

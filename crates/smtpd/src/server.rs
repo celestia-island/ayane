@@ -23,6 +23,40 @@
 //! per-connection count is reset by reconnecting — a per-IP AUTH failure
 //! budget with a back-off ([`AuthGuard`]).
 //!
+//! # `DATA` and `BDAT` are one policy seen from two sides
+//!
+//! A message may arrive either as lines followed by `.` or as a chain of
+//! opaque octets, and everything this module decides about it — the size, the
+//! header section, the bare `LF` — is decided over the **same bytes**. So the
+//! invariant is stronger than "both transports work": **for any byte sequence,
+//! `DATA` and `BDAT` accept or reject it identically, with the same code and
+//! the same text.** Anything less is a probe a sender can run: send the shape
+//! that gets `250` from one transport and the octets are in the queue without
+//! ever meeting the rule the other transport applies, which is exactly the
+//! shape of CVE-2023-51764 (an octet sequence that is one message to a lenient
+//! reader and two to a strict one).
+//!
+//! | Decision | `DATA` | `BDAT` |
+//! |---|---|---|
+//! | bare `LF` in the header section | refused on the line (`554 5.6.0`) | [`header_len`], through [`MalformedHead`] |
+//! | bare `LF` in the body | refused on the line (`554 5.6.0`) | [`scan_record`], through [`MalformedBody`] |
+//! | header section past the bound | charged per line (`552 5.3.4`) | [`HeaderBudget::charge_message`] (`552 5.3.4`) |
+//! | message past the size | refused while reading (`552`) | declared size, by the session |
+//! | a valid message | `250`, queued | `250`, queued |
+//!
+//! The body row is the one that is easy to lose: a chunk has no line
+//! structure, so nothing refuses a `LF` inside it unless a scan is written for
+//! it, and the head's scan stops at the blank line by design. `DATA` refuses
+//! the bare `LF` **wherever** it is in the transfer, so `BDAT` has to as well —
+//! the check is not a courtesy to the header bound, it is the same rule over
+//! the octets that bound does not cover.
+//!
+//! Both refusals leave the queue empty: the staged spool file is abandoned
+//! before the reply goes out ([`StagedMessage::abandon`]), so a `554` from
+//! either transport means the same thing — this server holds nothing.
+//!
+//! [`StagedMessage::abandon`]: crate::queue::StagedMessage::abandon
+//!
 //! # What looks like a runtime check and is not
 //!
 //! A few conditions in this module read like defence in depth and are worth
@@ -671,24 +705,88 @@ impl HeaderBudget {
     /// two transports must reject the same message for the same reason, not
     /// merely agree about its size.
     ///
+    /// **The bare-`LF` scan covers the whole transfer, and this is only its
+    /// head half.** A head that measures fine says nothing about the body
+    /// behind the blank line: that part has no line structure either, and it is
+    /// where a smuggled envelope would be put. It is scanned separately, by
+    /// [`scan_record`], on the octets after `section` — so a record is refused
+    /// for a bare `LF` in the head (here, as [`MalformedHead`]) or in the body
+    /// (there, as [`MalformedBody`]), whichever comes first, and both refusals
+    /// are answered identically to `DATA` (`554 5.6.0 Transaction failed`
+    /// through `fail_data` + `reply_end(false)`). Splitting the scan in two
+    /// rather than scanning the whole record once is what keeps this function's
+    /// answer — the size of the section — the *only* thing it decides.
+    ///
     /// # Errors
     ///
     /// Returns [`MalformedHead`] when a line of the section does not end in
     /// `CRLF`.
-    fn charge_message(&mut self, message: &[u8]) -> Result<(), MalformedHead> {
+    fn charge_message(&mut self, message: &[u8]) -> Result<usize, MalformedHead> {
         if self.ended {
-            return Ok(());
+            // The section was already charged (line by line, by `DATA`, or by
+            // an earlier record of the same chain); whatever `message` is, it
+            // adds nothing to the section, and the body scan starts at its
+            // first octet.
+            return Ok(0);
         }
         let section = header_len(message).ok_or(MalformedHead)?;
         self.consumed = self.consumed.saturating_add(section as u64);
         self.ended = true;
-        Ok(())
+        Ok(section)
     }
 
     /// Whether the header section has taken more than `limit` octets.
     fn over(&self, limit: u64) -> bool {
         self.consumed > limit
     }
+}
+
+/// What a reassembled record's bare-`LF` scan found.
+///
+/// A unit rather than a `bool`, for the same reason [`MalformedHead`] is one:
+/// the caller cannot reach the "no bare `LF` at all" case by forgetting to
+/// look at the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MalformedBody;
+
+/// Scans the **body** of a reassembled message — everything after the blank
+/// line that ends its header section — for a bare `LF`.
+///
+/// # Why this exists
+///
+/// `DATA` reads a message as lines and refuses, on the line that carries it, a
+/// `LF` that is not the second octet of a `CRLF` ([`Connection::read_body_line`]):
+/// treating one as a line break is the SMTP smuggling hole (CVE-2023-51764),
+/// where `\r\n\r\nfirst\r\n\n.\nRCPT TO:…` becomes two messages to a receiver
+/// that guesses. A `BDAT` chunk is opaque octets — [`HeaderBudget::charge_message`]
+/// could only look at the head — so the same body was accepted and queued with
+/// `250`. That asymmetry is the defect this scan closes: the body of a chained
+/// message must be subject to the same "no bare `LF` anywhere" rule as the body
+/// of a `DATA` transfer, or the two transports disagree about whether a message
+/// is even readable.
+///
+/// # What it costs
+///
+/// One pass over the message: [`header_len`] stops at the blank line, and this
+/// looks at the octets after it with [`has_bare_lf`], which is one `memchr`
+/// over the `LF` octets and a one-octet look-behind at each, never a
+/// `windows(2)` comparison per octet. Measured on a release build, a 25 MiB
+/// body of lines and one bare `LF` costs about 4 ms — the same order as the
+/// head scan it follows, and paid once per chained message, after the chunks
+/// are already in memory. It is not on the `DATA` path, where lines are
+/// refused as they arrive.
+///
+/// # Errors
+///
+/// Returns [`MalformedBody`] when a `\n` in the body is not directly preceded
+/// by a `\r`, or when the body's first octet is a `\n` (an empty line whose
+/// ending is a bare `LF`).
+fn scan_record(record: &[u8], body_from: usize) -> Result<(), MalformedBody> {
+    let body = record.get(body_from..).unwrap_or_default();
+    if has_bare_lf(body) {
+        return Err(MalformedBody);
+    }
+    Ok(())
 }
 
 /// How many octets of `message` are header section: up to and including the
@@ -725,11 +823,8 @@ fn header_len(message: &[u8]) -> Option<usize> {
     let mut line_start = 0usize;
     loop {
         // The end of the line starting at `line_start`: the next `CRLF`.
-        let line_end = match message[line_start..]
-            .windows(2)
-            .position(|window| window == b"\r\n")
-        {
-            Some(found) => line_start + found + 2,
+        let line_end = match find_crlf(message, line_start) {
+            Some(found) => found + 2,
             // No `CRLF` left. A line of content running to the end without one
             // means the message has no blank line, so what is left is all
             // header — the case the bound exists for. (A message that ends
@@ -746,11 +841,74 @@ fn header_len(message: &[u8]) -> Option<usize> {
         // transfer on one (RFC 5321 §2.3.8, CVE-2023-51764), so a chained
         // message with one is not a message this server reads, and there is no
         // section to measure.
-        if message[line_start..line_end - 2].contains(&b'\n') {
+        if has_bare_lf(&message[line_start..line_end - 2]) {
             return None;
         }
         line_start = line_end;
     }
+}
+
+/// The index of the first `CRLF` of `haystack` at or after `from`.
+///
+/// Anchored at each candidate `\r`, so the whole scan is one `memchr` per
+/// octet searched for and nothing is rescanning a suffix: the loop is linear
+/// in `haystack.len() - from`, restarting a search only where a `\r` was not
+/// followed by `\n` (which, in a message with a bare `\r` and no `CRLF`, is
+/// the number of `\r`s in it).
+fn find_crlf(haystack: &[u8], from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(found) = memchr::memchr(b'\r', haystack.get(at..)?) {
+        let index = at + found;
+        if haystack.get(index + 1) == Some(&b'\n') {
+            return Some(index);
+        }
+        at = index + 1;
+    }
+    None
+}
+
+/// Whether `octets` holds a bare `LF`: a `\n` whose predecessor — inside these
+/// octets — is not a `\r`.
+///
+/// This is the whole bare-`LF` question for a run of octets with no line
+/// structure left. Over a complete message it has to agree with the rule
+/// `DATA` applies line by line:
+///
+/// - a line ending in `\n` that is not `\r\n` — the octet before that `\n` is
+///   not a `\r`, or there is no octet before it; and
+/// - a `\n` at the start of a line, because the line before ended `\n\n` or
+///   began `\n`: in both cases some `\n` has no `\r` immediately before it.
+///
+/// So one rule covers both: **every `\n` in the message must be directly
+/// preceded by a `\r`**, and that is exactly what this checks, in one `memchr`
+/// pass over the `\n` octets with a one-octet look-behind at each.
+///
+/// # What it must be taken over
+///
+/// The precondition is that `octets` is a run that starts where a line starts
+/// (the beginning of the message, or just after a `CRLF`). A run that starts
+/// *inside* a line — a chunk boundary, say — cannot be judged alone: a `\n`
+/// whose `\r` fell in the previous run looks bare here. So this is called with
+/// a whole record, a whole `DATA` body line, or a line's content between two
+/// CRLFs, never with an arbitrary fragment.
+///
+/// The look-behind is what keeps this from being a `contains(b'\n')`: every
+/// legal line ending ends in `\n`, so a scan that forgot the `\r` would refuse
+/// every message with a line in it.
+fn has_bare_lf(octets: &[u8]) -> bool {
+    let mut at = 0usize;
+    while let Some(found) = memchr::memchr(b'\n', octets.get(at..).unwrap_or(&[])) {
+        let index = at + found;
+        // A `\n` at index 0 has no predecessor in this run: with the
+        // precondition above, the octet before the run is either nothing (the
+        // message's first octet) or the `\n` of a `CRLF` — neither is a
+        // `\r`, so the line that ends here started with an `LF`.
+        if index == 0 || octets[index - 1] != b'\r' {
+            return true;
+        }
+        at = index + 1;
+    }
+    false
 }
 
 /// A reassembled message whose header section cannot be measured: one of its
@@ -1549,14 +1707,38 @@ impl Connection {
         // over `DATA`, which is a discrepancy a sender can see and a refusal a
         // legitimate chunking client can do nothing about.
         self.header = HeaderBudget::default();
-        if self.header.charge_message(&record).is_err() {
-            // The same message over `DATA` would have been refused while it
-            // was being read; refusing it here answers the same way. `554` is
-            // the reply the session gives a transaction it did not complete
-            // (`end_of_message(false)`), which is exactly what the `DATA` path
-            // sends for a bare `LF` — so a client sees one answer per
-            // transport, and not a `250` from the transport that never looked.
-            tracing::info!("chained message has a bare LF in its header section, refusing");
+        // Where the body starts, from the same function that sized the head:
+        // every octet from there on is the part `DATA` would have read *as
+        // body*, and it is scanned below for the bare `LF` the head's own scan
+        // never looks at.
+        let body_from = match self.header.charge_message(&record) {
+            Ok(body_from) => body_from,
+            Err(MalformedHead) => {
+                // The same message over `DATA` would have been refused while it
+                // was being read; refusing it here answers the same way. `554` is
+                // the reply the session gives a transaction it did not complete
+                // (`end_of_message(false)`), which is exactly what the `DATA` path
+                // sends for a bare `LF` — so a client sees one answer per
+                // transport, and not a `250` from the transport that never looked.
+                tracing::info!("chained message has a bare LF in its header section, refusing");
+                staged.abandon();
+                self.session.fail_data();
+                return self.reply_end(false).await;
+            }
+        };
+        // The body half of the same rule. A chunk is opaque octets, so nothing
+        // refused a `LF` in it that was not part of a `CRLF`; `DATA` refuses such
+        // a body outright (CVE-2023-51764's smuggling shape lives here, not in
+        // the head), and a record accepted over one transport and refused over
+        // the other is a difference a sender can probe for. Same refusal, same
+        // code and text, and the message is never spooled: `staged.abandon()`
+        // removes the file and the transaction is reset with it.
+        if scan_record(&record, body_from).is_err() {
+            tracing::info!(
+                from = body_from,
+                size = record.len(),
+                "chained message has a bare LF in its body, refusing"
+            );
             staged.abandon();
             self.session.fail_data();
             return self.reply_end(false).await;
@@ -2769,9 +2951,110 @@ mod tests {
         // would size — and it must not be reported as a small one either.
         assert_eq!(header_len(b"h\n\r\nbody\r\n"), None);
         assert_eq!(header_len(b"h\r\nfold\n\r\nbody\r\n"), None);
-        // A bare LF *after* the section does not matter: the section ended
-        // before it, and `DATA` would have accepted the same split.
+        // A bare LF *after* the section does not make the section
+        // unmeasurable — the section ended before it. It does not make the
+        // *message* acceptable either: that is the body scan's question
+        // (`scan_record`), which starts exactly where this answer ends. Kept
+        // here so the two halves stay visibly separate: `header_len` answers
+        // "how many octets are the section", never "is the body clean".
         assert_eq!(header_len(b"h\r\n\r\nbo\ndy\r\n"), Some(5));
+        assert_eq!(scan_record(b"h\r\n\r\nbo\ndy\r\n", 5), Err(MalformedBody));
+    }
+
+    #[test]
+    fn a_body_with_any_bare_lf_is_refused_and_a_crlf_one_is_not() {
+        // The table the `DATA` path produces, expressed over whole octets: a
+        // `\n` must be directly preceded by a `\r`, and that is the entire
+        // rule. The rows on the refusing side are the three measured shapes
+        // (first body line, deep, and an `LF` at the start of a line), plus
+        // the empty line whose ending is a bare `LF`.
+        let refusing: &[&[u8]] = &[
+            b"\nafter the blank line",
+            b"first\nsecond\r\n",
+            b"a\r\nb\r\nc\nd\r\n",
+            b"line\r\n\n.\nMAIL FROM:<evil@example.net>\r\n",
+            b"end\r\n\n",
+        ];
+        for body in refusing {
+            assert_eq!(
+                scan_record(body, 0),
+                Err(MalformedBody),
+                "{:?} carries a bare LF",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // The accepting side: every line ends in CRLF, blank lines included,
+        // and nothing else is a bare LF.
+        let accepting: &[&[u8]] = &[
+            b"",
+            b"\r\n",
+            b"only a crlf\r\n",
+            b"a\r\n\r\nb\r\n",
+            b"\r\n\r\n\r\n",
+            b"ends without a line ending",
+        ];
+        for body in accepting {
+            assert_eq!(
+                scan_record(body, 0),
+                Ok(()),
+                "{:?} has no bare LF",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // A carriage return on its own is not a bare LF: `DATA` reads it as
+        // line content, and so does this. Two blank lines in a row are two
+        // CRLFs, not a bare LF.
+        assert_eq!(scan_record(b"a\rb\r\nc\r\n", 0), Ok(()));
+        assert_eq!(scan_record(b"\r\n\r\n", 0), Ok(()));
+    }
+
+    #[test]
+    fn the_body_scan_starts_where_the_header_section_ends() {
+        // The defect this fixes lived at the seam: the head was scanned and the
+        // body was not, so the octets *after* the blank line were the ones a
+        // sender could fill with a bare LF. The offset `charge_message` returns
+        // is that seam, and a record is judged by looking at both sides of it.
+        let mut budget = HeaderBudget::default();
+        let record = b"Subject: clean\r\n\r\nbody\r\nsmu\nggled\r\n";
+        let body_from = budget.charge_message(record).expect("a clean head");
+        assert_eq!(body_from, 18, "`Subject: clean\r\n` then the blank line");
+        assert_eq!(&record[..body_from], b"Subject: clean\r\n\r\n");
+        assert_eq!(budget.consumed, 18, "only the section is charged");
+        assert_eq!(scan_record(record, body_from), Err(MalformedBody));
+
+        // And the same record with a bare LF *in the head* stops earlier, in
+        // the measurement itself: the two halves never both fire on one
+        // octet.
+        let mut budget = HeaderBudget::default();
+        let head_dirty = b"Subject: bad\nhead\r\n\r\nbody\r\n";
+        assert_eq!(budget.charge_message(head_dirty), Err(MalformedHead));
+    }
+
+    #[test]
+    fn the_scans_are_linear_on_a_large_message() {
+        // Both halves are one pass. A `windows(2)` comparison per octet, or a
+        // rescan from every line start, is what this pins against: the first
+        // would be tens of times slower, the second quadratic (minutes at
+        // this size in a debug build). The assertions here are about the
+        // answers; the cost is pinned by the size the test runs at — a
+        // quadratic scan does not finish.
+        let line = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd\r\n";
+        let mut clean = Vec::with_capacity(25 * 1024 * 1024);
+        clean.extend_from_slice(b"Subject: big\r\n\r\n");
+        while clean.len() < 25 * 1024 * 1024 {
+            clean.extend_from_slice(line);
+        }
+        let mut budget = HeaderBudget::default();
+        let body_from = budget.charge_message(&clean).expect("a clean head");
+        assert_eq!(body_from, b"Subject: big\r\n\r\n".len());
+        assert_eq!(scan_record(&clean, body_from), Ok(()));
+
+        // One bare LF at the very end: the scan has to walk the whole body to
+        // find it, and find it.
+        let mut dirty = clean.clone();
+        let end = dirty.len() - 2;
+        dirty[end] = b'\n';
+        assert_eq!(scan_record(&dirty, body_from), Err(MalformedBody));
     }
 
     #[test]

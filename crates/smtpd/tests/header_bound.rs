@@ -210,32 +210,97 @@ async fn the_bound_applies_without_a_verifier() {
     harness.stop();
 }
 
+/// One transport's answer to a message: the transaction's final reply and how
+/// many messages the listener queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    /// The `250` of the transaction, the `554` of a failed one, or a `552` for
+    /// a bound.
+    pub code: u16,
+    /// The reply text, empty for a reply that carried none.
+    pub text: String,
+    /// How many messages the listener spooled.
+    pub queued: usize,
+}
+
 /// Sends `message` over both transports, on separate listeners with the same
-/// bound, and returns `(DATA reply code, DATA queued, BDAT reply code, BDAT
-/// queued)`.
+/// bound, and returns what each transport answered.
 ///
 /// Every test in this module that is about *agreement* goes through here, so
 /// the two paths are exercised by the same octets, the same fixture and the
-/// same limit — the only thing that differs is the transport.
-async fn both_ways(tag: &str, message: &[u8]) -> (u16, usize, u16, usize) {
+/// same limit — the only thing that differs is the transport. The whole reply
+/// is kept, not just its code, because "same code" is the weaker half of the
+/// duality: a `554 5.6.0 Transaction failed` and a `554 5.7.1 Sender rejected`
+/// agree on the code and disagree about the reason, and only the text pair
+/// shows it.
+async fn both_ways(tag: &str, message: &[u8]) -> (Verdict, Verdict) {
     let data_harness = Harness::start(&format!("{tag}-data"), bounded()).await;
     let mut client = transaction(&data_harness);
     client.expect("DATA", 354);
-    let mut wire = message.to_vec();
-    wire.extend_from_slice(b".\r\n");
-    client.send_raw(&wire);
-    let over_data = client.read_reply().code;
+    // The transfer is written as the message alone, with no `.<CRLF>`
+    // terminator: the octets under test are exactly the ones a sender would
+    // have put in the transfer, and the answer does not depend on a
+    // terminator being present. (It is also the realistic shape for a body
+    // whose last line ends in a bare `LF`: the sender has not finished the
+    // transfer, and a server with something to say about those octets says it
+    // then — see [`Client::finish_sending`], which every refusal case here
+    // follows with, because a FAILED `DATA` transfer on this path reads the
+    // rest of the upload up to its terminator first. `tb15` pins that
+    // behaviour; these tests are about which octets are refused, not about
+    // when the client is told.)
+    client.send_raw(message);
+    // A refusal arrives while the client is mid-upload; a transfer that wants
+    // a terminator gets one, after which the reply is the transfer's.
+    let data_reply = client.try_read_reply_within(std::time::Duration::from_millis(500));
+    let data_reply = match data_reply {
+        Some(reply) => reply,
+        // The transfer wanted its terminator: the answer is `DATA`'s anyway,
+        // and the test below asserts the reply the sender actually gets.
+        None => {
+            client.send_raw(b".\r\n");
+            client.read_reply()
+        }
+    };
     let queued_over_data = data_harness.queued().len();
     data_harness.stop();
 
     let bdat_harness = Harness::start(&format!("{tag}-bdat"), bounded()).await;
     let mut client = transaction(&bdat_harness);
     client.pending(message);
-    let over_bdat = client.command(&format!("BDAT {} LAST", message.len())).code;
+    let bdat_reply = client.command(&format!("BDAT {} LAST", message.len()));
     let queued_over_bdat = bdat_harness.queued().len();
     bdat_harness.stop();
 
-    (over_data, queued_over_data, over_bdat, queued_over_bdat)
+    (
+        Verdict {
+            code: data_reply.code,
+            text: data_reply.text,
+            queued: queued_over_data,
+        },
+        Verdict {
+            code: bdat_reply.code,
+            text: bdat_reply.text,
+            queued: queued_over_bdat,
+        },
+    )
+}
+
+/// Asserts the duality every message in this module is supposed to have: the
+/// two transports answer the same code with the same text, and queue the same
+/// number of messages.
+#[track_caller]
+fn assert_duality(what: &str, data: &Verdict, bdat: &Verdict) {
+    assert_eq!(
+        (bdat.code, bdat.text.as_str()),
+        (data.code, data.text.as_str()),
+        "{what}: DATA answered {data:?} and BDAT answered {bdat:?} — one \
+         answer per transport is the invariant, not merely one code"
+    );
+    assert_eq!(
+        bdat.queued, data.queued,
+        "{what}: the transports queued different numbers of messages: \
+         DATA {data:?}, BDAT {bdat:?}"
+    );
 }
 
 /// The two transports refuse the same message, which is what makes the bound
@@ -275,22 +340,18 @@ async fn both_transports_answer_the_same_message_the_same_way() {
         body.len()
     );
 
-    let (over_data, queued_data, over_bdat, queued_bdat) =
-        both_ways("dual", format!("{head}{body}").as_bytes()).await;
+    let (data, bdat) = both_ways("dual", format!("{head}{body}").as_bytes()).await;
     assert_eq!(
-        over_data, 250,
+        data.code, 250,
         "a small head over DATA is accepted, whatever the body weighs"
     );
     assert_eq!(
-        over_bdat, 250,
+        bdat.code, 250,
         "and over BDAT: the blank line ends the section there too"
     );
-    assert_eq!(
-        over_bdat, over_data,
-        "the two transports must not disagree about the same message"
-    );
-    assert_eq!(queued_data, 1, "the DATA copy is queued");
-    assert_eq!(queued_bdat, 1, "the BDAT copy is queued");
+    assert_duality("a small head and a big body", &data, &bdat);
+    assert_eq!(data.queued, 1, "the DATA copy is queued");
+    assert_eq!(bdat.queued, 1, "the BDAT copy is queued");
 }
 
 /// The empty-header message: the very first line is already the blank line.
@@ -319,16 +380,16 @@ async fn an_empty_header_is_the_same_two_octets_over_both_transports() {
     message.extend(std::iter::repeat_n(b'q', limit + 2 - 4 - 2));
     message.extend_from_slice(b"\r\ntail\r\n");
 
-    let (over_data, queued_data, over_bdat, queued_bdat) = both_ways("dual-empty", &message).await;
-    assert_eq!(over_data, 250, "an empty header over DATA: {over_data}");
+    let (data, bdat) = both_ways("dual-empty", &message).await;
+    assert_eq!(data.code, 250, "an empty header over DATA: {data:?}");
     assert_eq!(
-        over_bdat, 250,
+        bdat.code, 250,
         "an empty header over BDAT — a `CRLFCRLF` search would charge the \
-         body's first line as part of the section and answer 552: {over_bdat}"
+         body's first line as part of the section and answer 552: {bdat:?}"
     );
-    assert_eq!(over_bdat, over_data, "same message, same answer");
-    assert_eq!(queued_data, 1);
-    assert_eq!(queued_bdat, 1);
+    assert_duality("an empty header", &data, &bdat);
+    assert_eq!(data.queued, 1);
+    assert_eq!(bdat.queued, 1);
 }
 
 /// The same, one line further in: `<CRLF>` (the empty first line ends the
@@ -340,10 +401,10 @@ async fn an_empty_header_over_a_long_first_body_line_agrees() {
     let mut message = b"\r\n".to_vec();
     message.extend(std::iter::repeat_n(b'z', limit + 8));
     message.extend_from_slice(b"\r\nmore body\r\n");
-    let (over_data, _, over_bdat, _) = both_ways("dual-short", &message).await;
-    assert_eq!(over_data, 250, "two octets of head over DATA");
-    assert_eq!(over_bdat, 250, "and over BDAT");
-    assert_eq!(over_bdat, over_data);
+    let (data, bdat) = both_ways("dual-short", &message).await;
+    assert_eq!(data.code, 250, "two octets of head over DATA");
+    assert_eq!(bdat.code, 250, "and over BDAT");
+    assert_duality("an empty header over a long first line", &data, &bdat);
 }
 
 /// A head with a bare `LF` is refused by both transports, with the same code.
@@ -363,18 +424,18 @@ async fn an_empty_header_over_a_long_first_body_line_agrees() {
 async fn a_bare_lf_in_the_head_is_refused_by_both_transports() {
     let message = b"Subject: x\nfake\r\n\r\nbody\r\n";
     assert_eq!(message.len(), 25, "small enough that no bound applies");
-    let (over_data, queued_data, over_bdat, queued_bdat) = both_ways("dual-bare-lf", message).await;
+    let (data, bdat) = both_ways("dual-bare-lf", message).await;
     assert_eq!(
-        over_data, 554,
-        "DATA fails the transaction on a bare LF: {over_data}"
+        data.code, 554,
+        "DATA fails the transaction on a bare LF: {data:?}"
     );
     assert_eq!(
-        over_bdat, 554,
-        "and BDAT must not answer 250 to octets DATA refuses: {over_bdat}"
+        bdat.code, 554,
+        "and BDAT must not answer 250 to octets DATA refuses: {bdat:?}"
     );
-    assert_eq!(over_bdat, over_data, "one answer per transport");
-    assert_eq!(queued_data, 0, "nothing is queued over DATA");
-    assert_eq!(queued_bdat, 0, "nothing is queued over BDAT");
+    assert_duality("a bare LF in the head", &data, &bdat);
+    assert_eq!(data.queued, 0, "nothing is queued over DATA");
+    assert_eq!(bdat.queued, 0, "nothing is queued over BDAT");
 }
 
 /// The same, with the bare `LF` in a folded line rather than the first field:
@@ -382,14 +443,14 @@ async fn a_bare_lf_in_the_head_is_refused_by_both_transports() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bare_lf_in_a_folded_head_line_is_refused_by_both_transports() {
     let message = b"Subject: ok\r\n bad\nline\r\n\r\nbody\r\n";
-    let (over_data, _, over_bdat, queued_bdat) = both_ways("dual-bare-lf-fold", message).await;
-    assert_eq!(over_data, 554, "DATA: {over_data}");
-    assert_eq!(over_bdat, 554, "BDAT: {over_bdat}");
-    assert_eq!(over_bdat, over_data);
-    assert_eq!(queued_bdat, 0);
+    let (data, bdat) = both_ways("dual-bare-lf-fold", message).await;
+    assert_eq!(data.code, 554, "DATA: {data:?}");
+    assert_eq!(bdat.code, 554, "BDAT: {bdat:?}");
+    assert_duality("a bare LF in a folded head line", &data, &bdat);
+    assert_eq!(bdat.queued, 0);
 }
 
-/// The boundary, **derived** rather than assumed: `limit` octets of section
+/// The bound is **derived** rather than assumed: `limit` octets of section
 /// is accepted and `limit + 1` is refused, over both transports.
 ///
 /// A section of exactly `limit` is not over a bound of `limit` — the
@@ -422,20 +483,17 @@ async fn the_bound_is_a_strict_inequality_on_both_transports() {
     for (section, expected) in [(limit - 1, 250), (limit, 250), (limit + 1, 552)] {
         let mut message = head_of(section);
         message.extend_from_slice(b"body\r\n");
-        let (over_data, _, over_bdat, _) = both_ways(&format!("edge-{section}"), &message).await;
+        let (data, bdat) = both_ways(&format!("edge-{section}"), &message).await;
         assert_eq!(
-            over_data, expected,
+            data.code, expected,
             "a {section}-octet head over DATA (bound {limit}): \
              `section > limit` is the rule"
         );
         assert_eq!(
-            over_bdat, expected,
+            bdat.code, expected,
             "a {section}-octet head over BDAT (bound {limit}): same rule"
         );
-        assert_eq!(
-            over_bdat, over_data,
-            "the boundary is the same both ways at {section} octets"
-        );
+        assert_duality(&format!("a {section}-octet head"), &data, &bdat);
     }
 }
 
@@ -455,14 +513,13 @@ async fn both_transports_refuse_a_head_that_never_ends() {
         endless.len()
     );
 
-    let (over_data, queued_data, over_bdat, queued_bdat) =
-        both_ways("dual-refuse", endless.as_bytes()).await;
-    for (transport, code) in [("DATA", over_data), ("BDAT", over_bdat)] {
-        assert_eq!(code, 552, "{transport}: a head with no blank line");
+    let (data, bdat) = both_ways("dual-refuse", endless.as_bytes()).await;
+    for (transport, verdict) in [("DATA", &data), ("BDAT", &bdat)] {
+        assert_eq!(verdict.code, 552, "{transport}: a head with no blank line");
     }
-    assert_eq!(over_bdat, over_data, "same answer, both ways");
-    assert_eq!(queued_data, 0);
-    assert_eq!(queued_bdat, 0);
+    assert_duality("a head that never ends", &data, &bdat);
+    assert_eq!(data.queued, 0);
+    assert_eq!(bdat.queued, 0);
 }
 
 /// One chunk that is *itself* larger than the bound, holding a short head and
@@ -494,4 +551,231 @@ fn the_default_bound_is_one_mebibyte() {
     assert_eq!(DEFAULT_MAX_HEADER_BYTES, 1024 * 1024);
     // It has to be smaller than the default message size, or it bounds nothing.
     const _: () = assert!(DEFAULT_MAX_HEADER_BYTES < 25 * 1024 * 1024);
+}
+
+// ── a bare LF in the BODY ────────────────────────────────────────────────
+//
+// The header tests above are about the *head*: `charge_message` sizes the
+// section before the blank line and refuses one of its lines that does not end
+// in `CRLF`. The body behind the blank line never reached that scan, so a
+// chained record whose head was clean and whose body carried a bare `LF` was
+// answered `250` — while the same octets over `DATA` were refused `554 5.6.0`,
+// because `read_body_line` refuses a bare `LF` anywhere in the transfer.
+//
+// That is CVE-2023-51764 at the *BDAT* boundary: the body is where a smuggled
+// envelope would be put (`\r\n\r\nfirst\r\n\n.\nMAIL FROM:…`), and answering
+// `250` to it means the spool holds octets this server told the sender it
+// would never accept. The three shapes below are the ones that were measured
+// on the unfixed tree (first body line / deep in the body / a large body past
+// the head), and each one went `DATA = 554`, `BDAT = 250` before the fix and
+// `554`/`554` after it.
+
+/// The three body shapes a bare `LF` was hiding in, as one list so the tests
+/// below cannot quietly cover only the easy one.
+///
+/// Every message starts with a **clean** head (its own bare-`LF` scan does not
+/// fire), so a failure here can only come from the body scan.
+fn body_bare_lf_shapes() -> Vec<(&'static str, Vec<u8>)> {
+    let head = b"From: <a@example.net>\r\nSubject: body bare lf\r\n\r\n";
+
+    // 1. The very first line of the body, ending in a bare `LF`.
+    let mut first_line = head.to_vec();
+    first_line.extend_from_slice(b"first\r\nstill the body\nmore\r\n");
+
+    // 2. Deep in the body: far past the blank line, dozens of well-formed
+    //    lines in, so a scan that only looks at the start of the body misses
+    //    it. The bare `LF` carries the smuggling shape of the classic attack:
+    //    a `\n.\n` after it would be a second message to a server that reads
+    //    `LF` as a line break.
+    let mut deep = head.to_vec();
+    for index in 0..64 {
+        deep.extend_from_slice(format!("line {index}\r\n").as_bytes());
+    }
+    deep.extend_from_slice(b"before\r\n\n.\nMAIL FROM:<evil@example.net>\r\n");
+    deep.extend_from_slice(b"after the smuggle attempt\r\n");
+
+    // 3. A large body whose one bare `LF` sits past the header bound: the
+    //    head fits, so this is not a size refusal, and it is the shape that
+    //    says the scan has to cover the *whole* record rather than the part
+    //    the header budget happened to look at.
+    let mut large = head.to_vec();
+    let filler = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd\r\n";
+    while large.len() < LIMIT as usize * 4 {
+        large.extend_from_slice(filler);
+    }
+    large.extend_from_slice(b"tail\r\nsmuggled\n\r\n");
+
+    vec![
+        ("first-body-line", first_line),
+        ("deep-in-the-body", deep),
+        ("large-body", large),
+    ]
+}
+
+/// The three measured body shapes, each refused by **both** transports with
+/// the same `554 5.6.0 Transaction failed`, and nothing queued either way.
+///
+/// Before the fix this test failed on the `BDAT` half of every shape: the
+/// head's bare-`LF` scan stopped at the blank line, so an unclean body behind
+/// a clean head was spooled and answered `250`. The message below is the one
+/// the fix has to make impossible to accept: the octets `DATA` refuses are the
+/// octets a smuggled envelope would be built from.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_lf_in_the_body_is_refused_by_both_transports() {
+    for (shape, message) in body_bare_lf_shapes() {
+        // The head is clean: this is the body's check under test, not the
+        // head's. The first `\r\n\r\n` is the blank line, and nothing before
+        // it carries a bare `LF`.
+        let section = message
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("the fixture has a blank line")
+            + 4;
+        let clean = message[..section]
+            .iter()
+            .enumerate()
+            .all(|(index, octet)| *octet != b'\n' || message[index - 1] == b'\r');
+        assert!(
+            clean,
+            "{shape}: the head must be clean or this test is about the head"
+        );
+
+        let (data, bdat) = both_ways(&format!("body-{shape}"), &message).await;
+        assert_eq!(
+            data.code, 554,
+            "{shape}: DATA fails the transaction on a body bare LF: {data:?}"
+        );
+        assert_eq!(
+            data.text, "5.6.0 Transaction failed",
+            "{shape}: the transaction's own refusal: {data:?}"
+        );
+        assert_eq!(
+            bdat.code, 554,
+            "{shape}: BDAT answered {bdat:?} to octets DATA refuses with 554 — \
+             a chained record must not be spooled because its head was clean"
+        );
+        assert_eq!(
+            bdat.text, "5.6.0 Transaction failed",
+            "{shape}: the same refusal, not merely the same code: {bdat:?}"
+        );
+        assert_duality(shape, &data, &bdat);
+        assert_eq!(data.queued, 0, "{shape}: nothing is queued over DATA");
+        assert_eq!(bdat.queued, 0, "{shape}: nothing is queued over BDAT");
+    }
+}
+
+/// The control for the body scan: a body with **only** `CRLF` line endings is
+/// accepted by both transports, however many lines and how many octets it has.
+///
+/// Without this, a scan that refused every chained message would pass the test
+/// above. The body here is several times the header bound and spans many
+/// lines, so an over-eager "reject the whole record" would show up here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_of_only_crlf_is_accepted_by_both_transports() {
+    let mut message = b"From: <a@example.net>\r\nSubject: clean body\r\n\r\n".to_vec();
+    for index in 0..400 {
+        message.extend_from_slice(format!("body line {index} with content\r\n").as_bytes());
+    }
+    // A trailing `CRLF` and a line that ends the body: nothing here is a bare
+    // `LF`, and every `\n` is preceded by a `\r`.
+    message.extend_from_slice(b"last line\r\n");
+    assert!(
+        message.len() as u64 > 2 * LIMIT,
+        "the body must dwarf the header bound: {} vs {LIMIT}",
+        message.len()
+    );
+    let (data, bdat) = both_ways("body-clean", &message).await;
+    assert_eq!(data.code, 250, "a CRLF body over DATA: {data:?}");
+    assert_eq!(
+        bdat.code, 250,
+        "a CRLF body over BDAT must stay accepted — the scan refuses bare LF, \
+         not chunked messages: {bdat:?}"
+    );
+    assert_duality("a CRLF body", &data, &bdat);
+    assert_eq!(data.queued, 1);
+    assert_eq!(bdat.queued, 1);
+}
+
+/// A body whose **first** line is empty and whose `LF`s are all part of a
+/// `CRLF`: the boundary of the rule.
+///
+/// The bare-`LF` test in the other direction (`\n` at the start of a line) is
+/// what a naive `contains(&b'\n')` gets wrong: the octet after every legal line
+/// ending *is* an `LF`, and a check that looked for `\n` at a line start
+/// without looking behind it would refuse every message with a blank line in
+/// it. This message is mostly blank lines.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_of_blank_lines_agrees_both_ways() {
+    let mut message = b"From: <a@example.net>\r\n\r\n".to_vec();
+    for _ in 0..64 {
+        message.extend_from_slice(b"\r\n");
+    }
+    message.extend_from_slice(b"after the blanks\r\n");
+    let (data, bdat) = both_ways("body-blank-lines", &message).await;
+    assert_eq!(
+        data.code, 250,
+        "blank lines are `CRLF`-terminated lines, not bare LFs: {data:?}"
+    );
+    assert_eq!(bdat.code, 250, "and over BDAT: {bdat:?}");
+    assert_duality("a body of blank lines", &data, &bdat);
+    assert_eq!(bdat.queued, 1);
+}
+
+/// A `DKIM-Signature` carrying an `l=` (body-length, RFC 6376 §3.5) tag does
+/// not change the answer: a bare `LF` behind the blank line is still refused by
+/// both transports.
+///
+/// `l=` is the one signature form that *invites* a sender to append octets past
+/// what was signed, so it is exactly where a smuggled envelope would be put.
+/// The transport refusal is upstream of DKIM — it has to fire before any body
+/// hash is taken, whatever the signature says about how much of the body it
+/// covers — and the two transports have to agree that it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_length_signature_does_not_excuse_a_body_bare_lf() {
+    use base64::Engine;
+    use mail_auth::crypto::{HashContext, HashImpl, Sha256};
+    use mail_auth::headers::Writable;
+
+    // The signed prefix and the `bh=` it hashes to, under `simple`
+    // canonicalization (the prefix, then one CRLF).
+    let signed_body = b"this part is signed\r\n";
+    let signed = signed_body.len() as u64;
+    let canonical = [signed_body.as_slice(), b"\r\n"].concat();
+    let mut hasher = <Sha256 as HashImpl>::hasher();
+    canonical.as_slice().write(&mut hasher);
+    let bh = base64::engine::general_purpose::STANDARD.encode(hasher.complete().as_ref());
+
+    let head = format!(
+        "From: <a@example.net>\r\nSubject: l tag\r\n\
+         DKIM-Signature: v=1; a=rsa-sha256; c=simple/simple; d=example.net; \
+         s=s1; l={signed}; h=From:Subject; bh={bh}; b=AAAA\r\n\r\n"
+    );
+
+    // The unsigned tail carries the bare `LF`: the shape a sender would use to
+    // append a second envelope under a signature that covers only the prefix.
+    let mut message = head.into_bytes();
+    message.extend_from_slice(signed_body);
+    message.extend_from_slice(b"unsigned tail\r\nsmuggled\nMAIL FROM:<evil@example.net>\r\n");
+
+    // The signature must really be in the message, or this test proves nothing
+    // about `l=`.
+    let text = String::from_utf8_lossy(&message);
+    assert!(text.contains("; l="), "the fixture must carry the l= tag");
+    assert!(
+        text.contains(&format!("l={signed};")),
+        "the fixture must carry the limit it hashes: {signed}"
+    );
+
+    let (data, bdat) = both_ways("body-l-signature", &message).await;
+    assert_eq!(
+        data.code, 554,
+        "DATA refuses the bare LF in the unsigned tail: {data:?}"
+    );
+    assert_eq!(
+        bdat.code, 554,
+        "and BDAT: an `l=` signature is not a licence to append octets: {bdat:?}"
+    );
+    assert_duality("a body-length signature", &data, &bdat);
+    assert_eq!(data.queued, 0);
+    assert_eq!(bdat.queued, 0);
 }
