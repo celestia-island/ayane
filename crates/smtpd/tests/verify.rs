@@ -836,6 +836,41 @@ fn dmarc_fail_under_a_quarantine_policy_refuses_at_this_layer() {
 }
 
 #[test]
+fn a_subdomain_without_its_own_record_takes_the_parents_sp_policy() {
+    // RFC 9989's tree walk: `_dmarc.sender.example` has nothing, the walk
+    // goes up to `_dmarc.example`, which carries `p=none; sp=quarantine;
+    // np=reject`. A message from `ada@sender.example` must therefore be judged
+    // by `sp=quarantine`, not `p=none` and not `np=reject`.
+    //
+    // This is the assertion that pins the *response code* of the zone's
+    // negative answers: `np=` is selected only when the domain does not exist
+    // (an A record that says NXDOMAIN), and anything other than a clean
+    // NODATA would shuffle the choice between `sp` and `np`.
+    let pair = key_pair();
+    let zone = FixedZone::default()
+        .with_dmarc("example", "v=DMARC1; p=none; sp=quarantine; np=reject")
+        .expect("organizational policy");
+    let message = signed_message(&pair, "subdomain body\r\n", "sp/np");
+
+    let verification = verify(zone, &message, "ada@sender.example");
+    let block = String::from_utf8_lossy(&verification.prepend).to_string();
+    assert!(
+        block.contains("dmarc=fail"),
+        "the signature's key is not published, so DMARC fails: {block}"
+    );
+    assert!(
+        block.contains("policy.dmarc=quarantine"),
+        "an existing subdomain without its own record takes `sp=quarantine`: {block}"
+    );
+    assert_eq!(
+        verification.verdict,
+        PolicyVerdict::Reject,
+        "quarantine is fail-closed at this layer: {}",
+        verification.summary
+    );
+}
+
+#[test]
 fn a_domain_with_no_dmarc_record_is_none_and_accepted() {
     let (message, pair) = dmarc_failing_message();
     let (name, record) = pair.record_pair();
@@ -903,16 +938,15 @@ fn a_name_the_zone_does_not_list_answers_no_records_without_a_query() {
 }
 
 #[test]
-fn a_lookup_inside_the_authority_never_reaches_the_resolver() {
-    // The negative answer is what makes the zone authoritative, and this is
-    // the property stated directly rather than through a verdict: every name
-    // the zone can be asked about gets *an answer* — a record or a NODATA —
-    // and only a name it lists nothing for *and* knows nothing about is left
-    // to the resolver. `None` from the cache is "ask the network"; a
-    // `dkim=permerror` test would pass even if a resolver were asked and
-    // happened to answer, this would not.
-    use mail_auth::dns::{DnsCache, Negative, RecordSet, ResolverCache, TxtRecord};
-    use mail_auth::Mx;
+fn the_zone_answers_every_name_without_contacting_a_resolver() {
+    // **A cache-layer test**: it calls `ResolverCache::get` directly, because
+    // the property it pins is the shape of the answer, which no verdict can
+    // see. `None` from a cache is read by `mail-auth` as "this cache cannot
+    // answer" and becomes a network query, so the zone has to return the
+    // negative entry itself — `TxtRecord::Error(RecordNotFound)` for TXT and
+    // `Err(Negative)` for the rest — and `DnsCache` hands those caches out for
+    // *every* record type, not only the ones the fixture filled in.
+    use mail_auth::dns::{DnsCache, Negative, ResolverCache, TxtRecord};
 
     let pair = key_pair();
     let (name, record) = pair.record_pair();
@@ -944,36 +978,18 @@ fn a_lookup_inside_the_authority_never_reaches_the_resolver() {
         }
     }
 
-    // MX: same question, the `Err(Negative)` shape.
+    // The other record types: a zone that only ever held TXT answers for MX,
+    // A, AAAA and PTR too, because `DnsCache` returns a cache for each.
     let mx = DnsCache::mx(&zone).expect("mx cache");
-    match ResolverCache::get::<str>(mx, "sender.example.") {
-        Some(Err(Negative { .. })) => {}
-        _ => panic!("an MX miss inside the authority is a negative answer"),
-    }
-    // A listed MX would be a `RecordSet`; the marker type is enough to keep
-    // the import honest.
-    let _: Option<Result<RecordSet<Mx>, Negative>> =
-        ResolverCache::get::<str>(mx, "sender.example.");
-}
-
-#[test]
-fn an_unlisted_name_is_answered_by_the_zone_not_the_resolver() {
-    // The cache-level half of the contract, and the one property the
-    // decision-path test above cannot show: a *miss inside the authority* must
-    // come back as the NODATA answer. A `None` there means "this cache cannot
-    // answer" to `mail-auth`, which then asks the resolver — so `None` is a
-    // network query wearing the costume of an empty answer.
-    use mail_auth::dns::{DnsCache, ResolverCache};
-
-    let pair = key_pair();
-    let (name, record) = pair.record_pair();
-    let zone = zone_with(&[(&name, &record)]);
-    let cache = DnsCache::txt(&zone).expect("txt cache");
-
-    assert!(
-        ResolverCache::get::<str>(cache, "absent._domainkey.sender.example.").is_some(),
-        "an unlisted name still gets an answer (see the authority test below)"
-    );
+    assert!(matches!(
+        ResolverCache::get::<str>(mx, "no-such-host.invalid."),
+        Some(Err(Negative { .. }))
+    ));
+    let ipv4 = DnsCache::ipv4(&zone).expect("A cache");
+    assert!(matches!(
+        ResolverCache::get::<str>(ipv4, "email-sender.invalid."),
+        Some(Err(Negative { .. }))
+    ));
 }
 
 #[test]

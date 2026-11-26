@@ -38,9 +38,11 @@ use mail_auth::{DnsError, Error, Mx};
 ///
 /// Every answer is valid until this process ends, so nothing expires.
 ///
-/// A name absent from `entries` is answered with the type's negative entry —
-/// an empty answer, not a miss — because the zone asks for a per-type
-/// constructor at build time.
+/// A name absent from `entries` is answered with `miss` — an empty answer, not
+/// a miss. `miss` is a value of the value type rather than something computed
+/// on demand because this type is generic over `V` and cannot know which of
+/// them spells "no records": `TxtRecord::Error(..)` for TXT, `Err(Negative)`
+/// for the rest. The zone supplies it per cache when it is built.
 pub struct FixedCache<K, V> {
     entries: Vec<(K, V)>,
     /// What a miss answers with. Built once, cloned per lookup (these values
@@ -185,12 +187,23 @@ impl DnsCache for FixedZone {
 }
 
 impl FixedZone {
-    /// A zone that answers "no records" to every lookup.
+    /// A zone that answers "no records" to **every** lookup, whatever the
+    /// name — it is not scoped to a set of domains.
     ///
     /// The difference from an unset zone is the whole point of this module: a
     /// verifier built on this one never touches the network, so a result of
     /// `dkim=permerror` here means "the key is not published", not "the query
     /// failed".
+    ///
+    /// # A warning, not a default
+    ///
+    /// Every message verified against this zone comes out with no DKIM
+    /// signature able to pass, no DMARC record able to apply, and therefore
+    /// [`PolicyVerdict::Accept`](crate::PolicyVerdict) by default — the
+    /// fail-closed policy never fires. That is what a test wants and what a
+    /// deployment must never get: an operator-facing verifier uses
+    /// [`Verifier::with_system_resolver`](crate::Verifier::with_system_resolver)
+    /// or a zone built from real records.
     #[must_use]
     pub fn empty_authority() -> Self {
         Self {

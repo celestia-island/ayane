@@ -282,6 +282,17 @@ impl Verifier {
     /// A verifier over a fixed zone: every lookup the verifiers make is
     /// answered from `zone`, and a name the zone does not list has no
     /// records.
+    ///
+    /// # A warning about empty zones
+    ///
+    /// [`FixedZone::default()`] and [`FixedZone::empty_authority()`] publish
+    /// nothing, which makes every message agree with every check that needs a
+    /// record to fail: DKIM is `permerror` whatever the signature, DMARC never
+    /// gets a policy to enforce, and the verdict is
+    /// [`PolicyVerdict::Accept`] for every input — a run against one exercises
+    /// the code path but proves nothing about fail-closed. That is fine for a
+    /// test that supplies its own records; it must never be what a deployment
+    /// is wired to.
     #[must_use]
     pub fn with_zone(hostname: impl Into<String>, zone: FixedZone) -> Self {
         Self::from_parts(hostname.into(), Some(zone))
