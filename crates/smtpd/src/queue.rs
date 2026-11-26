@@ -290,6 +290,15 @@ impl Spool {
     }
 
     /// `fsync` the directory `dir`, reporting it to the observer.
+    ///
+    /// The same limit as [`Spool::sync_file`] applies, and it is worth
+    /// stating on both: removing the `fsync` *inside* this call is not
+    /// observable from a test in this process either. What the tests pin is
+    /// the report order — so they go red when a whole `sync_dir` call is
+    /// removed or the two reports are swapped, not when the syscall behind
+    /// one of them is deleted. Verified out of process once with an
+    /// `LD_PRELOAD` shim on `fsync(2)`: the commit path issues
+    /// `FILE <id>.eml` → `FILE <id>.json` → `DIR new`, in that order.
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         let result = fsync_dir(dir);
         if result.is_ok() {
@@ -736,6 +745,10 @@ impl StagedMessage {
                 .create_new(true)
                 .open(&json_tmp)?;
             meta.write_all(&json_bytes)?;
+            // The metadata's own sync: like the data file's, deleting this
+            // line is invisible in-process (nothing reports it); the shim
+            // above is what confirmed it really reaches the medium, between
+            // the data file's sync and the directory's.
             meta.sync_all()
         };
         if let Err(err) = write_meta() {
