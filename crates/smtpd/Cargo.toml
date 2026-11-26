@@ -1,6 +1,6 @@
 [package]
 name = "ayane-smtpd"
-description = "Inbound SMTP server for the ayane mail service: the crash-safe file spool (a message is acknowledged only after the data and the directory entry are durable)"
+description = "Inbound SMTP server for the ayane mail service: the RFC 5321 session state machine (PIPELINING/SIZE/CHUNKING/SMTPUTF8) and the crash-safe file spool (a message is acknowledged only after the data and the directory entry are durable)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,13 @@ license-file.workspace = true
 readme = "../../README.md"
 
 [dependencies]
+ayane-mail = { workspace = true }
+ayane-proto = { workspace = true }
+base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
