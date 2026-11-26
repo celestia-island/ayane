@@ -210,6 +210,144 @@ async fn the_bound_applies_without_a_verifier() {
     harness.stop();
 }
 
+/// The two transports refuse the same message, which is what makes the bound
+/// a policy instead of a per-transport accident.
+///
+/// The shape is the one an earlier version got wrong: a **small** header
+/// section (a blank line a hundred octets in) on top of a body far larger
+/// than the bound. Charged line by line over `DATA` that is obviously fine —
+/// the blank line ends the section and the body is never counted. Charged as
+/// one blob over `BDAT`, where the chain is raw octets with no line structure
+/// left, the same message became "a header section the size of the message"
+/// and was refused with `552`. Same limit, same message, two answers: a
+/// difference a sender can probe for, and a refusal a legitimate chunking
+/// client cannot act on.
+///
+/// Both transports are driven here, over one `max_header_bytes`, so the
+/// assertion is that the answers **match** — not that each is whatever it was
+/// last time.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_transports_answer_the_same_message_the_same_way() {
+    const SMALL_HEAD: &str = "From: <a@example.net>\r\nSubject: dual\r\n\r\n";
+
+    /// A body several times the header bound, as a string.
+    fn big_body() -> String {
+        let mut body = String::new();
+        for _ in 0..200 {
+            body.push_str(&"b".repeat(64));
+            body.push_str("\r\n");
+        }
+        body
+    }
+
+    let head_len = SMALL_HEAD.len();
+    let body = big_body();
+    assert!(
+        (head_len as u64) <= LIMIT,
+        "the section must fit under the bound: {head_len} vs {LIMIT}"
+    );
+    assert!(
+        body.len() as u64 > 2 * LIMIT,
+        "the body must dwarf the bound: {} vs {LIMIT}",
+        body.len()
+    );
+
+    // DATA: a hundred-octet head, then a body several times the bound.
+    let data_harness = Harness::start("dual-data", bounded()).await;
+    let mut client = transaction(&data_harness);
+    client.expect("DATA", 354);
+    client.send_raw(format!("{SMALL_HEAD}{body}.\r\n").as_bytes());
+    let over_data = client.read_reply().code;
+    let queued_over_data = data_harness.queued().len();
+    data_harness.stop();
+
+    // BDAT: the same octets, one chunk, `LAST`.
+    let bdat_harness = Harness::start("dual-bdat", bounded()).await;
+    let mut client = transaction(&bdat_harness);
+    let message = format!("{SMALL_HEAD}{body}").into_bytes();
+    client.pending(&message);
+    let over_bdat = client.command(&format!("BDAT {} LAST", message.len())).code;
+    let queued_over_bdat = bdat_harness.queued().len();
+    bdat_harness.stop();
+
+    assert_eq!(
+        over_data, 250,
+        "a small head over DATA is accepted, whatever the body weighs"
+    );
+    assert_eq!(
+        over_bdat, 250,
+        "and over BDAT: the blank line ends the section there too"
+    );
+    assert_eq!(
+        over_bdat, over_data,
+        "the two transports must not disagree about the same message"
+    );
+    assert_eq!(queued_over_data, 1, "the DATA copy is queued");
+    assert_eq!(queued_over_bdat, 1, "the BDAT copy is queued");
+}
+
+/// The same pair, on the refusing side: **no blank line at all** past the
+/// bound is a header section over the bound over either transport.
+///
+/// This is the other half of the duality — the fix above must not have made
+/// `BDAT` permissive, only *symmetric*. A message whose head never ends is
+/// refused by `DATA` for the reason the bound exists (the verifier would hold
+/// it whole), and `BDAT` has to say the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_transports_refuse_a_head_that_never_ends() {
+    let mut endless = String::from("From: <a@example.net>\r\n");
+    endless.push_str(&headers(200));
+    assert!(
+        endless.len() as u64 > LIMIT,
+        "the head must outgrow the bound: {} vs {LIMIT}",
+        endless.len()
+    );
+
+    let data_harness = Harness::start("dual-refuse-data", bounded()).await;
+    let mut client = transaction(&data_harness);
+    client.expect("DATA", 354);
+    client.send_raw(format!("{endless}.\r\n").as_bytes());
+    let over_data = client.read_reply();
+    data_harness.stop();
+
+    let bdat_harness = Harness::start("dual-refuse-bdat", bounded()).await;
+    let mut client = transaction(&bdat_harness);
+    let message = endless.into_bytes();
+    client.pending(&message);
+    let over_bdat = client.command(&format!("BDAT {} LAST", message.len()));
+    bdat_harness.stop();
+
+    for (transport, reply) in [("DATA", &over_data), ("BDAT", &over_bdat)] {
+        assert_eq!(reply.code, 552, "{transport}: {reply:?}");
+        assert_eq!(
+            reply.text, "5.3.4 Header section too large",
+            "{transport}: {reply:?}"
+        );
+    }
+    assert_eq!(over_bdat.code, over_data.code, "same answer, both ways");
+}
+
+/// One chunk that is *itself* larger than the bound, holding a short head and
+/// a long body, still goes through: the bound is on the section, and a single
+/// chunk is not a section.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_chunk_is_not_a_header_section() {
+    let harness = Harness::start("dual-single-chunk", bounded()).await;
+    let mut client = transaction(&harness);
+    let mut message = String::from("From: <a@example.net>\r\nSubject: one chunk\r\n\r\n");
+    message.push_str(&"c".repeat((LIMIT as usize) * 3));
+    message.push_str("\r\n");
+    let bytes = message.into_bytes();
+    client.pending(&bytes);
+    let reply = client.command(&format!("BDAT {} LAST", bytes.len()));
+    assert_eq!(
+        reply.code, 250,
+        "a big body in one chunk is fine: {reply:?}"
+    );
+    assert_eq!(harness.queued().len(), 1);
+    harness.stop();
+}
+
 #[test]
 fn the_default_bound_is_one_mebibyte() {
     // The default a deployment gets unless it says otherwise. Keeping it here

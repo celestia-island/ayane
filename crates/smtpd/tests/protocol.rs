@@ -340,7 +340,8 @@ async fn max_messages_per_connection_ends_the_session() {
     assert_eq!(
         harness.queued().len(),
         2,
-        "the tenth message is still spooled; the 421 is about the connection"
+        "both messages are spooled — the 421 is about the connection, not the \
+         message it just accepted"
     );
     harness.stop();
 }

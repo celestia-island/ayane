@@ -641,23 +641,60 @@ struct HeaderBudget {
 }
 
 impl HeaderBudget {
-    /// Counts one received line, answering whether it ended the header
-    /// section.
-    fn consume(&mut self, octets: &[u8]) -> bool {
+    /// Counts one received `DATA` line.
+    ///
+    /// Lines arrive one at a time there, so the section ends exactly on the
+    /// line that is the blank one — and from that line on nothing is counted.
+    fn consume(&mut self, octets: &[u8]) {
         if self.ended {
-            return true;
+            return;
         }
         self.consumed = self.consumed.saturating_add(octets.len() as u64);
         if header_ends_at(octets) {
             self.ended = true;
         }
-        self.ended
+    }
+
+    /// Counts a **whole** message assembled from elsewhere.
+    ///
+    /// A `BDAT` chain is raw octets: by the time it is whole there are no line
+    /// boundaries left to hand to [`HeaderBudget::consume`], and feeding it the
+    /// message as one "line" would make every chained message look like a
+    /// header section the size of the message. So the section is found the way
+    /// RFC 5322 defines it — everything up to the first blank line, that line
+    /// included — and only that prefix is charged. A message with no blank
+    /// line at all has no body, and its whole length is the section, which is
+    /// the case the bound exists for.
+    ///
+    /// This is the same rule `DATA` applies, reached from the other side: the
+    /// two transports must refuse the same messages, or a client can pick the
+    /// one that answers what it likes.
+    fn consume_message(&mut self, message: &[u8]) {
+        if self.ended {
+            return;
+        }
+        self.consumed = self.consumed.saturating_add(header_len(message) as u64);
+        self.ended = true;
     }
 
     /// Whether the header section has taken more than `limit` octets.
     fn over(&self, limit: u64) -> bool {
         self.consumed > limit
     }
+}
+
+/// How many octets of `message` are header section: up to and including the
+/// blank line that ends the section, or the whole message when it has none.
+///
+/// The blank line is `<CRLF><CRLF>`; a message whose very first octets are the
+/// blank line has an empty header section of two octets, and a message with no
+/// such pair anywhere is all header.
+fn header_len(message: &[u8]) -> usize {
+    const BLANK_LINE: &[u8] = b"\r\n\r\n";
+    message
+        .windows(BLANK_LINE.len())
+        .position(|window| window == BLANK_LINE)
+        .map_or(message.len(), |offset| offset + BLANK_LINE.len())
 }
 
 /// Whether a received line (CRLF included) is the blank line that ends the
@@ -918,16 +955,11 @@ impl Connection {
         match reply.action.clone() {
             Action::Continue | Action::Close => Ok(Some(reply)),
             Action::StartTls => {
-                // The `220` names the handshake, and it has to be on the wire
-                // before the acceptor is handed the stream: a client that
-                // pipelined its `ClientHello` right behind `STARTTLS` has
-                // those octets in flight, and `write` flushes this reply
-                // first, so the handshake reads nothing but the handshake.
-                let ready = Reply {
-                    text: "Ready to start TLS".to_owned(),
-                    ..reply
-                };
-                self.write(&ready).await?;
+                // The reply is the session's to word; the driver's job is to
+                // put it on the wire before the handshake starts. `write`
+                // flushes, so the `220` is out of the userspace buffer before
+                // the acceptor is handed the stream.
+                self.write(&reply).await?;
                 self.upgrade_tls().await?;
                 Ok(None)
             }
@@ -1445,14 +1477,15 @@ impl Connection {
         }
         // The header bound, applied to the reassembled message. It cannot be
         // charged line by line the way `DATA` charges it — a chunk is raw
-        // octets with no line structure until the chain is whole — so it is
-        // charged once, here, on what the client actually sent. The chunk's
-        // octets are already in memory by then (bounded by
-        // [`max_bdat_total`]); what this protects is the verifier's header
-        // buffer and the mailbox, which is what would otherwise hold a header
-        // section the size of the whole message.
+        // octets with no line structure until the chain is whole — so the
+        // blank line is located *in* the message here and only the section it
+        // closes is charged ([`HeaderBudget::consume_message`]). Charging the
+        // whole record instead would count every chained message's body as
+        // header: the same message would be refused over `BDAT` and accepted
+        // over `DATA`, which is a discrepancy a sender can see and a refusal a
+        // legitimate chunking client can do nothing about.
         self.header = HeaderBudget::default();
-        self.header.consume(&record);
+        self.header.consume_message(&record);
         if self.header.over(self.config.max_header_bytes) {
             tracing::info!(
                 consumed = self.header.consumed,
