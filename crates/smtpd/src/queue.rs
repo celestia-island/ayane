@@ -36,8 +36,12 @@
 //! [`RecoveryReport::failed`], so a full disk cannot make a run look clean.
 //!
 //! **Recovery does not delete a live writer's file.** A temporary file that a
-//! process still holds open, or whose id names a running process, stays where
-//! it is: that writer will commit it (or [`StagedMessage::abandon`] it).
+//! process still holds open stays where it is. So does a young file whose id
+//! names a running process — including this one: a short-lived `tmp/` file
+//! (a dropped handle, a cancelled task) is left untouched during the grace
+//! window [`TMP_RESIDUE_AGE`], because a late leftover costs disk and a wrong
+//! deletion costs a message. Only after that window can the id alone make it
+//! a leftover.
 //!
 //! For that to work with more than one process, the writer must ask the spool
 //! for its ids: [`Spool::open`] → [`Spool::recover`] →
@@ -387,16 +391,17 @@ impl Spool {
 
     /// Cleans up after a crash and reports what was found.
     ///
-    /// Idempotent and safe to run while another process is writing: a
-    /// `tmp/` file is only deleted once it is *provably* abandoned — no
-    /// process holds it open, and its id names either this process or a
-    /// process that no longer exists; a file without a usable id must be
-    /// older than [`TMP_RESIDUE_AGE`].
+    /// Idempotent and safe to run while another process is writing. A `tmp/`
+    /// file is deleted only when no process holds it open *and* either its id
+    /// names a process that no longer exists, or — when the id names a
+    /// process that still runs, this one included — it is older than
+    /// [`TMP_RESIDUE_AGE`]; a file without a usable id must be that old too.
     ///
-    /// A file a live writer still holds is left where it is: that writer
-    /// commits it (or [`StagedMessage::abandon`]s it). Writers must therefore
-    /// take their ids from [`Spool::next_id`] *after* calling `recover` (see
-    /// the module docs).
+    /// A young file is never deleted on the strength of its id alone: the
+    /// writer that owns it may be this very process, between dropping a
+    /// handle and committing. Writers must still take their ids from
+    /// [`Spool::next_id`] *after* calling `recover` (see the module docs) so
+    /// their live files are recognisably live.
     ///
     /// Failures to remove or move something are not swallowed: they are
     /// logged and returned in [`RecoveryReport::failed`], so a full disk
@@ -661,10 +666,15 @@ impl StagedMessage {
             self.size = moved;
         }
         // 2. The message survives a power cut: fsync the file itself. One
-        //    handle covers the moved body and the prepended block alike: the
-        //    write head never leaves the end of the message (a second
-        //    descriptor would have its own head at 0 and write `prepend` over
-        //    the start instead of in front of the message).
+        //    handle and one write head cover the moved body and the prepended
+        //    block alike, which keeps the cursor story in one place: `*&File`
+        //    is a place expression, so `seek`/`write` through a rebound local
+        //    (`let mut handle = file`) move this file's offset, while a second
+        //    `OpenOptions` handle would carry a cursor of its own. (The move
+        //    leaves `[0, offset)` empty, so a second descriptor writing
+        //    exactly `offset` octets at 0 fills that hole rather than
+        //    clobbering the message — the single head is clarity, not a
+        //    correctness fix.)
         if let Err(err) = file.sync_all() {
             drop(file);
             self.discard();
@@ -850,10 +860,14 @@ fn hash_until(file: &mut &File, length: Option<u64>, hasher: &mut Sha256) -> io:
     Ok(())
 }
 
-/// Writes `block` over the first octets the move left free. Neither `seek` nor
-/// `write_all` on a `File` touches the offset (the `io::Seek` impl
-/// `*&File` -> `&mut File` would), so the single write head stays past the end
-/// of the message, exactly where [`StagedMessage::write`] left it.
+/// Writes `block` over the first octets the move left free.
+///
+/// Neither `seek` nor `write_all` on a `File` touches the offset (the
+/// `io::Seek`/`io::Write` impls for `*&File` -> `&mut File` would move it), so
+/// the single write head stays past the end of the message, exactly where
+/// [`StagedMessage::write`] left it. Writability alone would suffice here —
+/// `[0, block.len())` is the hole `move_in_file` left — so this is about not
+/// juggling a second cursor, not about where the octets land.
 fn write_at_start(file: &File, block: &[u8]) -> io::Result<()> {
     use std::io::{Seek as _, SeekFrom};
     let mut handle = file;
@@ -873,13 +887,11 @@ fn read_envelope(dir: &Path, id: &str) -> io::Result<Envelope> {
 ///    in the middle of staging it. This is the only signal that survives the
 ///    pid checks below being wrong (a crashed process whose pid got reused, a
 ///    file from another host), so it comes first and wins.
-/// 2. Carrying **this process's** pid: nothing of ours outlives a restart, so
-///    a fresh spool owns it.
-/// 3. Carrying the pid of a process that is **gone**: the writer died.
-/// 4. Carrying a still-running pid, or no id at all: only the residue-age
-///    threshold (on the `.eml` of the same id) can decide, because only the
-///    writer's absence over a whole window proves abandonment, and only the
-///    `.eml` is kept up to date while a message is being received.
+/// 2. Carrying the pid of a process that is **gone**: the writer died.
+/// 3. Carrying **any** live pid — this process's included — or no id at all:
+///    only the residue-age threshold (clocked on the `.eml` of the same id)
+///    can decide. A live id is not proof of abandonment; a file somebody is
+///    still writing in this process has a live id too.
 fn tmp_leftover(path: &Path) -> Option<&'static str> {
     let name = path.file_name()?.to_string_lossy();
     let id = if let Some(stem) = name.strip_suffix(".eml") {
@@ -894,7 +906,13 @@ fn tmp_leftover(path: &Path) -> Option<&'static str> {
         return residue_expired(path).then_some("no queue id and older than the residue threshold");
     };
     if pid == std::process::id() {
-        return Some("this process's own id");
+        // Our own id: the staging handle is gone, but the writer may still be
+        // this process — a dropped handle, a cancelled task, a panic unwind
+        // leaves a young file behind until the commit that owns it runs.
+        // Only a file nobody has touched for a whole residue window is a
+        // leftover; a young one is left alone.
+        return residue_expired(path)
+            .then_some("this process's own id, untouched for the residue age");
     }
     if !process_alive(pid) {
         return Some("the process that staged it is gone");
@@ -1184,6 +1202,17 @@ mod tests {
         std::fs::write(path, b"left by a writer that is gone").expect("residue");
     }
 
+    /// Backdates `path` to `age` before now.
+    fn age_to(path: &Path, age: Duration) {
+        let stamp = SystemTime::now() - age;
+        File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_modified(stamp)
+            .expect("age it");
+    }
+
     /// Commits `original` behind `prepend` and returns the spool with both
     /// the stored bytes and the queue's own record of the file.
     fn staged_with_prepend(
@@ -1361,6 +1390,82 @@ mod tests {
         assert!(spool.list(QueueState::New).expect("list").is_empty());
         assert!(root.join("corrupt").join(format!("{id}.eml")).exists());
         assert!(!root.join("new").join(format!("{id}.json")).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_keeps_this_process_s_young_tmp_file() {
+        // N2: the id names this very process, the staging handle is gone (a
+        // dropped handle, a cancelled task, a panic unwind), and the file is
+        // fresh. The writer that owns it may still commit it, so it must
+        // survive recovery; only once nobody has touched it for the whole
+        // residue window is it a leftover.
+        let root = temp_root("own-pid");
+        let spool = Spool::open(&root).expect("spool");
+        let tmp = root.join("tmp");
+
+        let young_id = spool.next_id();
+        let young = tmp.join(format!("{young_id}.eml"));
+        {
+            let mut staged = spool.stage(&young_id, envelope(&young_id)).expect("stage");
+            staged
+                .write(b"Subject: hi\r\n\r\nhalf a message\r\n")
+                .expect("write");
+            // Give the handle up without committing or abandoning.
+            drop(staged);
+        }
+        assert!(young.exists(), "the file outlives its handle");
+
+        let report = spool.recover().expect("recover");
+        assert_eq!(
+            report.tmp_removed, 0,
+            "a young own-pid file is not a leftover"
+        );
+        assert!(report.failed.is_empty());
+        assert!(young.exists(), "the message must still be there");
+
+        age_to(&young, TMP_RESIDUE_AGE + Duration::from_secs(3600));
+        let report = spool.recover().expect("recover");
+        assert_eq!(
+            report.tmp_removed, 1,
+            "two hours untouched makes it a leftover"
+        );
+        assert!(!young.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_reports_an_orphan_metadata_it_could_not_remove() {
+        // N3: the envelope without its message is the one orphan the commit
+        // order can leave. When the removal fails (here: a read-only `new/`,
+        // as on a full or read-only medium) recovery must not count it as
+        // discarded and must not stay silent.
+        let root = temp_root("orphan-failure");
+        let spool = Spool::open(&root).expect("spool");
+        let new = root.join("new");
+        let id = dead_id();
+        let orphan = new.join(format!("{id}.json"));
+        std::fs::write(&orphan, b"{}").expect("orphan");
+
+        let meta = std::fs::metadata(&new).expect("meta");
+        let mut permissions = meta.permissions();
+        let writable = permissions.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o500);
+        std::fs::set_permissions(&new, permissions).expect("make new/ read-only");
+
+        let report = spool.recover().expect("recover");
+        std::fs::set_permissions(&new, writable).expect("restore new/");
+
+        assert_eq!(report.orphan_metadata, 0, "nothing was discarded");
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|line| line.contains(&id) && line.contains("remove")),
+            "the report names the orphan and the step: {:?}",
+            report.failed
+        );
+        assert!(orphan.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
