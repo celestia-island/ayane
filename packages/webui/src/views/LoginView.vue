@@ -10,6 +10,7 @@ import {
   type HkLoginChannel,
   type HkLoginCredentialsChannel,
   type HkLoginDiscovery,
+  type HkLoginSsoChannel,
   type HkMfaFactor,
 } from "@celestia-island/hikari";
 
@@ -22,12 +23,13 @@ import logoUrl from "../res/ayane.webp";
 
 /**
  * The sign-in channels come from the server's login policy (the family
- * contract): the password card, plus one row per provider the deployment
+ * contract): the password card, plus one TAB per provider the deployment
  * CONFIGURED. A deployment with no provider renders a plain card — an
  * unconfigured provider must never surface as a dead option. hikari's
  * adapter maps the document to channels; this view enriches the password
- * card with its own copy and keeps the provider rows as buttons (the
- * navigation target needs a server ticket, so the row carries no href).
+ * card with its own copy and turns every provider into its own sso tab
+ * (the navigation target needs a server ticket, so the tab carries no
+ * href — the click starts the sign-in instead).
  */
 const policy = ref<HkLoginDiscovery | null>(null);
 
@@ -38,6 +40,15 @@ function providerLabel(id: string): string {
   const key = `login.provider.${id}`;
   const label = t(key);
   return label === key ? id : label;
+}
+
+/** The segment label of a provider tab: the app copy for a KNOWN
+ *  provider, else the family-neutral tab word — a server-carried
+ *  provider string never reaches the tab. */
+function providerTabLabel(id: string): string {
+  const key = `login.provider.${id}`;
+  const label = t(key);
+  return label === key ? t("login.channel.provider") : label;
 }
 
 /** Where the browser asked to land after signing in (a same-origin path). */
@@ -109,11 +120,11 @@ onMounted(async () => {
 });
 
 /**
- * The segment group the family's login pages share: the mailbox card and
- * the family IdP are PEER lanes, so Celestia ID is a TAB, never a row
- * under the mailbox card. Every other configured provider stays an
- * alternative row inside the mailbox card — a deployment that registers
- * something else still reaches it without a second tab.
+ * The segment group the family's login pages share: the mailbox card,
+ * the family IdP as a PEER lane (Celestia ID is a named TAB, never a row
+ * under the mailbox card), and every other configured provider as its
+ * OWN sso tab — the alternative-row syntax under the card is gone from
+ * the family contract.
  */
 const PEER_PROVIDER = "celestia";
 
@@ -121,9 +132,7 @@ const channels = computed<HkLoginChannel[]>(() => {
   const plan = hkLoginPlanFromDiscovery(policy.value ?? LOCAL_POLICY, {
     credentialsKey: "credentials",
   });
-  const rows = plan.channels.flatMap((entry) =>
-    entry.mode === "credentials" ? (entry.methods ?? []) : [],
-  );
+  const rows = plan.channels.filter((entry): entry is HkLoginSsoChannel => entry.mode === "sso");
   const peer = rows.find((row) => row.key === PEER_PROVIDER);
   const others = rows.filter((row) => row !== peer);
 
@@ -140,17 +149,12 @@ const channels = computed<HkLoginChannel[]>(() => {
     // password is a factor, and factors are proven on the verify step.
     passwordField: false,
   };
-  if (others.length > 0) {
-    // The provider rows: no href — the target needs a server ticket, so
-    // `method-select` starts the sign-in and navigates.
-    mailbox.methods = others.map((row) => ({
-      key: row.key,
-      label: providerLabel(row.key),
-      disabled: starting.value !== null,
-    }));
-    mailbox.methodsDivider = t("login.methodsDivider");
-  }
 
+  // One tab per provider: the peer keeps its named tab, the rest get the
+  // row copy on the card button and the app's tab word (or the neutral
+  // one) on the segment. No href — the target needs a server ticket, so
+  // the click starts the sign-in and navigates. No icon — the wire
+  // carries an icon URL, and the row renders vnodes, not strings.
   const list: HkLoginChannel[] = [mailbox];
   if (peer !== undefined) {
     list.push({
@@ -161,6 +165,19 @@ const channels = computed<HkLoginChannel[]>(() => {
       subtitle: t("login.subtitle"),
       icon: undefined,
       buttonLabel: providerLabel(peer.key),
+    });
+  }
+  for (const row of others) {
+    list.push({
+      key: row.key,
+      mode: "sso",
+      label: providerTabLabel(row.key),
+      title: t("login.title"),
+      subtitle: t("login.subtitle"),
+      icon: undefined,
+      buttonLabel: providerLabel(row.key),
+      // While a provider sign-in is starting, every provider tab rests.
+      disabled: starting.value !== null,
     });
   }
   return list;
@@ -225,15 +242,13 @@ async function claim(code: string): Promise<void> {
   }
 }
 
-/** A provider row was picked: ask for a ticket and leave for the provider. */
-/** A provider tab / row was picked: ask for a ticket and leave. The SSO
- *  tab carries the provider id as its channel key, so both events land
- *  on the same start. */
+/** A provider tab was picked: ask for a ticket and leave. The tab's
+ *  channel key IS the provider id, so every provider tab lands here. */
 function onSsoClick(provider: string): void {
-  void startProvider(provider, provider);
+  void startProvider(provider);
 }
 
-async function startProvider(_channel: string, provider: string): Promise<void> {
+async function startProvider(provider: string): Promise<void> {
   if (starting.value !== null) return;
   starting.value = provider;
   try {
@@ -333,7 +348,6 @@ function onHandoffBack(): void {
       :verify-subtitle="unlockAddress !== null ? t('login.unlock.subtitle', { name: account }) : undefined"
       :logo-src="logoUrl"
       @account-submit="onAccountSubmit"
-      @method-select="startProvider"
       @sso-click="onSsoClick"
       @verify="onVerify"
       @verify-back="onVerifyBack"
