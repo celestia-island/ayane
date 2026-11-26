@@ -63,6 +63,11 @@ expression = "LicenseRef-SySL-1.0"
 license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
 
 [[licenses.clarify]]
+name = "ayane-smtpd"
+expression = "LicenseRef-SySL-1.0"
+license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]
+
+[[licenses.clarify]]
 name = "ayane-mail"
 expression = "LicenseRef-SySL-1.0"
 license-files = [{ path = "LICENSE", hash = 0x4313eae3 }]

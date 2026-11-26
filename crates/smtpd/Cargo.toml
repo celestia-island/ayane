@@ -1,0 +1,22 @@
+[package]
+name = "ayane-smtpd"
+description = "Inbound SMTP server for the ayane mail service: the crash-safe file spool (a message is acknowledged only after the data and the directory entry are durable)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
+
+[lints]
+workspace = true

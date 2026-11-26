@@ -290,6 +290,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ayane-smtpd"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ayane-store"
 version = "0.1.0"
 dependencies = [
