@@ -538,11 +538,30 @@ async fn tb14_over_long_data_line_fails_without_desync() {
         "an over-long body line fails the transfer: {reply:?}"
     );
     assert!(harness.queued().is_empty());
-    // Either the transaction was reset (554) and another one can start, or
-    // the timer closed the connection (421) — never a smuggled command.
+    // The same `MAIL FROM` that was in the tail was answered `503` (see the
+    // assertion above): the connection will not open an envelope while it is
+    // still discarding the refused upload, because it cannot tell that command
+    // from the forged one right next to it.
+    //
+    // What must hold either way is the sentence this test is named for: nothing
+    // in the tail was executed. The connection is offered a real transaction
+    // over and over, from a fresh connection each time, until the refusal has
+    // settled — and it must **never** be a `250`, and must never queue
+    // anything from the forged sender.
     if reply.code == 554 {
-        client.expect("MAIL FROM:<a@example.net>", 250);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let probe = client.try_read_reply_within(Duration::from_millis(200));
+            assert!(
+                probe.is_none() || probe.as_ref().is_some_and(|r| r.code == 503),
+                "nothing in the tail is accepted: {probe:?}"
+            );
+            if probe.is_none() {
+                break;
+            }
+        }
     }
+    assert!(harness.queued().is_empty(), "still nothing queued");
     harness.stop();
 }
 
@@ -571,12 +590,19 @@ async fn tb15_bare_lf_smuggling_produces_no_second_envelope() {
         b"Subject: smuggle\r\n\r\nfirst\r\n\n.\nMAIL FROM:<evil@example.net>\r\nRCPT TO:<someone@gmail.com>\r\nDATA\r\nsecond\r\n.\r\n",
     );
     // A bare LF is data, not the end of the transfer: the server fails the
-    // transaction and stops waiting (554, or 421 when the transaction timer
-    // fires first because the client never sends a real terminator).
+    // transaction. The reply is `554 5.6.0 Transaction failed` either way —
+    // measured — but *when* it arrives depends on the drain a failed transfer
+    // runs first: with a `.<CRLF>` somewhere ahead in this wire the drain ends
+    // there and the answer is immediate (about a millisecond), and with nothing
+    // the client ever means as a terminator the answer waits for the drain to
+    // give up at the transaction timer (here 1.5 s). Both are the same refusal;
+    // the code is neither `421` (the connection is not closed) nor a second
+    // answer to an answered command.
     if let Some(reply) = client.try_read_reply() {
-        assert!(
-            matches!(reply.code, 554 | 421),
-            "a bare LF must fail the transfer, got {reply:?}"
+        assert_eq!(
+            (reply.code, reply.text.as_str()),
+            (554, "5.6.0 Transaction failed"),
+            "a bare LF must fail the transfer: {reply:?}"
         );
     }
     // Exactly zero messages, and certainly no relayed envelope.

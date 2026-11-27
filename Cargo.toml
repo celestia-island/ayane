@@ -48,6 +48,8 @@ mail-parser = "^1"
 ammonia = "^4"
 hickory-resolver = { version = "^0.26", features = ["tokio", "system-config"] }
 sha2 = "^0.10"
+# byte scanning: one memchr pass per bound the driver applies to a message
+memchr = "^2"
 rust-embed = { version = "^8", features = ["interpolate-folder-path"] }
 base64 = "^0.22"
 reqwest = { version = "^0.12", default-features = false, features = ["json", "rustls-tls"] }
