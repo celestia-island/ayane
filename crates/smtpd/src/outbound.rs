@@ -1746,6 +1746,18 @@ impl Signer {
 ///   state names the selector (which is public); the environment delivers the
 ///   key. Nothing this function touches is ever written back.
 ///
+/// # Upgrading: the variable name changed
+///
+/// The substituted name is **sanitised** (`example.com` becomes `example_com`),
+/// because a POSIX environment variable name may not contain a dot. An
+/// installation that wrote the dotted spelling into its systemd unit --
+/// `Environment=AYANE_DKIM_KEY_example.com=...` -- will find it **not read**
+/// after the upgrade, and mail from that domain goes out unsigned. The WARN
+/// logged below names both spellings so that operator recognises their own
+/// deployment in it; the fix is to rename the variable to the sanitised
+/// spelling. [`dkim_env_name`] is the one place the substitution happens, so
+/// the log line and the lookup cannot disagree.
+///
 /// # Errors
 ///
 /// Returns [`SignError::Key`] when a key the environment does supply cannot be
@@ -1773,7 +1785,8 @@ pub fn signers_from_env(
                     tracing::warn!(
                         domain = %domain,
                         error = %err,
-                        "a DKIM key is configured for a name that is not a domain:                          refusing to sign for it"
+                        "a DKIM key is configured for a name that is not a domain: \
+                         refusing to sign for it"
                     );
                     continue;
                 }
@@ -1783,9 +1796,13 @@ pub fn signers_from_env(
                 );
             }
             _ => {
+                // Name the spelling the lookup used *and* the dotted one an
+                // earlier release read: the most likely reader of this line is
+                // an operator whose deployment still has the old name.
                 tracing::warn!(
                     domain = %domain,
-                    variable,
+                    variable = %variable,
+                    legacy_variable = %template.replace("{domain}", &domain),
                     "a DKIM selector is configured but its key is not in the environment: \
                      mail from this domain leaves unsigned"
                 );
@@ -1806,6 +1823,15 @@ pub fn signers_from_env(
 /// written (no double substitution), so an operator who wrote
 /// `AYANE_DKIM_KEY_example_com` by hand and an operator who wrote the template
 /// get the same variable.
+///
+/// # What is *not* compatible
+///
+/// The dotted spelling -- `AYANE_DKIM_KEY_example.com` -- is **not** looked up.
+/// A POSIX environment variable name cannot contain a dot, so such a name is
+/// only reachable through a mechanism that bypasses `setenv` (systemd's
+/// `Environment=` does not). An installation that has one is reported by
+/// [`signers_from_env`] as "selector configured, no key in the environment",
+/// which is the honest description of what it finds.
 #[must_use]
 pub fn dkim_env_name(template: &str, domain: &str) -> String {
     let sanitised: String = domain
@@ -2208,39 +2234,39 @@ impl Outbound {
 
 /// The domain a message is signed for, from its `From` header field(s).
 ///
-/// # Which `From` — the last one, and why
+/// # Which `From` — and why an ambiguous message is refused
 ///
-/// RFC 5322 §3.6 says a message has exactly one `From` field, but a message on
-/// the wire may carry several, and when it does, **readers and DMARC take the
-/// last one** — the one nearest the body, which is the one a chain of relays
-/// most recently added. A signer that picked the first would sign
-/// `example.test` for a message whose reader sees `victim.test`: the receiver
-/// would report DKIM `pass` for a domain the message does not claim, which is
-/// the exact combination a forger wants. So the *last* `From` field's domain
-/// is what this returns.
+/// RFC 5322 §3.6 says a message has exactly one `From` field. A message on the
+/// wire may nevertheless carry several, and **there is no agreement among
+/// readers about which one counts**: some take the first, some the last. This
+/// workspace's own receiving side takes the **first** --
+/// [`Verifier::verify`](crate::verify::Verifier::verify) hands
+/// `first_from_address()` to its `Authentication-Results` and its DMARC leg
+/// (`crates/smtpd/src/verify.rs`) -- while `mail-auth` accumulates the
+/// addresses of *every* `From` field into one list.
 ///
-/// # Multiple `From` is a refusal, not a choice
-///
-/// Taking the last one is already the safer reading, but a message with two
-/// `From` fields is malformed, and signing it would lend a valid signature to
-/// a shape that receivers handle inconsistently (some read the first, some the
-/// last, DMARC reads the last). So [`from_domain`] returns the analysis rather
-/// than a bare `Option`, and a second `From` field is a [`FromDomain::Ambiguous`]
-/// that the transport refuses to sign and logs. A message nobody signed is
-/// worse than one signed for the wrong domain only for the sender; an ambiguous
-/// one is worse for everybody.
+/// That disagreement is the reason a signer must not pick one. A signature
+/// naming either field is a statement about a message whose own author is
+/// undecided: with `From: a@example.test` followed by `From: evil@victim.test`
+/// it can produce "DKIM pass" for `example.test` beside a viewer (or a DMARC
+/// evaluator) that reads `victim.test`, or the reverse. Neither reading is
+/// wrong; the message is. So [`from_domain`] returns the analysis rather than
+/// a domain, a second `From` field is [`FromDomain::Ambiguous`], and the
+/// transport **leaves an ambiguous message unsigned** and logs it. Taking the
+/// last field would also have been defensible; refusing is safer, because a
+/// malformed message is one receivers handle inconsistently and a signature is
+/// an assertion this crate should not make about it.
 ///
 /// # Failing on one field never silences the others
 ///
 /// The header section is scanned field by field. A field name that is not
-/// UTF-8, or is not `From`, is **skipped** — not a reason to give up on the
+/// UTF-8, or is not `From`, is **skipped** -- not a reason to give up on the
 /// fields after it. Only a `From` field whose *own* value yields no domain
-/// makes the answer `NoDomain`, and even then the scan continues, so
-/// `From: nobody` followed by `From: Alice <alice@example.test>` still signs
-/// for `example.test`. That distinction is the difference between "this message
-/// has no usable `From`" and "the first thing I looked at confused me": the
-/// former is a fact about the message, the latter was a bug that let one
-/// throwaway header line suppress signing for a whole domain.
+/// contributes nothing, and even then the scan continues. That distinction is
+/// the difference between "this message has no usable `From`" and "the first
+/// thing I looked at confused me": the former is a fact about the message, the
+/// latter was a bug that let one throwaway header line suppress signing for a
+/// whole domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FromDomain {
     /// Exactly one `From` field, naming this signing domain.
@@ -3016,10 +3042,11 @@ mod tests {
 
     #[test]
     fn two_from_fields_are_ambiguous_and_never_signed() {
-        // The reader and DMARC take the *last* `From` (RFC 5322 §3.6 says
-        // there is exactly one, so this is malformed input). Signing the first
-        // one would let a forger obtain "DKIM pass" for a domain the message
-        // does not claim, so a second `From` is a refusal, not a choice.
+        // RFC 5322 §3.6 says there is exactly one `From`; two is malformed
+        // input. Readers disagree about which one counts -- this workspace's own
+        // verifier takes the first (`first_from_address`), other consumers take
+        // the last -- so a signature for either is a claim about a message whose
+        // author is undecided. A second `From` is a refusal, not a choice.
         let message = b"From: Alice <alice@example.test>\r\n\
                         From: Bank <security@victim.test>\r\n\
                         \r\nbody\r\n";

@@ -291,8 +291,45 @@ fn load_tls(cert: &PathBuf, key: &PathBuf) -> Result<TlsAcceptor, String> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Installs the log subscriber, before anything can want to log.
+///
+/// Until this runs, every `tracing` event in this crate and the ones it calls
+/// is dropped: `warn!` and `error!` are macros that check for a subscriber
+/// first, and with none installed they are no-ops. That is the difference
+/// between an operator seeing "a DKIM selector is configured but its key is not
+/// in the environment" and that message existing only in the source.
+///
+/// The filter is `RUST_LOG` when set, and `warn` when not -- the level at which
+/// this binary has something to say (a missing key, a failed handshake, a
+/// snapshot that cannot be used) without drowning a systemd journal in a line
+/// per connection. `AYANE_LOG` is the family's name for the same knob; it is
+/// honoured when `RUST_LOG` is not set, so an operator who already writes one
+/// for the control plane does not have to learn a second spelling.
+///
+/// A filter that does not parse falls back to `warn` and says so on stderr: a
+/// typo must not cost the operator the very messages this installs.
+fn init_tracing() {
+    let (directives, source) = match std::env::var("RUST_LOG") {
+        Ok(value) if !value.trim().is_empty() => (value, "RUST_LOG"),
+        _ => match std::env::var("AYANE_LOG") {
+            Ok(value) if !value.trim().is_empty() => (value, "AYANE_LOG"),
+            _ => ("warn".to_owned(), "default"),
+        },
+    };
+    let filter = tracing_subscriber::EnvFilter::try_new(&directives).unwrap_or_else(|err| {
+        eprintln!("ignoring a malformed {source}={directives:?}: {err}; logging at `warn`");
+        tracing_subscriber::EnvFilter::new("warn")
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+    tracing::debug!(source, directives = %directives, "log subscriber installed");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let options = match parse_options() {
         Ok(options) => options,
         Err(err) => {

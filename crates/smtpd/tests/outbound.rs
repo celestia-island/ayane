@@ -759,10 +759,10 @@ fn a_receiver_whose_tls_fails_still_takes_the_message_in_cleartext() {
                 .expect("ehlo");
             read_line(&mut reader, captured);
             writer.write_all(b"220 go ahead\r\n").expect("starttls");
-            // Not TLS: a reply the handshake will reject.
-            writer
-                .write_all(b"250 that is not a client hello\r\n")
-                .expect("bogus");
+            // Nothing follows the `220`: the client sends its ClientHello and
+            // waits for a record that never comes. That is the shape of a
+            // receiver whose TLS is broken rather than absent -- and the one
+            // that must not cost the message.
             std::thread::sleep(Duration::from_millis(50));
             return;
         }
@@ -814,9 +814,21 @@ fn a_receiver_whose_tls_fails_still_takes_the_message_in_cleartext() {
     // The body the server read is the whole message, not a fragment the failed
     // handshake left behind.
     let body = captured.data();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.starts_with("Received: "), "{text}");
+
+    // **The trace field says which `ESMTP` this was.** A downgrade and a peer
+    // that never offered TLS both put `ESMTP` on the wire, and the comment is
+    // the only thing that tells an operator "your TLS is broken" apart from
+    // "your peer does not do TLS" -- so it is asserted on the captured octets,
+    // not on the type that produced them.
     assert!(
-        String::from_utf8_lossy(&body).starts_with("Received: "),
-        "{body:?}"
+        text.contains("with ESMTP (starttls-failed) id qid"),
+        "a failed upgrade must be visible in the field the receiver keeps: {text}"
+    );
+    assert!(
+        !text.contains("with ESMTPS"),
+        "and must not claim an encrypted session: {text}"
     );
 }
 
@@ -1116,9 +1128,10 @@ fn a_malformed_header_before_the_from_does_not_suppress_the_signature() {
 
 #[test]
 fn two_from_fields_go_out_unsigned_rather_than_signed_for_one_of_them() {
-    // R1's S2-1 over the wire: a reader and DMARC take the *last* `From`, so a
-    // signature for the first would give a forger "DKIM pass" for a domain the
-    // message does not claim.
+    // RFC 5322 §3.6 allows exactly one `From`; readers disagree about which one
+    // counts when there are two (this workspace's own verifier takes the first,
+    // other consumers take the last), so a signature for either would be a
+    // claim about a message whose author is undecided.
     let body = b"From: Alice <alice@example.test>\r\n\
                  From: Bank <security@victim.test>\r\n\
                  To: girl@remote.test\r\n\
