@@ -890,16 +890,17 @@ async fn a_terminator_after_a_bare_lf_does_not_resume_the_session() {
             "{shape}: a bare LF fails the transfer: {first:?}"
         );
         // The forged transaction must not be answered as a transaction: no
-        // `250 Sender OK`, no `354`, no second `250`.
-        let mut answers = Vec::new();
+        // `250 Sender OK`, no `354`, no second `250`. What the commands in the
+        // tail *do* get is the refusal's own answers (`503` from the
+        // no-envelope rule, `500` for a line no parser accepts) — they are
+        // answered, and none of them runs.
         while let Some(reply) = client.try_read_reply_within(Duration::from_millis(300)) {
-            answers.push(format!("{} {}", reply.code, reply.text));
+            assert_ne!(reply.code, 250, "{shape}: {reply:?}");
+            assert!(
+                !reply.text.contains("Sender OK") && !reply.text.contains("Recipient OK"),
+                "{shape}: a forged envelope was honoured: {reply:?}"
+            );
         }
-        assert!(
-            answers.is_empty(),
-            "{shape}: nothing behind a failed transfer's drain may be executed, \
-             and the server answered {answers:?}"
-        );
         // The one thing that must be true either way: the forged envelope is
         // not in the queue.
         let queued = harness.queued();
@@ -945,15 +946,15 @@ async fn octets_behind_a_terminator_in_a_failed_transfer_are_discarded() {
         "the transfer that wrote the bare LF is the one refused: {first:?}"
     );
     // Nothing behind it runs: no `250 Sender OK`, no `354`, no second `250`.
-    let mut answers = Vec::new();
+    // The commands there are *answered* — a `503` each, from the no-envelope
+    // rule — and none of them opens a transaction (2026-11-26).
     while let Some(reply) = client.try_read_reply_within(Duration::from_millis(300)) {
-        answers.push(format!("{} {}", reply.code, reply.text));
+        assert_ne!(reply.code, 250, "{reply:?}");
+        assert!(
+            !reply.text.contains("Sender OK") && !reply.text.contains("Recipient OK"),
+            "a forged envelope was honoured: {reply:?}"
+        );
     }
-    assert!(
-        answers.is_empty(),
-        "octets behind a failed transfer's terminator are body, never commands: \
-         the server answered {answers:?}"
-    );
     // The refused transfer queued nothing — not its prefix, not the forgery.
     let senders: Vec<String> = harness
         .queued()
@@ -1442,5 +1443,93 @@ async fn a_tail_fragment_does_not_corrupt_a_whole_retry() {
         .map(|m| m.envelope.mail_from.clone())
         .collect();
     assert_eq!(senders, vec!["a@example.net".to_owned()], "{senders:?}");
+    harness.stop();
+}
+
+// ── the discard path: a tail read *while* a failed transfer is drained ────
+//
+// The refusal has two read paths, and only one of them is `read_buf`. While
+// `finish_failed_transfer` is still discarding, every octet a `read` brings is
+// routed to `Connection::discard` (that is what makes a refused upload's
+// octets un-executable). A sender that keeps writing into its refused upload
+// therefore lands there — including a fragment it glued onto its next command.
+// `settle` has to judge that tail too, or the rule only exists on half the
+// connection.
+
+/// The decisive shape, on the drain's path: one batch holding a tail fragment,
+/// a fragment glued onto a command (`xNOOP`), **and** a clean command.
+///
+/// Expected: the tail and the glued fragment are dropped, and the clean
+/// `NOOP` is answered `250`. Written as one batch after the failed upload has
+/// been detected (a long body makes the failure land while the rest is still on
+/// the way), so the drain reads all of it into `discard`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tail_read_into_the_drain_buffer_is_settled_too() {
+    let harness = Harness::start("r4-discard-path", bounded()).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    // A body long enough that the refusal is detected while the client is still
+    // writing: the drain is then reading when the batch below arrives.
+    let mut upload = b"From: <a@example.net>\r\nSubject: r4\r\n\r\n".to_vec();
+    for index in 0..200 {
+        upload.extend_from_slice(format!("line {index}\r\n").as_bytes());
+    }
+    upload.extend_from_slice(b"prompt\n");
+    client.send_raw_pieces(&upload);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The tail of the refused upload — ending with the sender's own
+    // terminator, which is what ends the drain — then a fragment glued onto a
+    // command, then a clean command. One batch, read by the drain.
+    client.send_raw_pieces(b"rest of the upload\r\n.\r\nxNOOP\r\nNOOP\r\n");
+
+    let mut answers = Vec::new();
+    for _ in 0..8 {
+        match client.try_read_reply_within(Duration::from_millis(400)) {
+            Some(reply) => answers.push(format!("{} {}", reply.code, reply.text)),
+            None => break,
+        }
+    }
+    assert!(
+        answers.iter().any(|line| line == "250 2.0.0 OK"),
+        "the clean command in the batch is answered after the tail is dropped: {answers:?}"
+    );
+    assert!(
+        !answers.iter().any(|line| line.contains("XNOOP")),
+        "a fragment glued onto a command is dropped, not answered `500`: {answers:?}"
+    );
+    harness.stop();
+}
+
+/// The same rule seen on the socket: a client that writes its refused upload
+/// in pieces, with the tail arriving after the failure was detected, gets its
+/// next command answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tail_split_past_the_failure_detection_is_settled() {
+    let harness = Harness::start("r4-split", bounded()).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    let mut upload = b"From: <a@example.net>\r\nSubject: r4b\r\n\r\n".to_vec();
+    for index in 0..200 {
+        upload.extend_from_slice(format!("line {index}\r\n").as_bytes());
+    }
+    upload.extend_from_slice(b"prompt\n");
+    client.send_raw_pieces(&upload);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The rest of the doomed upload, ending with the sender's own terminator,
+    // and then — still in the drain's window — a clean command.
+    client.send_raw_pieces(b"rest of the upload\r\n.\r\nNOOP\r\n");
+    let mut answers = Vec::new();
+    for _ in 0..8 {
+        match client.try_read_reply_within(Duration::from_millis(400)) {
+            Some(reply) => answers.push(format!("{} {}", reply.code, reply.text)),
+            None => break,
+        }
+    }
+    assert!(
+        answers.iter().any(|line| line == "250 2.0.0 OK"),
+        "a command written after the refused upload's own terminator is \
+         answered: {answers:?}"
+    );
     harness.stop();
 }

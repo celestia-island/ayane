@@ -1934,6 +1934,13 @@ impl Connection {
         loop {
             let discard = self.discard.as_deref().unwrap_or_default();
             if let Some(position) = find_terminator(discard, scanned) {
+                // Drop through the terminator and **keep what came after it**:
+                // a sender that wrote its next command in the same `write` as
+                // its own terminator put it here, inside the drain's buffer.
+                // Discarding it would answer a clean command with silence —
+                // and keeping it is safe, because whatever the drain leaves
+                // behind is judged by [`Connection::settle`] before it can be
+                // parsed, exactly as if it had arrived after the drain.
                 if let Some(buffer) = &mut self.discard {
                     buffer.drain(..position);
                 }
@@ -2208,50 +2215,73 @@ impl Connection {
         self.refused = true;
     }
 
-    /// Spends `settling` on one read.
+    /// Spends `settling` on what a read (or the drain) delivered, keeping the
+    /// **lines** in it that a command could be and dropping everything else.
     ///
-    /// The read that follows a refusal is offered three different things, and
-    /// two of them look the same on the wire (`<something>\r\n`):
+    /// # Where it applies — both sinks, one rule
     ///
-    /// | what arrived | what it is | what this does |
-    /// |---|---|---|
-    /// | `xNOOP\r\n` | a fragment that ran into the client's next command | dropped whole |
-    /// | `MAIL FROM:…\r\n` | a clean command, or a tail that happened to be one | kept — the session refuses the envelope (`503`) |
+    /// `arrived` is what the delivery actually brought, whichever buffer took
+    /// it. There are three deliveries, and all three end up here:
     ///
-    /// They cannot be told apart, so this picks the reading that fails safe
-    /// for the **session** rather than for the parser: a line that looks like
-    /// a command is kept and the session decides whether it may open a
-    /// transaction ([`Connection::quarantine_refused_upload`]), and anything
-    /// that is **not** a well-formed command — a fragment glued onto one is
-    /// not — is dropped instead of being answered `500`.
+    /// - **`read_buf`, after the drain** — the ordinary path;
+    /// - **`discard`, inside the drain** — while `finish_failed_transfer` is
+    ///   discarding, every read lands in `Connection::discard`, so the tail
+    ///   sits there and not in the command buffer. `drain_until_dot` stops at
+    ///   the client's terminator and leaves everything **behind** it in place;
+    ///   `finish_failed_transfer` hands that remainder to this function;
+    /// - **`read_buf`, from a socket read taken after the drain** — a tail that
+    ///   was still in flight when the drain ended.
     ///
-    /// # What this can and cannot decide
+    /// # The rule, and why it is per line
     ///
-    /// A tail and a command the client wrote are the same octets, and a
-    /// fragment glued onto a command arrives as one line exactly as a clean
-    /// command does. So the rule is: **the drop happens at the last `LF` of
-    /// whatever is not a command, and a buffer that is one complete
-    /// command-shaped line is left for the session.** The cost is that a tail
-    /// which happened to be `NOOP\r\n` runs (a no-op, and it is the same
-    /// octets a client would have sent) — while a tail that would open a
-    /// transaction does not, because the session refuses it.
+    /// A refused transfer's tail and the commands behind it arrive together,
+    /// and they are the same kind of octets. What can be decided per **line**
+    /// is whether a line is one a command parser would recognise at all
+    /// ([`command_shaped`] asks `crate::command::parse` itself):
     ///
-    /// Cutting at an `LF` never splits a line: it is a line's last octet.
-    fn settle(&mut self) {
+    /// | line | verdict |
+    /// |---|---|
+    /// | `NOOP` | kept — the session decides, and a `MAIL FROM` in it opens nothing |
+    /// | `xNOOP` | dropped — no parser would call this a command, so it is a fragment that ran into one |
+    /// | *(unterminated remainder)* | dropped — the middle of a line |
+    ///
+    /// Judging per line rather than per read is what lets `xNOOP\r\nNOOP\r\n`
+    /// come out right: the glued fragment goes, the command behind it is
+    /// served. It is also the only reading that survives both places a tail can
+    /// be — the command buffer ([`Connection::read_buf`]) and the drain's
+    /// ([`Connection::discard`]) — with one rule.
+    ///
+    /// # Why a command-shaped line is kept rather than dropped with the tail
+    ///
+    /// Because dropping it would eat the retry a client sends after its `554`,
+    /// which is the one command a refusal must not cost. The cost of keeping it
+    /// is bounded by the session: a `MAIL FROM` in the tail is answered `503`
+    /// and opens nothing ([`Connection::quarantine_refused_upload`]).
+    fn settle(&mut self, arrived: &[u8]) {
         self.settling = false;
-        // Is what arrived exactly one complete, command-shaped line?
-        let single_line = match self.read_buf.iter().position(|octet| *octet == b'\n') {
-            Some(end) if end + 1 == self.read_buf.len() => command_shaped(&self.read_buf[..end]),
-            _ => false,
-        };
-        if single_line {
-            return;
-        }
-        match self.read_buf.iter().rposition(|octet| *octet == b'\n') {
-            Some(last) => {
-                self.read_buf.drain(..=last);
+        let mut kept = Vec::new();
+        for line in arrived.split_inclusive(|octet| *octet == b'\n') {
+            // Only a terminated line that looks like a command survives; a
+            // fragment (terminated or not) is what a tail leaves behind.
+            let terminated = line.last() == Some(&b'\n');
+            let content = if terminated {
+                let mut content = &line[..line.len() - 1];
+                if content.last() == Some(&b'\r') {
+                    content = &content[..content.len() - 1];
+                }
+                content
+            } else {
+                line
+            };
+            if terminated && !content.is_empty() && command_shaped(content) {
+                kept.extend_from_slice(line);
             }
-            None => self.read_buf.clear(),
+        }
+        // The buffers are replaced wholesale: everything that arrived was in
+        // them, and only the kept lines go back.
+        self.read_buf = kept;
+        if let Some(discard) = &mut self.discard {
+            discard.clear();
         }
     }
 
@@ -2299,7 +2329,18 @@ impl Connection {
             // the client starts after the refusal).
             DrainEnd::NoMore | DrainEnd::TimedOut => {}
         }
-        self.discard = None;
+        // What the drain left behind is whatever came after the terminator: a
+        // sender that wrote its next command in the same `write` as its own
+        // terminator, or nothing. It is **not** executed on sight — it goes
+        // through `settle`, the same judgement the next socket read gets, so
+        // one rule covers both where the tail is (see
+        // [`Connection::settle`]).
+        if let Some(left) = self.discard.take() {
+            if !left.is_empty() {
+                self.read_buf.extend_from_slice(&left);
+                self.settle(&left);
+            }
+        }
         Ok(())
     }
 
@@ -2438,9 +2479,27 @@ impl Connection {
             // as commands, which is how a second transaction got smuggled
             // through a connection the server had already refused.)
             let settled = self.settling;
+            // Where the bytes this read brings will land — the drain's buffer
+            // or the command buffer — so that `settle` can judge them either
+            // way. Both are empty here: the loop only reads when no complete
+            // line is buffered.
+            let (buf_len, discard_len) = (
+                self.read_buf.len(),
+                self.discard.as_ref().map_or(0, Vec::len),
+            );
             let outcome = tokio::time::timeout_at(deadline, self.fill(want, None)).await;
             if settled {
-                self.settle();
+                // The octets that arrived, from whichever buffer took them.
+                let mut arrived = Vec::new();
+                if self.read_buf.len() > buf_len {
+                    arrived.extend_from_slice(&self.read_buf[buf_len..]);
+                }
+                if let Some(discard) = &self.discard {
+                    if discard.len() > discard_len {
+                        arrived.extend_from_slice(&discard[discard_len..]);
+                    }
+                }
+                self.settle(&arrived);
             }
             match outcome {
                 Err(_) => {
@@ -2552,21 +2611,24 @@ impl Connection {
     }
 }
 
-/// Whether a line (its line ending removed) is one a command parser would
-/// recognise: an ASCII verb — letters and the characters SMTP verbs use —
-/// followed by nothing or by a space.
+/// Whether a line is a command this server parses at all — the test the
+/// refusal uses to tell `NOOP`-like octets from `xNOOP`-like ones.
 ///
-/// This is not a parser; it is the shape test the refusal needs to tell
-/// `NOOP`-like octets from `xNOOP`-like ones, where the second is what a tail
-/// fragment produces when it runs into the command behind it. Anything that is
-/// not command-shaped cannot be a command the client meant, so it is thrown
-/// away rather than answered `500 Command unrecognized`.
+/// It asks [`crate::command::parse`], the same parser the connection runs, so
+/// the answer can never drift from what a command is: a line the parser
+/// refuses is not a command the client wrote, and a line it accepts is (a
+/// `NOOP`, a `MAIL FROM:`, a `BDAT 100 LAST`, …). `None` disables UTF-8
+/// arguments on purpose — the shape is what matters here, and a non-ASCII
+/// argument cannot be what a smuggled fragment looks like.
+///
+/// An **empty** line is not command-shaped either: it is what a fragment
+/// leaves behind (`\r\n` on its own parses as an empty command, and the
+/// connection answers it `500`).
 fn command_shaped(line: &[u8]) -> bool {
-    let verb_end = line
-        .iter()
-        .position(|octet| !octet.is_ascii_alphabetic())
-        .unwrap_or(line.len());
-    verb_end > 0 && (verb_end == line.len() || line[verb_end] == b' ')
+    let Ok(text) = std::str::from_utf8(line) else {
+        return false;
+    };
+    !line.is_empty() && command::parse(text, false).is_ok()
 }
 
 /// Whether a drained line (its `<CRLF>` removed) is the terminator `.`.
