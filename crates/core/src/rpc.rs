@@ -1351,8 +1351,31 @@ async fn net_cert(app: &AppState) -> Result<Value, AppError> {
     Ok(serde_json::to_value(status).unwrap_or(json!({})))
 }
 
-/// Postfix traffic of the recent window (default 72h): inbound connect
-/// peers and outbound relay deliveries, aggregated from the engine logs.
+/// Mail traffic of the recent window (default 72h).
+///
+/// The numbers come from the mail service's own counters
+/// ([`ayane_smtpd::metrics`]) through [`crate::driver::EngineDriver::traffic_snapshot`],
+/// not from a parsed engine log — there is no longer an engine log to parse,
+/// and the counters cannot drift from the events they count.
+///
+/// # The shape, and why it is additive
+///
+/// The page drew two tables, `inbound` (one row per peer, with `connects`) and
+/// `outbound` (one row per relay, with `domains`, `sent`, `deferred`,
+/// `bounced`), and this reply keeps both **field names and semantics** so a
+/// webui build from before the change renders it unchanged:
+///
+/// - `inbound[].peer` / `inbound[].connects` are the same two fields, now
+///   counted from accepted connections instead of parsed `connect from` lines;
+/// - `outbound[].sent` / `deferred` / `bounced` are counted per *destination
+///   domain* rather than per relay host, and `outbound[].domains` carries the
+///   single domain each row is about — the one shape difference, and the reason
+///   it is spelled out here: the outbound transport resolves an MX per attempt
+///   and does not keep that host anywhere a counter could read it, while the
+///   domain is in the request it was asked about.
+///
+/// Everything else (`messages`, `recipients`, `refused`, `window_seconds`,
+/// `totals`) is additive: a panel that does not know the fields ignores them.
 async fn net_traffic(app: &AppState, params: Value) -> Result<Value, AppError> {
     let since = params
         .get("since")
@@ -1360,12 +1383,11 @@ async fn net_traffic(app: &AppState, params: Value) -> Result<Value, AppError> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("72h")
         .to_owned();
-    let lines = app
+    let snapshot = app
         .driver
-        .postfix_logs(&since)
+        .traffic_snapshot(&since)
         .map_err(|e| AppError::new("Admin.ApplyFailed", e))?;
-    let report = crate::net::traffic_from_lines(&lines);
-    Ok(serde_json::to_value(report).unwrap_or(json!({})))
+    Ok(crate::net::traffic_reply(&snapshot))
 }
 
 /// The sender policy slices the 黑白名单 page edits.

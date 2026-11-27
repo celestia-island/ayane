@@ -167,8 +167,11 @@ pub fn full_router(surface: crate::transport::RpcSurface) -> Router {
         .layer(landing.layer())
 }
 
-async fn health() -> Json<crate::Health> {
-    Json(crate::Health::default())
+/// `/api/health`: the process's liveness, the mail service's state, and —
+/// because a panel reads this before anything else — the reason a degraded
+/// instance is degraded.
+async fn health(State(app): State<AppState>) -> Json<crate::Health> {
+    Json(app.health())
 }
 
 async fn get_state(State(app): State<AppState>) -> Result<Json<DesiredState>, ApiError> {

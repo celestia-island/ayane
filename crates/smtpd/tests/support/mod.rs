@@ -159,6 +159,10 @@ pub struct HarnessOptions {
     pub auth_guard: Option<(usize, Duration)>,
     /// The largest header section the listener accepts.
     pub max_header_bytes: u64,
+    /// Whether the listener counts traffic. Off by default: a counter here is
+    /// a shared, order-dependent number in every test that starts a listener,
+    /// and only a test that asks for one should see it.
+    pub metrics: bool,
 }
 
 impl Default for HarnessOptions {
@@ -175,6 +179,7 @@ impl Default for HarnessOptions {
             transaction_timeout: Duration::from_secs(600),
             auth_guard: None,
             max_header_bytes: ayane_smtpd::server::DEFAULT_MAX_HEADER_BYTES,
+            metrics: false,
         }
     }
 }
@@ -208,6 +213,9 @@ pub struct Harness {
     pub dir: TempDir,
     /// The per-peer AUTH budget this listener runs with, when it has one.
     pub auth_guard: Option<Arc<AuthGuard>>,
+    /// The traffic counters this listener writes to, when it was asked for
+    /// them ([`HarnessOptions::metrics`]).
+    pub metrics: Option<Arc<ayane_smtpd::metrics::Metrics>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -253,6 +261,9 @@ impl Harness {
         let auth_guard = options
             .auth_guard
             .map(|(budget, window)| Arc::new(AuthGuard::new(budget, window)));
+        let metrics = options
+            .metrics
+            .then(|| Arc::new(ayane_smtpd::metrics::Metrics::new()));
         let config = Arc::new(ServerConfig {
             hostname: "mx.test".to_owned(),
             role: options.role,
@@ -270,6 +281,10 @@ impl Harness {
             max_received_headers: 25,
             max_header_bytes: options.max_header_bytes,
             auth_guard: auth_guard.clone(),
+            // The harness counts nothing unless a test asks: a counter here
+            // would be a shared, order-dependent number in every test that
+            // happens to start a listener. `Harness::metrics` reads them.
+            metrics: metrics.clone(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -282,6 +297,7 @@ impl Harness {
             state,
             dir,
             auth_guard,
+            metrics,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -398,6 +414,30 @@ impl Client {
             }
         }
         let _ = self.stream.flush();
+    }
+
+    /// Sets how long a plain [`Client::read_reply`] waits for the server.
+    ///
+    /// The default is the socket's twenty seconds, which is what a test that
+    /// asserts *that* a reply arrives wants. A test that asserts **when** it
+    /// arrives needs the wait itself to be short, so a regression fails as a
+    /// read timeout instead of passing after a longer wait that the assertion
+    /// never looked at.
+    pub fn set_read_timeout(&mut self, within: Duration) {
+        self.stream.set_read_timeout(Some(within)).expect("timeout");
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(within))
+            .expect("timeout");
+    }
+
+    /// Measures how long [`Client::read_reply`] takes, with no bound but the
+    /// socket's own. Used where the bound under test is "well under a second"
+    /// and the assertion is on the measurement, not on a timeout.
+    pub fn read_reply_timed(&mut self) -> (Duration, Reply) {
+        let started = std::time::Instant::now();
+        let reply = self.read_reply();
+        (started.elapsed(), reply)
     }
 
     /// Shuts the write side down, so a server waiting for a terminator sees

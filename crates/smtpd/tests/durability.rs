@@ -150,6 +150,7 @@ fn child(point: FailPoint) {
         max_received_headers: 25,
         max_header_bytes: ayane_smtpd::server::DEFAULT_MAX_HEADER_BYTES,
         auth_guard: Some(Arc::new(ayane_smtpd::server::AuthGuard::default())),
+        metrics: None,
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

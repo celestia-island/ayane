@@ -45,6 +45,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -224,11 +233,13 @@ name = "ayane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "ayane-engine",
  "ayane-mail",
  "ayane-proto",
+ "ayane-smtpd",
  "ayane-store",
  "base64 0.22.1",
  "chrono",
@@ -239,10 +250,14 @@ dependencies = [
  "plana-error-landing",
  "reqwest",
  "rust-embed",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -296,6 +311,7 @@ version = "0.1.0"
 dependencies = [
  "ayane-mail",
  "ayane-proto",
+ "ayane-store",
  "base64 0.22.1",
  "mail-auth",
  "memchr",

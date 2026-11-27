@@ -157,6 +157,10 @@ fn fixture_with(tag: &str, google: bool) -> Fixture {
         imap: "127.0.0.1:1".to_owned(),
         submission: "127.0.0.1:1".to_owned(),
         cert_file: None,
+        // The mail section is off in every control-plane test: the default
+        // `MailConfig` is what an installation that has not enabled it gets,
+        // and a test that does not opt in must not bind a port.
+        mail: ayane::config::MailConfig::default(),
     };
     // GitHub as a public client; Google only when asked for.
     let catalog = ProviderCatalog::from_env_with(|name| match name {
@@ -177,6 +181,7 @@ fn fixture_with(tag: &str, google: bool) -> Fixture {
         )),
         config: Arc::new(config),
         auth: Arc::new(AuthState::new(catalog, http.clone())),
+        mail_health: None,
     };
     let surface = RpcSurface {
         app: app.clone(),

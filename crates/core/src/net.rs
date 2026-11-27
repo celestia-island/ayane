@@ -1,8 +1,17 @@
-//! Network-surface introspection: TLS certificate status and postfix
-//! traffic aggregation (the 网络配置 pages' data sources).
+//! Network-surface introspection: TLS certificate status and the traffic
+//! aggregation the 网络配置 pages draw.
+//!
+//! Traffic used to be *parsed* here — `traffic_from_lines` read Postfix's log
+//! text (`connect from …`, `relay=…, status=sent`) into the two tables. The
+//! engine that wrote those lines is not in the path any more, and the numbers
+//! now come from counters ([`ayane_smtpd::metrics`]), so this module only
+//! **renders** them ([`traffic_reply`]) in the shape the page already knows.
+//! The parser is gone rather than kept for a second engine: two sources of one
+//! number is how the page came to disagree with itself.
 
-use std::collections::BTreeMap;
 use std::path::Path;
+
+use ayane_smtpd::metrics::TrafficSnapshot;
 
 /// TLS certificate status parsed from the deployed PEM chain.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -82,126 +91,94 @@ fn first_pem_block(bytes: &[u8]) -> Option<Vec<u8>> {
 /// One aggregated inbound peer.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct InboundPeer {
-    /// `host[ip]` exactly as the log named it (`unknown` when no rDNS).
+    /// The connecting address, as the socket named it.
     pub peer: String,
-    /// `connect from` lines seen from this peer.
+    /// Connections accepted from it in the window.
     pub connects: u64,
+    /// Messages it got queued in the window (additive field).
+    pub messages: u64,
+    /// Recipients accepted at `RCPT` (additive field).
+    pub recipients: u64,
+    /// Recipients refused at `RCPT` (additive field).
+    pub refused: u64,
 }
 
 /// One aggregated outbound destination.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OutboundPeer {
-    /// `relay=host[ip]:port` as the log named it.
+    /// The destination domain. The field the page drew this row under was
+    /// `relay` — the MX host — and the native counters have the domain
+    /// instead (see `net_traffic` in `rpc.rs` for why), so the *name* is kept
+    /// and the value is the domain, whose one entry is also in `domains`.
     pub relay: String,
-    /// Recipient domains delivered through this relay.
+    /// The recipient domains this row is about (one, always).
     pub domains: Vec<String>,
-    /// `status=sent` deliveries.
+    /// Deliveries a receiver accepted.
     pub sent: u64,
-    /// `status=deferred` deliveries (retried by the queue).
+    /// Deliveries deferred (retried by the queue).
     pub deferred: u64,
-    /// `status=bounced` deliveries.
+    /// Deliveries that ended in a bounce.
     pub bounced: u64,
 }
 
-/// Traffic aggregation over postfix log lines.
+/// Traffic aggregation, in the shape the 网络配置 pages draw.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TrafficReport {
-    /// Inbound SMTP connections by peer, busiest first.
+    /// Inbound peers, busiest first.
     pub inbound: Vec<InboundPeer>,
-    /// Outbound deliveries by relay, busiest first.
+    /// Outbound destinations, busiest first.
     pub outbound: Vec<OutboundPeer>,
 }
 
-/// Aggregate `lines` (postfix logs) into a [`TrafficReport`].
+/// Renders a [`TrafficSnapshot`] as the page's reply.
 ///
-/// Recognised shapes (postfix default logging):
-/// - `… connect from unknown[203.0.113.9]` / `connect from mail.example.org[203.0.113.9]`
-/// - `… to=<a@b.example>, relay=mail.b.example[198.51.100.2]:25, status=sent …`
+/// The audit-shaped part (`requested_seconds`, `window_seconds`, `totals`) is
+/// carried alongside the two tables rather than folded into them: a caller that
+/// wants "how far back does this actually reach" has to be able to see it, and
+/// a caller written against the old shape must not have to care.
 #[must_use]
-pub fn traffic_from_lines(lines: &[String]) -> TrafficReport {
-    let mut inbound: BTreeMap<String, u64> = BTreeMap::new();
-    let mut outbound: BTreeMap<String, (Vec<String>, u64, u64, u64)> = BTreeMap::new();
-
-    for line in lines {
-        if let Some(rest) = line.split_once("connect from") {
-            let peer = rest.1.split(']').next().unwrap_or("").to_owned() + "]";
-            let peer = peer.trim_start_matches(' ').to_owned();
-            if peer.ends_with(']') {
-                *inbound.entry(peer).or_default() += 1;
-            }
-        }
-        if line.contains("to=<") {
-            if let Some(relay_part) = line.split_once("relay=") {
-                let relay = relay_part
-                    .1
-                    .split(',')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_owned();
-                // `relay=none` (local delivery) and `relay=local` are not
-                // remote peers — they would forge aggregate rows.
-                if relay.is_empty() || relay == "none" || relay == "local" {
-                    continue;
-                }
-                let status = if line.contains("status=sent") {
-                    0
-                } else if line.contains("status=deferred") {
-                    1
-                } else if line.contains("status=bounced") {
-                    2
-                } else {
-                    continue;
-                };
-                let domain = line
-                    .split_once("to=<")
-                    .and_then(|(_, r)| r.split_once('>'))
-                    .map(|(addr, _)| {
-                        addr.rsplit_once('@')
-                            .map_or_else(|| addr.to_owned(), |(_, d)| d.to_owned())
-                    })
-                    .unwrap_or_default();
-                let entry = outbound
-                    .entry(relay)
-                    .or_insert_with(|| (Vec::new(), 0, 0, 0));
-                match status {
-                    0 => entry.1 += 1,
-                    1 => entry.2 += 1,
-                    _ => entry.3 += 1,
-                }
-                if !domain.is_empty() && !entry.0.contains(&domain) {
-                    entry.0.push(domain);
-                }
-            }
-        }
-    }
-
-    let mut inbound_vec: Vec<_> = inbound
-        .into_iter()
-        .map(|(peer, connects)| InboundPeer { peer, connects })
-        .collect();
-    inbound_vec.sort_by(|a, b| b.connects.cmp(&a.connects).then(a.peer.cmp(&b.peer)));
-
-    let mut outbound_vec: Vec<_> = outbound
-        .into_iter()
-        .map(|(relay, (domains, sent, deferred, bounced))| OutboundPeer {
-            relay,
-            domains,
-            sent,
-            deferred,
-            bounced,
+pub fn traffic_reply(snapshot: &TrafficSnapshot) -> serde_json::Value {
+    let inbound: Vec<InboundPeer> = snapshot
+        .inbound
+        .iter()
+        .map(|row| InboundPeer {
+            peer: row.peer.clone(),
+            connects: row.connects,
+            messages: row.messages,
+            recipients: row.recipients,
+            refused: row.refused,
         })
         .collect();
-    outbound_vec.sort_by(|a, b| {
-        (b.sent + b.deferred + b.bounced)
-            .cmp(&(a.sent + a.deferred + a.bounced))
-            .then(a.relay.cmp(&b.relay))
-    });
-
-    TrafficReport {
-        inbound: inbound_vec,
-        outbound: outbound_vec,
+    let outbound: Vec<OutboundPeer> = snapshot
+        .outbound
+        .iter()
+        .map(|row| OutboundPeer {
+            relay: row.domain.clone(),
+            domains: vec![row.domain.clone()],
+            sent: row.sent,
+            deferred: row.deferred,
+            bounced: row.bounced,
+        })
+        .collect();
+    let report = TrafficReport { inbound, outbound };
+    let mut value = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(map) = value.as_object_mut() {
+        // Additive keys, same object: a consumer that never heard of them
+        // ignores them, one that wants them has them.
+        map.insert(
+            "requested_seconds".to_owned(),
+            serde_json::json!(snapshot.requested_seconds),
+        );
+        map.insert(
+            "window_seconds".to_owned(),
+            serde_json::json!(snapshot.window_seconds),
+        );
+        map.insert(
+            "totals".to_owned(),
+            serde_json::to_value(snapshot.totals).unwrap_or_else(|_| serde_json::json!({})),
+        );
     }
+    value
 }
 
 #[cfg(test)]
@@ -209,44 +186,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inbound_peers_aggregate_with_unknown_rdns() {
-        let lines = vec![
-            "postfix/smtpd[1]: connect from unknown[203.0.113.9]".to_owned(),
-            "postfix/smtpd[1]: connect from unknown[203.0.113.9]".to_owned(),
-            "postfix/smtpd[2]: connect from mail.sender.example[198.51.100.7]".to_owned(),
-        ];
-        let report = traffic_from_lines(&lines);
-        assert_eq!(report.inbound[0].peer, "unknown[203.0.113.9]");
-        assert_eq!(report.inbound[0].connects, 2);
-        assert_eq!(report.inbound[1].peer, "mail.sender.example[198.51.100.7]");
-        assert_eq!(report.inbound[1].connects, 1);
+    fn the_reply_keeps_the_shape_the_page_draws() {
+        // The two tables the 网络配置 page has always drawn, from counters
+        // instead of log lines: the fields the old parser produced are the
+        // fields this renders, so a webui built before the change renders it
+        // unchanged.
+        use ayane_smtpd::metrics::{Counter, Metrics};
+        let metrics = Metrics::new();
+        let now = 1_700_000_000;
+        metrics.record_peer("203.0.113.9", Counter::Connects, 2, now);
+        metrics.record_peer("203.0.113.9", Counter::MessagesIn, 1, now);
+        metrics.record_peer("203.0.113.9", Counter::RecipientsIn, 2, now);
+        metrics.record_domain("dest.example", Counter::OutboundSent, 3, now);
+        metrics.record_domain("dest.example", Counter::OutboundDeferred, 1, now);
+        let reply = traffic_reply(&metrics.snapshot(now, 72 * 3600));
+
+        // The shape the page reads: `inbound[].peer` / `.connects`,
+        // `outbound[].relay` / `.domains` / `.sent` / `.deferred` / `.bounced`.
+        assert_eq!(reply["inbound"][0]["peer"], "203.0.113.9");
+        assert_eq!(reply["inbound"][0]["connects"], 2);
+        assert_eq!(reply["outbound"][0]["relay"], "dest.example");
+        assert_eq!(reply["outbound"][0]["domains"][0], "dest.example");
+        assert_eq!(reply["outbound"][0]["sent"], 3);
+        assert_eq!(reply["outbound"][0]["deferred"], 1);
+        assert_eq!(reply["outbound"][0]["bounced"], 0);
+        // The additive part: what the old shape had no room for.
+        assert_eq!(reply["inbound"][0]["messages"], 1);
+        assert_eq!(reply["inbound"][0]["recipients"], 2);
+        assert_eq!(reply["inbound"][0]["refused"], 0);
+        assert_eq!(reply["requested_seconds"], 72 * 3600);
+        assert_eq!(reply["window_seconds"], 24 * 3600);
+        assert_eq!(reply["totals"]["connects"], 2);
     }
 
     #[test]
-    fn outbound_statuses_and_domains_aggregate() {
-        let lines = vec![
-            "smtp 1 to=<a@dest.example>, relay=mx.dest.example[192.0.2.1]:25, status=sent"
-                .to_owned(),
-            "smtp 2 to=<b@dest.example>, relay=mx.dest.example[192.0.2.1]:25, status=deferred"
-                .to_owned(),
-            "smtp 3 to=<c@other.example>, relay=mx.other.example[192.0.2.9]:25, status=bounced"
-                .to_owned(),
-        ];
-        let report = traffic_from_lines(&lines);
-        assert_eq!(report.outbound.len(), 2);
-        let first = &report.outbound[0];
-        assert_eq!(first.relay, "mx.dest.example[192.0.2.1]:25");
-        assert_eq!(first.sent, 1);
-        assert_eq!(first.deferred, 1);
-        assert_eq!(first.domains, vec!["dest.example".to_owned()]);
-    }
-
-    #[test]
-    fn non_smtp_lines_are_ignored() {
-        let lines = vec![
-            "postfix/qmgr[1]: removed".to_owned(),
-            "postfix/anvil[1]: statistics".to_owned(),
-        ];
-        assert_eq!(traffic_from_lines(&lines), TrafficReport::default());
+    fn an_empty_engine_renders_empty_tables() {
+        // "Nothing happened" is an empty table, not an error: the page draws
+        // its empty state from it.
+        let reply = traffic_reply(&TrafficSnapshot::default());
+        assert_eq!(reply["inbound"], serde_json::json!([]));
+        assert_eq!(reply["outbound"], serde_json::json!([]));
+        assert_eq!(reply["totals"]["messages_in"], 0);
     }
 }

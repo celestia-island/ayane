@@ -45,12 +45,17 @@ fn fixture(tag: &str) -> Router {
         imap: "127.0.0.1:143".to_owned(),
         submission: "127.0.0.1:587".to_owned(),
         cert_file: None,
+        // The mail section is off in every control-plane test: the default
+        // `MailConfig` is what an installation that has not enabled it gets,
+        // and a test that does not opt in must not bind a port.
+        mail: ayane::config::MailConfig::default(),
     };
     let app = AppState {
         store: Arc::new(store),
         driver: Arc::new(RecordingDriver::new(root.join("docker-compose.yml"))),
         config: Arc::new(config),
         auth: Arc::new(ayane::auth::AuthState::local()),
+        mail_health: None,
     };
     ayane::api::full_router(RpcSurface {
         app,

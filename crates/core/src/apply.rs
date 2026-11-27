@@ -31,7 +31,7 @@ pub enum ApplyError {
     /// The filesystem refused a write.
     #[error("io: {0}")]
     Io(String),
-    /// The engine could not be reloaded at all (missing compose file).
+    /// The engine could not be reloaded at all (an engine that is not running).
     #[error("reload: {0}")]
     Reload(String),
 }
@@ -66,6 +66,15 @@ pub struct ApplyReport {
     /// Non-fatal notes (e.g. engine not running yet).
     pub warnings: Vec<String>,
 }
+
+/// The state snapshot every consumer of the routing table reads: the delivery
+/// consumer, the outbound signers, and (in the split deployment) the listener
+/// started by `ayane-smtpd --serve`.
+///
+/// It is rendered from the same `StoredState` as the map files and written with
+/// the same diff-then-write rule, so it is never a second source of truth — it
+/// is the one the processes that are *not* this one read.
+pub const SNAPSHOT_PATH: &str = "desired-state.json";
 
 /// Render every engine file from one stored state.
 ///
@@ -203,6 +212,44 @@ pub async fn apply(
             changed: !same,
         });
     }
+
+    // The routing snapshot the mail service reads: the delivery consumer and
+    // the outbound signers are separate processes (or separate readers of one
+    // directory) in the split deployment, and this file is how they know what
+    // the store says — the same role `state/desired-state.json` plays for
+    // `ayane-smtpd --deliver`. It is written by the same diff-then-write rule as
+    // the rendered maps, so an apply that changed nothing rewrites nothing here
+    // either, and a consumer that polls it sees the change without being told.
+    let snapshot = RenderedFile {
+        rel_path: SNAPSHOT_PATH.to_owned(),
+        contents: serde_json::to_string_pretty(&stored.desired)
+            .map_err(|e| ApplyError::Io(format!("state snapshot: {e}")))?,
+        mode: 0o644,
+    };
+    let target = state_dir.join(&snapshot.rel_path);
+    let existing = tokio::fs::read(&target).await.ok();
+    let same = existing
+        .as_ref()
+        .is_some_and(|bytes| bytes == snapshot.contents.as_bytes());
+    if !same {
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ApplyError::Io(format!("{}: {e}", parent.display())))?;
+        }
+        tokio::fs::write(&target, &snapshot.contents)
+            .await
+            .map_err(|e| ApplyError::Io(format!("{}: {e}", target.display())))?;
+        let perms = std::fs::Permissions::from_mode(snapshot.mode);
+        tokio::fs::set_permissions(&target, perms)
+            .await
+            .map_err(|e| ApplyError::Io(format!("{}: {e}", target.display())))?;
+        changed_any = true;
+    }
+    files.push(FileOutcome {
+        path: snapshot.rel_path,
+        changed: !same,
+    });
 
     let _ = changed_any;
     let mut warnings = Vec::new();

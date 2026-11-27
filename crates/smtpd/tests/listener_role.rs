@@ -21,7 +21,7 @@
 //! | Listener | Client | RCPT to a remote domain | Why |
 //! |---|---|---|---|
 //! | inbound (25) | unauthenticated (it has no AUTH at all) | `550 5.7.1` | a relay is not this listener's job |
-//! | submission (587) | unauthenticated | `550 5.7.1` | submission is for authenticated clients |
+//! | submission (587) | unauthenticated | `530 5.7.0` | submission is for authenticated clients, and RFC 4954 §4 says so |
 //! | submission (587) | authenticated as its own sender | `250` | this is what submission is for |
 //!
 //! and the fourth, which is the wiring read the other way round: an address that
@@ -80,10 +80,10 @@ async fn a_submission_listener_refuses_an_unauthenticated_recipient() {
     client.expect("MAIL FROM:<ops@example.com>", 250);
     let reply = client.command(&format!("RCPT TO:<{REMOTE}>"));
     assert_eq!(
-        reply.code, 550,
-        "submission without a login must not relay: {reply:?}"
+        reply.code, 530,
+        "submission without a login must not relay, and says to authenticate: {reply:?}"
     );
-    assert!(reply.text.contains("5.7.1"), "{reply:?}");
+    assert!(reply.text.contains("5.7.0"), "{reply:?}");
     assert!(harness.queued().is_empty(), "nothing was queued");
     harness.stop();
 }
@@ -153,13 +153,14 @@ async fn only_the_inbound_arm_answers_from_the_router() {
     let mut client = unauthenticated(&submission);
     client.expect("MAIL FROM:<ops@example.com>", 250);
     // The same hosted mailbox: not an answer this listener's arm can give, so
-    // it is the relay refusal — identical to what a remote domain gets.
+    // it is the "authenticate first" refusal — identical to what a remote
+    // domain gets.
     let reply = client.command("RCPT TO:<inbox@example.com>");
     assert_eq!(
-        reply.code, 550,
+        reply.code, 530,
         "an unauthenticated submission relays nowhere: {reply:?}"
     );
-    assert!(reply.text.contains("5.7.1"), "{reply:?}");
+    assert!(reply.text.contains("5.7.0"), "{reply:?}");
 
     inbound.stop();
     submission.stop();
@@ -185,10 +186,10 @@ async fn the_implicit_tls_listener_takes_the_submission_arm() {
     client.expect("MAIL FROM:<ops@example.com>", 250);
     let reply = client.command(&format!("RCPT TO:<{REMOTE}>"));
     assert_eq!(
-        reply.code, 550,
-        "an unauthenticated 465 listener relays nowhere: {reply:?}"
+        reply.code, 530,
+        "an unauthenticated 465 listener relays nowhere and says to authenticate: {reply:?}"
     );
-    assert!(reply.text.contains("5.7.1"), "{reply:?}");
+    assert!(reply.text.contains("5.7.0"), "{reply:?}");
     harness.stop();
 }
 
@@ -199,8 +200,9 @@ async fn the_implicit_tls_listener_takes_the_submission_arm() {
 /// unauthenticated_remote_recipient`` and ``a_submission_listener_lets_an_
 /// authenticated_client_relay`` already pin each answer; what they cannot say
 /// on their own is that the answers come from *different arms*. Here the same
-/// address, the same fixture state and the same client state get `550 5.7.1`
-/// from one listener and `250` from the other, so an implementation that read
+/// address, the same fixture state and the same client state get `530 5.7.0`
+/// from one listener and `250` from the other — and from the inbound listener
+/// `550 5.7.1`, which is the relay verdict, so an implementation that read
 /// one arm for both (or collapsed the `match` into a shared answer) fails the
 /// pair even if it happened to pick a plausible single code.
 #[tokio::test(flavor = "multi_thread")]
@@ -230,8 +232,8 @@ async fn the_two_arms_answer_the_same_address_differently() {
 
     assert_eq!(on_inbound, 550, "port 25 refuses to relay");
     assert_eq!(
-        on_submission_anon, 550,
-        "submission without a login refuses"
+        on_submission_anon, 530,
+        "submission without a login says which refusal it is: authenticate first"
     );
     assert_eq!(
         on_submission_auth, 250,

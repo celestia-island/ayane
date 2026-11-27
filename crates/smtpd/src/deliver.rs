@@ -212,7 +212,11 @@ pub struct RemoteReport {
 /// One call carries a whole destination: the recipients of one domain, in one
 /// group, because one SMTP transaction can carry several (and a connection per
 /// recipient is how a small installation looks like a spam run).
-pub trait RemoteTransport {
+///
+/// `Send + Sync`, because the delivery consumer is the kind of thing a control
+/// plane runs in a tokio task next to its HTTP surface: a transport that could
+/// not cross a thread boundary would make the whole consumer unspawnable.
+pub trait RemoteTransport: Send + Sync {
     /// Delivers `message` to `recipients`, all at `domain`.
     ///
     /// # Errors

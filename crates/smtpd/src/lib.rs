@@ -174,6 +174,7 @@ pub mod authn;
 pub mod command;
 pub mod deliver;
 pub mod mailbox;
+pub mod metrics;
 pub mod outbound;
 pub mod policy;
 pub mod queue;
@@ -191,6 +192,9 @@ pub use deliver::{
     RemoteReport, RemoteRequest, RemoteTransport, DEFAULTS,
 };
 pub use mailbox::{Mailbox, MailboxError, POSTMASTER};
+pub use metrics::{
+    Counter, DomainTraffic, Metrics, MetricsDelivery, PeerTraffic, TrafficSnapshot, TrafficTotals,
+};
 pub use outbound::{
     Outbound, Resolver, Signer, StaticResolver, SyncedTransport, TlsPolicy, ZoneResolver,
 };

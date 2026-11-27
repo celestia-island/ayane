@@ -268,6 +268,9 @@ pub enum Outcome {
     RecipientInvalid,
     /// `RCPT` verdict: the transaction may not relay there unauthenticated.
     RelayDenied,
+    /// `RCPT` verdict: this listener authenticates before it accepts a
+    /// recipient, and the client has not (RFC 4954 §4, `530 5.7.0`).
+    AuthenticationRequired,
     /// `STARTTLS` is not available.
     TlsUnavailable,
     /// `AUTH` succeeded; the transport supplies the authenticated identity.
@@ -507,6 +510,16 @@ impl Session {
             Outcome::RelayDenied => {
                 self.pending_recipient = None;
                 Reply::new(550, Some("5.7.1"), "Relay access denied")
+            }
+            // RFC 4954 §4: a server that requires authentication says so with
+            // `530 5.7.0 Authentication required`, and the reply points at the
+            // mechanism. `550 5.7.1 Relay access denied` is the relay refusal —
+            // right for a client that *is* authenticated, wrong for one that has
+            // not tried: it tells a client with credentials in hand to stop
+            // rather than to authenticate.
+            Outcome::AuthenticationRequired => {
+                self.pending_recipient = None;
+                Reply::new(530, Some("5.7.0"), "Authentication required")
             }
             Outcome::TlsUnavailable => {
                 self.abandon_transaction();

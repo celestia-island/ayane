@@ -327,9 +327,10 @@ async fn submission_never_accepts_credentials_on_a_clear_channel() {
         base64_plain("ops@example.com", "s3cret")
     ));
     assert_eq!(reply.code, 538, "clear-text AUTH: {reply:?}");
-    // The rejected attempt leaves no identity behind.
+    // The rejected attempt leaves no identity behind, so the submission is
+    // refused — at `RCPT`, with the code that says "authenticate first".
     client.expect("MAIL FROM:<ops@example.com>", 250);
-    assert_eq!(client.command("RCPT TO:<someone@gmail.com>").code, 550);
+    assert_eq!(client.command("RCPT TO:<someone@gmail.com>").code, 530);
     harness.stop();
 }
 
@@ -512,7 +513,9 @@ async fn tb14_body_over_the_message_limit_fails_the_transaction() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tb14_over_long_data_line_fails_without_desync() {
     // The refused transfer is drained up to its terminator; a client that
-    // stops sending after the refusal is cut off by the transaction timer.
+    // stops sending after the refusal is cut off by the drain's own short
+    // bound, which is what keeps this test from waiting on the transaction
+    // timer.
     let options = HarnessOptions {
         transaction_timeout: Duration::from_millis(1500),
         ..HarnessOptions::inbound()
@@ -524,7 +527,7 @@ async fn tb14_over_long_data_line_fails_without_desync() {
     client.expect("RCPT TO:<inbox@example.com>", 250);
     client.expect("DATA", 354);
     // A 70 KiB line is past the body line bound; the server must drain to the
-    // terminator and answer 554 rather than treat the noise as commands.
+    // terminator and answer rather than treat the noise as commands.
     let long = format!("{}\r\n", "b".repeat(70 * 1024));
     // The rest of the "envelope" is inside the failed transfer: it is drained
     // with the body, never executed.
@@ -533,32 +536,34 @@ async fn tb14_over_long_data_line_fails_without_desync() {
     let reply = client
         .try_read_reply()
         .expect("the refused transfer is answered");
-    assert!(
-        matches!(reply.code, 554 | 421),
+    // `552 5.2.3` — RFC 5321 §4.3.2's "line too long" — and not the
+    // transaction's `554`: a line over a resource bound is a request the client
+    // can fix by re-wrapping it, which is what the code tells it. `BDAT` answers
+    // the same octets the same way (`header_bound::the_line_bound_is_one_answer`).
+    assert_eq!(
+        (reply.code, reply.text.as_str()),
+        (552, "5.2.3 Message line too long"),
         "an over-long body line fails the transfer: {reply:?}"
     );
     assert!(harness.queued().is_empty());
-    // The same `MAIL FROM` that was in the tail was answered `503` (see the
-    // assertion above): the connection will not open an envelope while it is
-    // still discarding the refused upload, because it cannot tell that command
-    // from the forged one right next to it.
+    // The same `MAIL FROM` that was in the tail is answered `503`, not run:
+    // the connection will not open an envelope while it is still discarding the
+    // refused upload, because it cannot tell that command from the forged one
+    // right next to it.
     //
     // What must hold either way is the sentence this test is named for: nothing
-    // in the tail was executed. The connection is offered a real transaction
-    // over and over, from a fresh connection each time, until the refusal has
-    // settled — and it must **never** be a `250`, and must never queue
-    // anything from the forged sender.
-    if reply.code == 554 {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            let probe = client.try_read_reply_within(Duration::from_millis(200));
-            assert!(
-                probe.is_none() || probe.as_ref().is_some_and(|r| r.code == 503),
-                "nothing in the tail is accepted: {probe:?}"
-            );
-            if probe.is_none() {
-                break;
-            }
+    // in the tail was executed. The connection must never answer a step of the
+    // forged transaction — never a `250`, and never a `354` that would let the
+    // second message in.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let probe = client.try_read_reply_within(Duration::from_millis(200));
+        assert!(
+            probe.is_none() || probe.as_ref().is_some_and(|r| r.code == 503),
+            "nothing in the tail is accepted: {probe:?}"
+        );
+        if probe.is_none() {
+            break;
         }
     }
     assert!(harness.queued().is_empty(), "still nothing queued");
@@ -858,14 +863,17 @@ async fn an_identity_with_a_crlf_is_refused_and_never_reaches_received() {
     client.handshake();
     client.ehlo("client.test");
     let reply = client.command(&format!("AUTH PLAIN {}", base64_plain(injected, "s3cret")));
+    // One answer for every failed login: an identity that is not a mailbox is
+    // not told apart from a wrong password (`535` for both), and it spends the
+    // per-address failure budget like a guess.
     assert_eq!(
-        reply.code, 501,
-        "an identity that is not a mailbox is a syntax error: {reply:?}"
+        reply.code, 535,
+        "an identity that is not a mailbox fails authentication: {reply:?}"
     );
     // The session did not authenticate, so the submission is refused — and no
     // message carries the injected field.
     client.expect("MAIL FROM:<ops@example.com>", 250);
-    assert_eq!(client.command("RCPT TO:<someone@gmail.com>").code, 550);
+    assert_eq!(client.command("RCPT TO:<someone@gmail.com>").code, 530);
     assert!(harness.queued().is_empty());
     harness.stop();
 }
@@ -1050,7 +1058,10 @@ async fn a_non_ascii_identity_with_a_crlf_is_still_refused() {
         "AUTH PLAIN {}",
         base64_plain("用户@例子.测试\r\nBcc: victim@example.net", "s3cret")
     ));
-    assert_eq!(reply.code, 501, "the identity is not a mailbox: {reply:?}");
+    assert_eq!(
+        reply.code, 535,
+        "the identity is not a mailbox, which is a failed login and not a syntax report: {reply:?}"
+    );
     harness.stop();
 }
 
@@ -1136,7 +1147,9 @@ async fn auth_and_mail_from_agree_about_what_a_mailbox_is() {
     // `a@example..com` and `a@example.com.` are not mailboxes, and the path
     // parser said so with a `501` while the identity check — which only knew
     // "one `@`, no quoting" — answered `235`. One server, two answers about
-    // whether the same text is an address.
+    // whether the same text is an address — and the two answers are
+    // deliberately *different kinds* of no: `MAIL FROM` names the syntax error
+    // it found, `AUTH` gives the one answer every failed login gets.
     let harness = Harness::start("auth-shape", HarnessOptions::submission()).await;
     for identity in ["a@-example.com", "a@example..com", "a@example.com."] {
         // The path: a syntax error, and therefore no transaction to log into.
@@ -1147,7 +1160,11 @@ async fn auth_and_mail_from_agree_about_what_a_mailbox_is() {
             path.code, 501,
             "`{identity}` is not a mailbox, so MAIL FROM must refuse it: {path:?}"
         );
-        // The identity: the same answer, and never a credential verdict.
+        // The identity: refused too, but as a **failed login** and never as a
+        // syntax report — telling a prober which shapes are addresses here is
+        // the oracle this test used to pin by accident, one `501` per attempt
+        // outside the failure budget. Both refusals are "no", and only one of
+        // them is a directory.
         let mut client = support::TlsClient::connect(harness.addr);
         client.ehlo("client.test");
         client.expect("STARTTLS", 220);
@@ -1155,8 +1172,8 @@ async fn auth_and_mail_from_agree_about_what_a_mailbox_is() {
         client.ehlo("client.test");
         let reply = client.command(&format!("AUTH PLAIN {}", base64_plain(identity, "s3cret")));
         assert_eq!(
-            reply.code, 501,
-            "`{identity}` must be refused here exactly as MAIL FROM refuses it: {reply:?}"
+            reply.code, 535,
+            "`{identity}` is refused for login too, as a failed authentication: {reply:?}"
         );
     }
     harness.stop();
@@ -1201,5 +1218,100 @@ async fn a_bare_postmaster_identity_is_the_host_s_own() {
         Some("postmaster@mx.test"),
         "the identity is recorded as the mailbox the path names"
     );
+    harness.stop();
+}
+
+// ── the traffic counters ────────────────────────────────────────────────
+//
+// The control plane's traffic page used to be built from Postfix log lines
+// (`connect from unknown[…]: …`, `to=<…>, relay=…, status=sent`). The engine
+// that produces those lines is no longer in the path, so the numbers have to
+// come from the layer that knows the event happened. These tests pin what the
+// listener counts, from the outside: what a client does, and what the counter
+// says afterwards.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn traffic_counts_what_the_listener_answered() {
+    use ayane_smtpd::metrics::Counter;
+
+    let options = HarnessOptions {
+        metrics: true,
+        ..HarnessOptions::inbound()
+    };
+    let harness = Harness::start("metrics", options).await;
+    let metrics = harness
+        .metrics
+        .clone()
+        .expect("the harness asked for counting");
+
+    // One connection, three recipients: two accepted, one refused.
+    let mut client = harness.client();
+    client.ehlo("client.test");
+    client.expect("MAIL FROM:<a@example.net>", 250);
+    client.expect("RCPT TO:<inbox@example.com>", 250);
+    client.expect("RCPT TO:<ops@example.com>", 250);
+    let refused = client.command("RCPT TO:<nobody@example.net>");
+    assert_eq!(refused.code, 550, "{refused:?}");
+    // The message goes in: one message, and the recipients it was accepted
+    // for were counted as they were accepted.
+    client.expect("DATA", 354);
+    client.send_raw(b"Subject: counted\r\n\r\nbody\r\n.\r\n");
+    assert_eq!(client.read_reply().code, 250);
+
+    // A second connection that only greets, so `connects` is 2 and nothing
+    // else moves.
+    let mut second = harness.client();
+    second.ehlo("client.test");
+
+    let snapshot = metrics.snapshot(ayane_smtpd::server::received_now_epoch(), 3600);
+    let row = snapshot
+        .inbound
+        .iter()
+        .find(|row| row.peer == "127.0.0.1")
+        .unwrap_or_else(|| panic!("no row for the loopback peer: {snapshot:?}"));
+    assert_eq!(row.connects, 2, "two connections were accepted: {row:?}");
+    assert_eq!(row.messages, 1, "one message was queued: {row:?}");
+    assert_eq!(row.recipients, 2, "two recipients were accepted: {row:?}");
+    assert_eq!(row.refused, 1, "one was refused: {row:?}");
+    // The reported totals are the same numbers, summed.
+    assert_eq!(snapshot.totals.connects, 2);
+    assert_eq!(snapshot.totals.messages_in, 1);
+    assert_eq!(snapshot.totals.recipients_in, 2);
+    assert_eq!(snapshot.totals.recipients_refused, 1);
+    // A listener that was never asked to count stays silent.
+    assert_eq!(
+        ayane_smtpd::metrics::Metrics::new().total(Counter::Connects),
+        0
+    );
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn traffic_does_not_count_a_refused_transaction_as_a_message() {
+    use ayane_smtpd::metrics::Counter;
+
+    let options = HarnessOptions {
+        metrics: true,
+        ..HarnessOptions::inbound()
+    };
+    let harness = Harness::start("metrics-refused", options).await;
+    let metrics = harness.metrics.clone().expect("counters");
+    let mut client = harness.client();
+    client.ehlo("client.test");
+    client.expect("MAIL FROM:<a@example.net>", 250);
+    client.expect("RCPT TO:<inbox@example.com>", 250);
+    client.expect("DATA", 354);
+    // A bare `LF` fails the transaction; nothing is queued, so no message is
+    // counted — but the recipient *was* accepted, and that half is true.
+    client.send_raw(b"Subject: bad\r\n\r\nbody\n.\r\n");
+    let reply = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the refused transfer is answered");
+    assert_eq!(reply.code, 554, "{reply:?}");
+    let now = ayane_smtpd::server::received_now_epoch();
+    assert_eq!(metrics.total(Counter::MessagesIn), 0);
+    assert_eq!(metrics.total(Counter::RecipientsIn), 1);
+    let snapshot = metrics.snapshot(now, 3600);
+    assert!(snapshot.totals.messages_in == 0, "{snapshot:?}");
     harness.stop();
 }

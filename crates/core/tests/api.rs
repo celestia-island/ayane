@@ -41,12 +41,19 @@ fn fixture(tag: &str, token: Option<&str>) -> Fixture {
         imap: "127.0.0.1:143".to_owned(),
         submission: "127.0.0.1:587".to_owned(),
         cert_file: None,
+        // The mail section is off in every control-plane test: the default
+        // `MailConfig` is what an installation that has not enabled it gets,
+        // and a test that does not opt in must not bind a port.
+        mail: ayane::config::MailConfig::default(),
     };
     let app = ayane::app(AppState {
         store: Arc::new(store),
         driver: Arc::new(driver),
         config: Arc::new(config),
         auth: Arc::new(ayane::auth::AuthState::local()),
+        // No mail section in these fixtures, so `/api/health` is the payload it
+        // was before the mail engine existed.
+        mail_health: None,
     });
     Fixture {
         app,
@@ -340,7 +347,9 @@ async fn apply_writes_config_then_rewrites_nothing() {
         .iter()
         .filter(|f| f["changed"] == serde_json::Value::Bool(true))
         .collect();
-    assert_eq!(changed.len(), 8, "first apply writes every file: {report}");
+    // Eight rendered maps, plus the routing snapshot the delivery consumer and
+    // the split-process listener read (`desired-state.json`).
+    assert_eq!(changed.len(), 9, "first apply writes every file: {report}");
     // The sender-login map rides every apply (2026-11-25): it is the table
     // reject_sender_login_mismatch consults on the submission ports.
     let login = fixture.state_dir.join("config/postfix/sender_login");
@@ -395,9 +404,13 @@ async fn apply_writes_config_then_rewrites_nothing() {
         changed.is_empty(),
         "second apply must rewrite nothing: {report}"
     );
+    // One service now: the SMTP listeners, hot-swapped. Postfix, Dovecot and
+    // rspamd are not in the process (or in the path) any more, so a report that
+    // still named three would be naming daemons nothing reloads.
     assert_eq!(
         report["reloaded"].as_array().map(Vec::len),
-        Some(3),
-        "all three daemons reloaded: {report}"
+        Some(1),
+        "the one service this engine reloads: {report}"
     );
+    assert_eq!(report["reloaded"][0]["service"], "smtp", "{report}");
 }
