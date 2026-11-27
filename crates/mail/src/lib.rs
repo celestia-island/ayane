@@ -178,6 +178,7 @@ mod tests {
                 name: "example.com".to_owned(),
                 catch_all: Some(addr("inbox@example.com")),
                 enabled: true,
+                dkim: None,
             }],
             accounts: vec![
                 Account {

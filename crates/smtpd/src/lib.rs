@@ -174,6 +174,7 @@ pub mod authn;
 pub mod command;
 pub mod deliver;
 pub mod mailbox;
+pub mod outbound;
 pub mod policy;
 pub mod queue;
 pub mod retry;
@@ -186,9 +187,13 @@ pub use authn::{valid_identity, DenyAll, PasswordVerifier, SaslError};
 pub use command::{Command, ParseError};
 pub use deliver::{
     AuditEvent, Defaults, Deliverer, DeliveryRecord, DeliveryReport, Disposition, MaildirHook,
-    MaildirStep, MaildirSync, RecipientOutcome, RecipientReport, RecordedRecipient, DEFAULTS,
+    MaildirStep, MaildirSync, RecipientOutcome, RecipientReport, RecordedRecipient, RemoteReply,
+    RemoteReport, RemoteRequest, RemoteTransport, DEFAULTS,
 };
 pub use mailbox::{Mailbox, MailboxError, POSTMASTER};
+pub use outbound::{
+    Outbound, Resolver, Signer, StaticResolver, SyncedTransport, TlsPolicy, ZoneResolver,
+};
 pub use policy::{inbound_recipient, submission_recipient, AddressPolicy, ListenerRole};
 pub use policy::{RecipientVerdict, SessionRefusal, Verdict};
 pub use queue::{

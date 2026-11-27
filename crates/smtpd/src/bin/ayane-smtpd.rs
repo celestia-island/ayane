@@ -67,6 +67,31 @@ struct DeliverOptions {
     retry_max_attempts: u32,
     quota: Option<u64>,
     interval: Duration,
+    /// Deliver to remote domains over SMTP (the outbound transport). Off by
+    /// default: a consumer without it leaves remote recipients in the queue,
+    /// which is what a local-only deployment wants and what every pass before
+    /// this flag existed did.
+    outbound: bool,
+    /// The port the outbound transport connects to. `25` — the MX default — is
+    /// what a deployment uses; a rig behind a NAT that forwards another port
+    /// says so.
+    smtp_port: u16,
+    /// The environment variable each hosted domain's DKIM private key is read
+    /// from, with `{domain}` standing in for the domain name (PKCS #8 PEM).
+    ///
+    /// One variable per domain rather than one directory of keys because the
+    /// delivery of a secret is the operator's environment (systemd
+    /// `LoadCredential`, a 0600 env file) and this process only reads the name:
+    /// nothing here opens a path of its own, and no key is ever written to the
+    /// state snapshot.
+    ///
+    /// **The substituted name carries no dot.** A POSIX environment variable
+    /// name may not contain one, and every hosted domain has one, so the
+    /// domain is spelled with `_` where its dots are:
+    /// `--dkim-key-env 'AYANE_DKIM_KEY_{domain}'` reads `example.com`'s key
+    /// from `AYANE_DKIM_KEY_example_com`. See
+    /// [`ayane_smtpd::outbound::dkim_env_name`].
+    dkim_key_env: Option<String>,
 }
 
 fn usage() -> &'static str {
@@ -77,7 +102,10 @@ fn usage() -> &'static str {
         [--submission-authenticates]\n\
      \x20 or: ayane-smtpd --deliver --spool DIR --mail-root DIR --state FILE \
         --hostname NAME [--retry-max-age-seconds N] [--retry-max-attempts N] \
-        [--quota BYTES] [--interval-seconds N]"
+        [--quota BYTES] [--interval-seconds N] [--outbound] \
+        [--smtp-port N] [--dkim-key-env VAR]\n\
+     \x20 (VAR may contain {domain}; a domain's dots become _ in the name: \
+        example.com -> example_com)"
 }
 
 fn parse_options() -> Result<Options, String> {
@@ -87,6 +115,9 @@ fn parse_options() -> Result<Options, String> {
     let mut retry_max_attempts = 0u32;
     let mut quota = None;
     let mut interval = Duration::from_secs(30);
+    let mut outbound = false;
+    let mut smtp_port = ayane_smtpd::outbound::SMTP_PORT;
+    let mut dkim_key_env = None;
     let mut role = None;
     let mut listen = None;
     let mut spool = None;
@@ -162,6 +193,13 @@ fn parse_options() -> Result<Options, String> {
                         .map_err(|err| format!("bad --quota: {err}"))?,
                 );
             }
+            "--outbound" => outbound = true,
+            "--smtp-port" => {
+                smtp_port = value()?
+                    .parse()
+                    .map_err(|err| format!("bad --smtp-port: {err}"))?;
+            }
+            "--dkim-key-env" => dkim_key_env = Some(value()?),
             "--interval-seconds" => {
                 interval = Duration::from_secs(
                     value()?
@@ -189,6 +227,9 @@ fn parse_options() -> Result<Options, String> {
             retry_max_attempts,
             quota,
             interval,
+            outbound,
+            smtp_port,
+            dkim_key_env,
         }));
     }
     let tls = match (cert, key) {
@@ -250,8 +291,45 @@ fn load_tls(cert: &PathBuf, key: &PathBuf) -> Result<TlsAcceptor, String> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Installs the log subscriber, before anything can want to log.
+///
+/// Until this runs, every `tracing` event in this crate and the ones it calls
+/// is dropped: `warn!` and `error!` are macros that check for a subscriber
+/// first, and with none installed they are no-ops. That is the difference
+/// between an operator seeing "a DKIM selector is configured but its key is not
+/// in the environment" and that message existing only in the source.
+///
+/// The filter is `RUST_LOG` when set, and `warn` when not -- the level at which
+/// this binary has something to say (a missing key, a failed handshake, a
+/// snapshot that cannot be used) without drowning a systemd journal in a line
+/// per connection. `AYANE_LOG` is the family's name for the same knob; it is
+/// honoured when `RUST_LOG` is not set, so an operator who already writes one
+/// for the control plane does not have to learn a second spelling.
+///
+/// A filter that does not parse falls back to `warn` and says so on stderr: a
+/// typo must not cost the operator the very messages this installs.
+fn init_tracing() {
+    let (directives, source) = match std::env::var("RUST_LOG") {
+        Ok(value) if !value.trim().is_empty() => (value, "RUST_LOG"),
+        _ => match std::env::var("AYANE_LOG") {
+            Ok(value) if !value.trim().is_empty() => (value, "AYANE_LOG"),
+            _ => ("warn".to_owned(), "default"),
+        },
+    };
+    let filter = tracing_subscriber::EnvFilter::try_new(&directives).unwrap_or_else(|err| {
+        eprintln!("ignoring a malformed {source}={directives:?}: {err}; logging at `warn`");
+        tracing_subscriber::EnvFilter::new("warn")
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+    tracing::debug!(source, directives = %directives, "log subscriber installed");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let options = match parse_options() {
         Ok(options) => options,
         Err(err) => {
@@ -341,13 +419,47 @@ async fn deliver_forever(options: DeliverOptions) -> Result<(), Box<dyn std::err
         ..ayane_smtpd::retry::RetryPolicy::default()
     };
     let spool = Spool::open(&options.spool)?;
-    let deliverer = ayane_smtpd::deliver::Deliverer::new(
+    let mut deliverer = ayane_smtpd::deliver::Deliverer::new(
         spool,
         options.mail_root.clone(),
         options.hostname.clone(),
     )
     .with_retry(retry)
     .with_quota(options.quota);
+    if options.outbound {
+        // The outbound transport: an MX resolver, the opportunistic-TLS client
+        // and the DKIM signers the state's selectors name. The keys are read
+        // from the process environment here and nowhere else, so the state
+        // snapshot on disk never carries one.
+        let resolver: std::sync::Arc<dyn ayane_smtpd::outbound::Resolver> = std::sync::Arc::new(
+            ayane_smtpd::outbound::SystemResolver::system().map_err(|err| err.to_string())?,
+        );
+        let mut transport =
+            ayane_smtpd::outbound::Outbound::new(resolver, options.hostname.clone())
+                .with_port(options.smtp_port);
+        // The signers need the state, which this function has not loaded yet:
+        // it is read once here for the keys and once more every pass for the
+        // routing (an operator who adds a domain does not restart the
+        // consumer, and a selector change is a restart).
+        if let Some(template) = &options.dkim_key_env {
+            match load_state(&options.state) {
+                Ok(state) => {
+                    let signers = ayane_smtpd::outbound::signers_from_env(&state, template)
+                        .map_err(|err| err.to_string())?;
+                    for (_, signer) in signers {
+                        transport = transport.with_signer(signer);
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(%reason, "no state yet: outbound mail will be unsigned");
+                }
+            }
+        }
+        deliverer = deliverer.with_remote(std::sync::Arc::new(
+            ayane_smtpd::outbound::SyncedTransport::new(transport)?,
+        ));
+        tracing::info!(port = options.smtp_port, "outbound transport enabled");
+    }
     // The two roots are the one mistake this process cannot survive: writing
     // mail into the spool's own directory names is a failure that looks like
     // success. It is checked before the first pass, and a bad pair is fatal —

@@ -34,6 +34,7 @@ fn state() -> DesiredState {
             name: "example.com".to_owned(),
             catch_all: None,
             enabled: true,
+            dkim: None,
         }],
         accounts: vec![Account {
             id: Uuid::new_v4(),

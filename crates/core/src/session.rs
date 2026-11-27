@@ -473,6 +473,7 @@ mod tests {
                     name: "example.test".to_owned(),
                     catch_all: None,
                     enabled: true,
+                    dkim: None,
                 }],
                 accounts,
                 ..Default::default()
@@ -495,6 +496,7 @@ mod tests {
                     name: "example.test".to_owned(),
                     catch_all: None,
                     enabled: true,
+                    dkim: None,
                 }],
                 accounts: vec![Account {
                     id: uuid::Uuid::new_v4(),
@@ -546,11 +548,13 @@ mod tests {
                         name: "a.test".to_owned(),
                         catch_all: None,
                         enabled: true,
+                        dkim: None,
                     },
                     Domain {
                         name: "b.test".to_owned(),
                         catch_all: None,
                         enabled: true,
+                        dkim: None,
                     },
                 ],
                 accounts: vec![mk("test@a.test"), mk("test@b.test")],

@@ -46,3 +46,24 @@ entity (`CaUsedAsEndEntity`), which is what a bare `-subj` self-signed pair is.
 It is not a credential: it authenticates `mx.test` inside the test process and
 nothing else, and every test trusts it explicitly. It exists so the STARTTLS
 path is exercised over a real rustls handshake instead of being mocked.
+
+## Outbound DKIM (the signing tests)
+
+`dkim-private.pem` / `dkim-public.txt` are a **throwaway RSA-2048 key pair**
+generated for the outbound signing tests only:
+
+```
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out dkim-private.pem
+openssl pkey -in dkim-private.pem -pubout -out /tmp/dkim-pub.pem
+# dkim-public.txt is `v=DKIM1; k=rsa; p=<the base64 DER of /tmp/dkim-pub.pem>`
+```
+
+`tests/outbound.rs` signs a message with the private half and verifies it with
+`mail-auth` — the same verifier the inbound side runs — using a `FixedZone`
+that publishes the public half at `ayane._domainkey.example.test`. So the
+"signature verifies" test is a closed loop: sign here, verify here, no network.
+
+It is not a credential: nothing is published in DNS, no instance is configured
+with it, and the only key that ever reads it is a test process. It exists so
+the signing path is exercised against the real crypto instead of being mocked.
+Registered in `_ledger/tool-exemptions.md` with the other PEM fixtures.

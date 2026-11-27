@@ -2154,6 +2154,7 @@ mod tests {
             name: "example.test".to_owned(),
             catch_all: None,
             enabled: true,
+            dkim: None,
         });
         for (index, raw) in addresses.iter().enumerate() {
             state.desired.accounts.push(ayane_proto::Account {

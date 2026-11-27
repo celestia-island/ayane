@@ -20,10 +20,16 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# The binary installs a subscriber; the library only emits events.
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 rustls = { version = "^0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "^0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "^2"
+# The outbound client verifies a receiver's certificate against the web's
+# roots; the workspace already trusts the same store through reqwest's
+# rustls-tls and mail-auth's `webpki-roots` feature.
+webpki-roots = "^1"
 
 [dev-dependencies]
 tokio = { workspace = true }

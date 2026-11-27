@@ -500,11 +500,13 @@ mod tests {
                     name: "example.com".to_owned(),
                     catch_all: Some(addr("inbox@example.com")),
                     enabled: true,
+                    dkim: None,
                 },
                 MailDomain {
                     name: "retired.example".to_owned(),
                     catch_all: None,
                     enabled: false,
+                    dkim: None,
                 },
             ],
             accounts: vec![
@@ -942,6 +944,7 @@ mod tests {
             name: "second.example".to_owned(),
             catch_all: None,
             enabled: true,
+            dkim: None,
         });
         let rendered = postfix_variant_alias_regexp(&state);
         assert!(
