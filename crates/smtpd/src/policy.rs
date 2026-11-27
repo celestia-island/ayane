@@ -270,6 +270,7 @@ mod tests {
                 name: "example.com".to_owned(),
                 catch_all: catch_all.then(|| addr("inbox@example.com")),
                 enabled: true,
+                dkim: None,
             }],
             accounts: vec![Account {
                 id: Uuid::new_v4(),

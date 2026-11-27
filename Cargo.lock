@@ -309,6 +309,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -171,6 +171,76 @@ pub enum RecipientOutcome {
     Rejected(String),
 }
 
+/// What the outbound transport did with one remote recipient.
+///
+/// The delivery layer does not speak SMTP: it asks a [`RemoteTransport`] and
+/// turns the answer into a retry or a bounce, exactly as it does for a maildir
+/// write. That keeps the whole remote path — the one that leaves the machine —
+/// drivable from a test with no socket, and keeps the async client in
+/// [`crate::outbound`] where everything that touches the network lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteReply {
+    /// A host took it. The name is the MX host, for the operator's log.
+    Delivered {
+        /// The host that accepted the message.
+        host: String,
+    },
+    /// The receiver said "later", with its own words. Transient.
+    Deferred {
+        /// The failure as a `Diagnostic-Code` value and a log line.
+        reason: String,
+    },
+    /// The receiver said "never", or the domain cannot take mail at all
+    /// (a null MX, a domain that does not resolve). Permanent.
+    Refused {
+        /// The failure as a `Diagnostic-Code` value and a log line.
+        reason: String,
+    },
+}
+
+/// One remote recipient and what became of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteReport {
+    /// The recipient as it was accepted at `RCPT`.
+    pub recipient: String,
+    /// What the transport did.
+    pub reply: RemoteReply,
+}
+
+/// The outbound transport, as the delivery layer sees it.
+///
+/// One call carries a whole destination: the recipients of one domain, in one
+/// group, because one SMTP transaction can carry several (and a connection per
+/// recipient is how a small installation looks like a spam run).
+pub trait RemoteTransport {
+    /// Delivers `message` to `recipients`, all at `domain`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error only when the transport itself could not be asked —
+    /// never for a delivery failure, which is [`RemoteReply`]'s job.
+    fn deliver_group(&self, request: &RemoteRequest<'_>) -> io::Result<Vec<RemoteReport>>;
+}
+
+/// One group of remote recipients, ready to leave the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRequest<'a> {
+    /// The queue id, which the trace field carries.
+    pub id: &'a str,
+    /// The destination domain every recipient shares.
+    pub domain: &'a str,
+    /// The reverse-path (`""` for the null sender).
+    pub sender: &'a str,
+    /// The recipients.
+    pub recipients: &'a [String],
+    /// The octets to send: the stored message, without this hop's
+    /// `Received:` field — the transport writes one per hop, at send time, so
+    /// a retry does not accumulate a trace chain in the queue.
+    pub message: &'a [u8],
+    /// Seconds since the epoch, for the trace field's date.
+    pub now_epoch: u64,
+}
+
 /// One recipient and what became of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecipientReport {
@@ -340,6 +410,11 @@ pub struct Deliverer {
     hostname: String,
     retry: RetryPolicy,
     quota: Option<u64>,
+    /// The outbound transport, when this instance delivers off-host mail.
+    /// `None` leaves every non-hosted recipient [`RecipientOutcome::Remote`],
+    /// which is what a local-only deployment (and every unit test that is not
+    /// about the outbound path) wants.
+    remote: Option<Arc<dyn RemoteTransport>>,
     hooks: Arc<Hooks>,
 }
 
@@ -399,6 +474,7 @@ impl Deliverer {
             hostname: hostname.into(),
             retry: RetryPolicy::default(),
             quota: None,
+            remote: None,
             hooks: Arc::new(Hooks::default()),
         }
     }
@@ -483,6 +559,24 @@ impl Deliverer {
     #[must_use]
     pub fn quota(&self) -> Option<u64> {
         self.quota
+    }
+
+    /// Installs the outbound transport.
+    ///
+    /// Without one, a recipient whose domain this instance does not host stays
+    /// [`RecipientOutcome::Remote`] for ever — the entry waits in `cur/` and
+    /// no attempt is charged, which is exactly what the delivery layer
+    /// documented before the transport existed.
+    #[must_use]
+    pub fn with_remote(mut self, transport: Arc<dyn RemoteTransport>) -> Self {
+        self.remote = Some(transport);
+        self
+    }
+
+    /// The outbound transport in force, if any.
+    #[must_use]
+    pub fn remote(&self) -> Option<&Arc<dyn RemoteTransport>> {
+        self.remote.as_ref()
     }
 
     /// Installs the maildir step hook (tests only).
@@ -622,9 +716,114 @@ impl Deliverer {
         let sender = sender_address(&queued.envelope);
         let mut reports = Vec::new();
         let mut changed = false;
+
+        // The remote recipients first, grouped by domain: one message has one
+        // MX lookup and one connection per destination, and the local
+        // recipients below are unaffected by what a remote host says. A
+        // recipient only becomes remote when a transport is installed — see
+        // `deliver_recipient`, which is what decides "hosted here".
+        let mut remote_handled: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Some(transport) = &self.remote {
+            // Indices, not references: the record is written through below, so
+            // the group is a list of positions and every write goes back to
+            // the one vector it came from.
+            let remote_groups = self.remote_groups(state, &record, now_epoch);
+            for (domain, positions) in remote_groups {
+                let recipients: Vec<String> = positions
+                    .iter()
+                    .map(|index| record.recipients[*index].state.recipient.clone())
+                    .collect();
+                let request = RemoteRequest {
+                    id: &queued.id,
+                    domain: &domain,
+                    sender: queued.envelope.mail_from.as_str(),
+                    recipients: &recipients,
+                    message: &message,
+                    now_epoch,
+                };
+                let replies = match transport.deliver_group(&request) {
+                    Ok(replies) => replies,
+                    Err(err) => {
+                        // The transport could not be asked at all. That is the
+                        // same situation as a local write that failed with a
+                        // busy medium: wait, do not bounce.
+                        tracing::warn!(id = queued.id, domain, %err, "the outbound transport failed");
+                        recipients
+                            .iter()
+                            .map(|recipient| RemoteReport {
+                                recipient: recipient.clone(),
+                                reply: RemoteReply::Deferred {
+                                    reason: format!("outbound transport: {err}"),
+                                },
+                            })
+                            .collect()
+                    }
+                };
+                let by_recipient: std::collections::HashMap<&str, &RemoteReport> = replies
+                    .iter()
+                    .map(|report| (report.recipient.as_str(), report))
+                    .collect();
+                for index in positions {
+                    let name = record.recipients[index].state.recipient.clone();
+                    remote_handled.insert(name.clone());
+                    // Everything the arms below need from the entry before it
+                    // is borrowed mutably: the sender's null-ness is a property
+                    // of the envelope, and the reason is the transport's.
+                    let name_for_log = name.clone();
+                    let reply = by_recipient
+                        .get(name.as_str())
+                        .map(|report| report.reply.clone())
+                        .unwrap_or(RemoteReply::Deferred {
+                            reason: format!("the outbound transport did not report on <{name}>"),
+                        });
+                    let entry = &mut record.recipients[index];
+                    let outcome = match reply {
+                        RemoteReply::Delivered { host } => {
+                            entry.state.pending = false;
+                            entry.state.attempts = entry.state.attempts.saturating_add(1);
+                            entry.state.last_error = None;
+                            tracing::info!(
+                                id = queued.id,
+                                recipient = %name_for_log,
+                                host,
+                                "delivered outbound"
+                            );
+                            RecipientOutcome::Delivered(PathBuf::from(format!("smtp://{host}")))
+                        }
+                        RemoteReply::Deferred { reason } => self.transient(
+                            &queued.envelope,
+                            entry,
+                            sender.is_none(),
+                            now_epoch,
+                            reason,
+                        ),
+                        RemoteReply::Refused { reason } => self.permanent(
+                            &queued.envelope,
+                            entry,
+                            sender.is_none(),
+                            now_epoch,
+                            reason,
+                        ),
+                    };
+                    changed = true;
+                    reports.push(RecipientReport {
+                        recipient: name_for_log,
+                        outcome,
+                    });
+                }
+            }
+        }
+
         let recipients = &mut record.recipients;
         for entry in recipients.iter_mut() {
             if !entry.state.pending || entry.state.next_attempt_epoch > now_epoch {
+                continue;
+            }
+            // The transport above has already asked about this one. Asking the
+            // router again here would answer `Remote` a second time and push a
+            // second report for the same recipient.
+            if remote_handled.contains(&entry.state.recipient) {
                 continue;
             }
             let outcome = self.deliver_recipient(
@@ -692,6 +891,41 @@ impl Deliverer {
         })
     }
 
+    /// The pending remote recipients of this message, grouped by domain.
+    ///
+    /// Membership is the router's answer, not the envelope's: a recipient
+    /// counts as remote exactly when it is due and its domain is not hosted —
+    /// the same `hosted` test `deliver_recipient` applies — so the transport's
+    /// group and the local loop's remainder partition the due set with nothing
+    /// in both. The groups are ordered by domain so a pass is deterministic.
+    fn remote_groups(
+        &self,
+        state: &DesiredState,
+        record: &DeliveryRecord,
+        now_epoch: u64,
+    ) -> Vec<(String, Vec<usize>)> {
+        let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, entry) in record.recipients.iter().enumerate() {
+            if !entry.state.pending || entry.state.next_attempt_epoch > now_epoch {
+                continue;
+            }
+            let Ok(address) = Address::parse(&entry.state.recipient) else {
+                // An address the router cannot look up is not the transport's
+                // to judge; `deliver_recipient` fails it with its own reason.
+                continue;
+            };
+            if hosted(state, &address) {
+                continue;
+            }
+            groups
+                .entry(address.domain().to_owned())
+                .or_default()
+                .push(index);
+        }
+        groups.into_iter().collect()
+    }
+
     /// Routes and delivers one recipient, updating its record in place.
     // Eight arguments is what this call needs: the router's inputs (state,
     // envelope, bytes, sender), the record it updates, the clock, and the
@@ -720,8 +954,12 @@ impl Deliverer {
             );
         };
         if !hosted(state, &recipient) {
-            // Not hosted here: the outbound transport owns it, and this layer
-            // must not charge an attempt for a delivery nobody attempted.
+            // Not hosted here: the outbound transport owns it. Without a
+            // transport installed this layer must not charge an attempt for a
+            // delivery nobody attempted, so the recipient is simply left —
+            // the pre-transport behaviour, kept for the deployments that are
+            // local-only. (The transport, when installed, is asked once per
+            // group in `deliver_claimed`, not once per recipient here.)
             return RecipientOutcome::Remote;
         }
         // The failure paths inside `deliver_local` and `quarantine_message`
@@ -1275,6 +1513,21 @@ impl Deliverer {
         Ok(id)
     }
 
+    /// The delivery record of `id` as it is on disk (empty when there is
+    /// none).
+    ///
+    /// A read of the queue's own state, for an operator's diagnostics and for
+    /// the tests that pin what a pass recorded: the record is what survives a
+    /// restart, so it is the only honest answer to "did this attempt count?".
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the record exists and cannot be read or
+    /// parsed.
+    pub fn record_of(&self, id: &str) -> io::Result<DeliveryRecord> {
+        self.read_record(id)
+    }
+
     /// Reads the delivery record of `id` (empty when there is none).
     fn read_record(&self, id: &str) -> io::Result<DeliveryRecord> {
         let path = self.record_path(id);
@@ -1608,6 +1861,7 @@ mod tests {
             name: name.to_owned(),
             catch_all: None,
             enabled: true,
+            dkim: None,
         }
     }
 

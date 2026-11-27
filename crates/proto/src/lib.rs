@@ -374,6 +374,117 @@ pub struct MailDomain {
     pub catch_all: Option<Address>,
     /// Disabled domains keep their data but stop accepting mail.
     pub enabled: bool,
+    /// The DKIM key this domain signs its outbound mail with; `None` means
+    /// mail leaves unsigned.
+    ///
+    /// `#[serde(default)]` so a snapshot stored before the field existed keeps
+    /// loading — and keeps meaning exactly what it meant: no signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dkim: Option<DkimSigningConfig>,
+}
+
+/// One domain's outbound DKIM signing configuration (RFC 6376 §3.6.1).
+///
+/// # The private key is not part of the snapshot
+///
+/// The key is the one credential this crate could leak: it is a *signing* key,
+/// so whoever holds it can speak as the domain to every receiver that checks
+/// DKIM. It is therefore **never serialized**: [`DkimSigningConfig::private_key`]
+/// is `skip_serializing`, and the state file that reaches the consumer on disk
+/// holds the selector and nothing else. The key itself reaches the process out
+/// of band — as the PKCS #8 PEM in a file named by an environment variable of
+/// the delivering process (see the smtpd binary's `--dkim-key-env`) — and
+/// [`clear_secret`](DkimSigningConfig::clear_secret) is what strips it from an
+/// in-memory state before that state is rendered, hashed or logged.
+///
+/// `Some("")` deserializes to `None` on that one field: a snapshot that
+/// round-trips through serde writes no `private_key` at all, and a reader that
+/// put an empty string there means "no key here" rather than "a zero-length
+/// key".
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct DkimSigningConfig {
+    /// The `s=` tag: the selector the public key is published under, at
+    /// `<selector>._domainkey.<domain>`.
+    pub selector: String,
+    /// The private key, PKCS #8 PEM. Never serialized; see the type docs.
+    #[serde(skip_serializing)]
+    pub private_key: Option<String>,
+}
+
+/// Deserialization goes through [`DkimSigningConfig::from_parts`], so a
+/// snapshot that puts an empty string in `private_key` reads as "no key"
+/// rather than as a zero-length one.
+impl<'de> Deserialize<'de> for DkimSigningConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            selector: String,
+            #[serde(default)]
+            private_key: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self::from_parts(raw.selector, raw.private_key))
+    }
+}
+
+impl DkimSigningConfig {
+    /// Reads the two fields, folding an empty key string to `None`.
+    ///
+    /// `Some("")` is not a key: it is what a reader finds when a writer put an
+    /// empty variable into a snapshot, and treating it as one would make the
+    /// signer fail on every message instead of leaving the domain unsigned.
+    #[must_use]
+    pub fn from_parts(selector: impl Into<String>, private_key: Option<String>) -> Self {
+        Self {
+            selector: selector.into(),
+            private_key: private_key.filter(|key| !key.trim().is_empty()),
+        }
+    }
+
+    /// A configuration that names a selector but carries no key — the shape
+    /// the snapshot on disk holds.
+    #[must_use]
+    pub fn selector_only(selector: impl Into<String>) -> Self {
+        Self {
+            selector: selector.into(),
+            private_key: None,
+        }
+    }
+
+    /// A configuration with the key attached: the shape the *consumer* holds
+    /// in memory after it has read the key from its own out-of-band source.
+    #[must_use]
+    pub fn with_key(selector: impl Into<String>, private_key: impl Into<String>) -> Self {
+        Self::from_parts(selector, Some(private_key.into()))
+    }
+
+    /// Drops the key, leaving the selector: what a state is stripped to before
+    /// it is stored, rendered or handed anywhere it could be read.
+    pub fn clear_secret(&mut self) {
+        self.private_key = None;
+    }
+}
+
+impl std::fmt::Debug for DkimSigningConfig {
+    /// Prints the selector, never the key: a `Debug` of a state reaches logs,
+    /// and a log is not a place a signing key may appear.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DkimSigningConfig")
+            .field("selector", &self.selector)
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl MailDomain {
+    /// The DKIM key this domain signs with, when it has one configured.
+    #[must_use]
+    pub fn dkim(&self) -> Option<&DkimSigningConfig> {
+        self.dkim.as_ref()
+    }
 }
 
 /// A regular mailbox.
@@ -443,6 +554,14 @@ pub enum StateError {
     /// A hosted domain name is not a valid DNS name.
     #[error("hosted domain is malformed: {0}")]
     MalformedDomain(String),
+    /// A domain's DKIM signing selector is not a usable DNS label.
+    ///
+    /// The selector is half of the name a receiver queries
+    /// (`<selector>._domainkey.<domain>`), so it obeys the same label law the
+    /// hosted domain does — and it is rendered into nothing else, which is why
+    /// this is a refusal rather than a warning.
+    #[error("DKIM selector is malformed: {0}")]
+    MalformedDkimSelector(String),
 }
 
 /// The full desired configuration of one instance.
@@ -501,6 +620,28 @@ impl DesiredState {
                     "{}: {error}",
                     domain.name
                 )));
+            }
+            // A DKIM selector is the left half of the name a receiver queries
+            // (`<selector>._domainkey.<domain>`), so it is held to the same
+            // label law. It is checked here rather than at signing time
+            // because a selector that cannot be published as a DNS name is
+            // mail that leaves signed with a key nobody can fetch.
+            if let Some(dkim) = &domain.dkim {
+                let selector = dkim.selector.trim();
+                let valid = !selector.is_empty()
+                    && selector.len() <= 63
+                    && !selector.contains('.')
+                    && !selector.starts_with('-')
+                    && !selector.ends_with('-')
+                    && selector
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-');
+                if !valid {
+                    return Err(StateError::MalformedDkimSelector(format!(
+                        "{}: `{selector}`",
+                        domain.name
+                    )));
+                }
             }
             if !seen.insert(format!("@{}", domain.name)) {
                 return Err(StateError::DuplicateAddress(domain.name.clone()));
@@ -624,6 +765,30 @@ impl DesiredState {
         out
     }
 
+    /// Drops every DKIM private key from this state, in place.
+    ///
+    /// The keys are the one credential a populated snapshot can carry, so this
+    /// is the call a writer makes before a state leaves the process: the file
+    /// the consumer reads holds selectors only, and any in-memory copy that is
+    /// about to be rendered, hashed or logged goes through here first. Calling
+    /// it twice is a no-op, and a state that never held a key is unchanged.
+    pub fn clear_dkim_secrets(&mut self) {
+        for domain in &mut self.domains {
+            if let Some(dkim) = domain.dkim.as_mut() {
+                dkim.clear_secret();
+            }
+        }
+    }
+
+    /// The DKIM configuration of the hosted domain `name`, when it has one.
+    #[must_use]
+    pub fn dkim_for(&self, name: &str) -> Option<&DkimSigningConfig> {
+        self.domains
+            .iter()
+            .find(|domain| domain.enabled && domain.name == name)
+            .and_then(|domain| domain.dkim.as_ref())
+    }
+
     fn addresses(&self) -> impl Iterator<Item = &Address> {
         self.accounts
             .iter()
@@ -701,6 +866,7 @@ mod tests {
                 name: "example.com".to_owned(),
                 catch_all: Some(address("inbox@example.com")),
                 enabled: true,
+                dkim: None,
             }],
             accounts: vec![Account {
                 id: Uuid::nil(),
@@ -929,6 +1095,129 @@ mod tests {
         assert_eq!(round_trip, all_on);
         assert!(round_trip.variants.any_inbound());
         assert!(round_trip.variants.any_outbound());
+    }
+
+    #[test]
+    fn a_dkim_private_key_is_never_serialized() {
+        // The one credential a state can hold. It must not survive a write to
+        // disk, a render, or a log — three paths that all start from serde or
+        // `Debug`, so both are pinned here.
+        let mut state = fixture();
+        // A key stands in for the real one: what matters is that *bytes*
+        // reach the field and none of them reach a serialized form. The
+        // sentinel is deliberately not PEM-shaped, so the source tree carries
+        // nothing a credential scanner has to be taught to ignore.
+        const SENTINEL: &str = "a-key-that-must-never-be-written";
+        state.domains[0].dkim = Some(DkimSigningConfig::with_key("ayane", SENTINEL));
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert!(!json.contains(SENTINEL), "{json}");
+        assert!(!json.contains("private_key"), "{json}");
+        assert!(json.contains("\"selector\":\"ayane\""), "{json}");
+        let round_trip: DesiredState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            round_trip.domains[0].dkim,
+            Some(DkimSigningConfig::selector_only("ayane")),
+            "the selector survives a round trip, the key does not"
+        );
+        // `Debug` is the other way a state reaches a log.
+        let shown = format!("{:?}", state.domains[0].dkim);
+        assert!(!shown.contains(SENTINEL), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("ayane"), "{shown}");
+        // And the in-place strip leaves the selector behind.
+        state.clear_dkim_secrets();
+        assert_eq!(
+            state.domains[0].dkim,
+            Some(DkimSigningConfig::selector_only("ayane"))
+        );
+    }
+
+    #[test]
+    fn an_empty_key_field_reads_as_no_key() {
+        // A snapshot that was written by a serde round trip carries no
+        // `private_key` field at all; one a human edited may carry `null` or
+        // an empty string. All three mean "no key here".
+        for body in [
+            r#"{"selector":"ayane"}"#,
+            r#"{"selector":"ayane","private_key":null}"#,
+        ] {
+            let parsed: DkimSigningConfig = serde_json::from_str(body).expect("deserialize");
+            assert_eq!(parsed.selector, "ayane");
+            assert!(parsed.private_key.is_none(), "{body}");
+        }
+        // An empty string is the one spelling serde would keep: it means "no
+        // key here", the way a blank environment variable does.
+        let empty: DkimSigningConfig =
+            serde_json::from_str(r#"{"selector":"ayane","private_key":""}"#).expect("deserialize");
+        assert!(
+            empty.private_key.as_deref() != Some(""),
+            "an empty key is no key"
+        );
+    }
+
+    #[test]
+    fn a_selector_is_held_to_the_dns_label_law() {
+        // The selector is the left half of `<selector>._domainkey.<domain>`,
+        // so a selector that is not one DNS label publishes a key nobody
+        // fetches — and the mail still leaves signed.
+        for selector in ["ayane", "mail-2026", "a"] {
+            let mut state = fixture();
+            state.domains[0].dkim = Some(DkimSigningConfig::selector_only(selector));
+            state
+                .validate()
+                .unwrap_or_else(|e| panic!("`{selector}` rejected: {e}"));
+        }
+        for selector in [
+            "",
+            " ",
+            "with.dot",
+            "-leading",
+            "trailing-",
+            "with space",
+            "…",
+        ] {
+            let mut state = fixture();
+            state.domains[0].dkim = Some(DkimSigningConfig::selector_only(selector));
+            let err = state
+                .validate()
+                .expect_err(&format!("`{selector}` must not be a selector"));
+            assert!(
+                matches!(err, StateError::MalformedDkimSelector(_)),
+                "`{selector}`: {err}"
+            );
+        }
+        // 64 octets is past a label's 63.
+        let mut state = fixture();
+        state.domains[0].dkim = Some(DkimSigningConfig::selector_only("a".repeat(64)));
+        assert!(state.validate().is_err(), "a label is at most 63 octets");
+        state.domains[0].dkim = Some(DkimSigningConfig::selector_only("a".repeat(63)));
+        state.validate().expect("63 octets is a label");
+    }
+
+    #[test]
+    fn a_snapshot_without_the_dkim_field_still_loads() {
+        // Every state written before this field existed must keep loading,
+        // and keep meaning what it meant: unsigned.
+        let json = r#"{"domains":[{"name":"example.com","catch_all":null,"enabled":true}],
+            "accounts":[],"aliases":[],"shared":[],
+            "policy":{"default_action":"reject","allowlist":[],"denylist":[]}}"#;
+        let state: DesiredState = serde_json::from_str(json).expect("deserialize");
+        assert!(state.domains[0].dkim.is_none());
+        state.validate().expect("valid");
+        assert!(state.dkim_for("example.com").is_none());
+    }
+
+    #[test]
+    fn only_an_enabled_domain_offers_a_key() {
+        let mut state = fixture();
+        state.domains[0].dkim = Some(DkimSigningConfig::selector_only("ayane"));
+        assert!(state.dkim_for("example.com").is_some());
+        assert!(state.dkim_for("other.example").is_none());
+        state.domains[0].enabled = false;
+        assert!(
+            state.dkim_for("example.com").is_none(),
+            "a disabled domain does not sign"
+        );
     }
 
     #[test]

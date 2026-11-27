@@ -139,6 +139,7 @@ fn fixture_with(tag: &str, google: bool) -> Fixture {
                     name: "example.test".to_owned(),
                     catch_all: None,
                     enabled: true,
+                    dkim: None,
                 }],
                 accounts: vec![alice, bob],
                 ..Default::default()

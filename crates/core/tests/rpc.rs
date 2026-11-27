@@ -37,6 +37,7 @@ async fn surface(tag: &str) -> (RpcSurface, PathBuf) {
                 name: "example.test".to_owned(),
                 catch_all: None,
                 enabled: true,
+                dkim: None,
             }],
             accounts: vec![ayane_proto::Account {
                 id: uuid::Uuid::new_v4(),

@@ -492,6 +492,7 @@ mod tests {
                     name: "example.test".to_owned(),
                     catch_all: None,
                     enabled: true,
+                    dkim: None,
                 }],
                 accounts: vec![Account {
                     id: uuid::Uuid::new_v4(),

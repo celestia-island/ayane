@@ -64,6 +64,7 @@ pub fn fixture_state(catch_all: bool) -> DesiredState {
             name: "example.com".to_owned(),
             catch_all: catch_all.then(|| addr("inbox@example.com")),
             enabled: true,
+            dkim: None,
         }],
         accounts: vec![
             Account {
@@ -219,9 +220,23 @@ impl Harness {
 
     /// Starts a listener on a loopback port.
     pub async fn start(tag: &str, options: HarnessOptions) -> Self {
+        Self::start_with(tag, options, None).await
+    }
+
+    /// [`Harness::start`] with a caller-supplied state instead of the fixture's.
+    ///
+    /// The routing snapshot, the address policy and the `Received:` name all
+    /// come from it, so a test that needs a different hosted set (the outbound
+    /// tests do: one listener must see a domain outside its delivery snapshot)
+    /// gets one without a second harness.
+    pub async fn start_with(
+        tag: &str,
+        options: HarnessOptions,
+        state: Option<DesiredState>,
+    ) -> Self {
         let dir = TempDir::new(tag);
         let spool = Spool::open(dir.path().join("spool")).expect("spool");
-        let state = fixture_state(options.catch_all);
+        let state = state.unwrap_or_else(|| fixture_state(options.catch_all));
         let policy = AddressPolicy::from_state(&state);
         let tls = options
             .tls
