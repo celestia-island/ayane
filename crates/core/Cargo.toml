@@ -26,6 +26,7 @@ arc-swap = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+subtle = { workspace = true }
 getrandom = { workspace = true }
 hickory-resolver = { workspace = true }
 rust-embed = { workspace = true }

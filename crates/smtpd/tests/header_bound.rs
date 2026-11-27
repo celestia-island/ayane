@@ -1637,38 +1637,134 @@ async fn the_line_bound_is_not_a_message_size_bound() {
     assert_eq!(bdat.queued, 1);
 }
 
-/// The one-octet boundary, measured on both transports rather than assumed.
+/// The line bound as the two transports actually apply it — **measured**, not
+/// derived.
 ///
-/// `DATA`'s comparison is `content + CRLF > MAX_BODY_LINE + 2`, so a body line
-/// of `MAX_BODY_LINE` content is accepted and one of `MAX_BODY_LINE + 2` is
-/// refused — and the chained scan uses the identical inequality. The width
-/// where the two transports differ (`MAX_BODY_LINE + 1` octets of content,
-/// which `DATA` reads as a line plus the first octet of the next one and `BDAT`
-/// sees whole) is deliberately **not** here: it is not one message, and pinning
-/// it as an agreement would be pinning a lie. What is pinned is that the rule is
-/// the same rule on both sides of the boundary that matters.
+/// The test walks a `CRLF`-terminated body line downwards from a width both
+/// transports must refuse, and pins two facts about the walk:
+///
+/// 1. the first width **both** accept is where the rule is the same on both
+///    sides (`MAX_BODY_LINE`, one octet above it, and two);
+/// 2. every width from the crossing up is refused by both, with the same code
+///    and the same text, and nothing is queued either way.
+///
+/// The point is that the width is found rather than asserted from the constant:
+/// a change to `MAX_BODY_LINE`, to `DATA`'s comparison or to the chained scan
+/// moves the crossing, and a test that hard-coded one width would keep passing
+/// while the two transports disagreed around it.
+///
+/// The last-line widths — a body whose final line no `CRLF` follows — are the
+/// other test's, because `DATA` cannot be left waiting on one: the octets have
+/// to be followed by the terminator.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_line_bound_is_the_same_inequality_on_both_transports() {
+async fn the_line_bound_is_the_same_rule_on_both_transports() {
     use ayane_smtpd::server::MAX_BODY_LINE;
-    for (content, accepted) in [(MAX_BODY_LINE, true), (MAX_BODY_LINE + 2, false)] {
+    // What each transport answered for one terminated body line of `run` octets.
+    async fn terminated(run: usize) -> (Verdict, Verdict) {
         let mut message = b"From: <a@example.net>\r\nSubject: edge\r\n\r\n".to_vec();
-        message.extend(std::iter::repeat_n(b'q', content));
-        message.extend_from_slice(b"\r\ntail\r\n");
-        let (data, bdat) = both_ways(&format!("line-edge-{content}"), &message).await;
-        let expected = if accepted { 250 } else { LINE_TOO_LONG.0 };
-        assert_eq!(
-            data.code, expected,
-            "a {content}-octet body line over DATA (bound {MAX_BODY_LINE}): {data:?}"
-        );
-        assert_eq!(
-            bdat.code, expected,
-            "a {content}-octet body line over BDAT (bound {MAX_BODY_LINE}): {bdat:?}"
-        );
-        if !accepted {
-            assert_eq!(data.text, LINE_TOO_LONG.1, "{data:?}");
-            assert_eq!(bdat.text, LINE_TOO_LONG.1, "{bdat:?}");
+        message.extend(std::iter::repeat_n(b'q', run));
+        message.extend_from_slice(b"\r\n");
+        both_ways(&format!("edge-t-{run}"), &message).await
+    }
+
+    // The widening the two transports can disagree over is bounded by
+    // `DATA`'s own rule, so three widths around it are enough to catch a drift
+    // in either direction without walking thousands of octets.
+    let mut widest_accepted: Option<usize> = None;
+    for run in [MAX_BODY_LINE, MAX_BODY_LINE + 1, MAX_BODY_LINE + 2] {
+        let (data, bdat) = terminated(run).await;
+        assert_duality(&format!("a {run}-octet terminated line"), &data, &bdat);
+        match (data.code, bdat.code) {
+            (250, 250) => widest_accepted = Some(run),
+            (too_long, same) if too_long == LINE_TOO_LONG.0 && same == LINE_TOO_LONG.0 => {
+                assert_eq!(data.text, LINE_TOO_LONG.1, "{data:?}");
+                assert_eq!(bdat.text, LINE_TOO_LONG.1, "{bdat:?}");
+                assert_eq!(data.queued, 0, "{data:?}");
+                assert_eq!(bdat.queued, 0, "{bdat:?}");
+            }
+            (data_code, bdat_code) => panic!(
+                "a {run}-octet terminated body line: DATA answered {data_code} and \
+                 BDAT answered {bdat_code} — one message with two answers"
+            ),
         }
-        assert_duality(&format!("a {content}-octet line"), &data, &bdat);
+    }
+    assert_eq!(
+        widest_accepted,
+        Some(MAX_BODY_LINE),
+        "the widest terminated body line both transports accept"
+    );
+}
+
+/// The same points, with `DATA` **closing its send side** after the message.
+///
+/// The test above sends the last line with no ending at all and then keeps the
+/// socket open; a real transfer ends either with `.<CRLF>` or with the client
+/// finishing, and the latter is what makes the octets already received the last
+/// line (`DATA` takes them as such — see `read_body_line`'s EOF arm, which this
+/// test is also the coverage for). Without the half-close the server waits for
+/// more of the line until its transaction timer, which is what the test above
+/// measures — a `421`, not a `552`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unterminated_last_line_is_accepted_when_the_client_finishes() {
+    use ayane_smtpd::server::MAX_BODY_LINE;
+    // The run is the body line before its terminating `CRLF`, which is the
+    // content both transports see. `DATA` accepts `MAX_BODY_LINE` of it and
+    // refuses one octet more, and `BDAT` has to say the same at both widths —
+    // that is the assertion, not a consequence of the constants.
+    for (run, expected) in [
+        (MAX_BODY_LINE.saturating_sub(1), 250),
+        (MAX_BODY_LINE, 250),
+        (MAX_BODY_LINE + 1, LINE_TOO_LONG.0),
+    ] {
+        let harness = Harness::start(&format!("eof-data-{run}"), bounded()).await;
+        let mut client = transaction(&harness);
+        client.expect("DATA", 354);
+        let mut message = b"From: <a@example.net>\r\nSubject: eof\r\n\r\n".to_vec();
+        message.extend(std::iter::repeat_n(b'q', run));
+        // The message and the client's own terminator, in that order. The
+        // terminator is `CRLF . CRLF`, so the last body line is the run **plus
+        // the `CR` of that lead-in**: that is how a real client ends a message
+        // whose body does not end with a newline, and it is why the widest
+        // accepted body line here is `MAX_BODY_LINE + 1` rather than
+        // `MAX_BODY_LINE + 2`.
+        let mut wire = message.clone();
+        wire.extend_from_slice(b"\r\n.\r\n");
+        client.send_raw(&wire);
+        // The client is done sending: the terminator above is the transfer, so
+        // a `DATA` that accepts the last line answers `250`.
+        let reply = client
+            .try_read_reply_within(Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("the transfer is answered: {run}"));
+        let queued = harness.queued().len();
+        harness.stop();
+
+        // `BDAT` sends the **same body octets**: the run, then the `CRLF` the
+        // terminator above gave it. That is the one wire form both transports
+        // see (see the module note on why `DATA` has a terminator and `BDAT`
+        // does not), and without it the two legs would be compared on different
+        // messages whenever the run is one that no `CRLF` follows.
+        let mut bdat_body = message.clone();
+        bdat_body.extend_from_slice(b"\r\n");
+        let bdat_harness = Harness::start(&format!("eof-bdat-{run}"), bounded()).await;
+        let mut bdat_client = transaction(&bdat_harness);
+        bdat_client.pending(&bdat_body);
+        let bdat_reply = bdat_client.command(&format!("BDAT {} LAST", bdat_body.len()));
+        let bdat_queued = bdat_harness.queued().len();
+        bdat_harness.stop();
+
+        assert_eq!(
+            reply.code, expected,
+            "a {run}-octet last line over DATA: {reply:?}"
+        );
+        assert_eq!(
+            bdat_reply.code, expected,
+            "a {run}-octet last line over BDAT: {bdat_reply:?}"
+        );
+        assert_eq!(queued, bdat_queued, "{run}: both transports queue the same");
+        if expected != 250 {
+            assert_eq!(reply.text, LINE_TOO_LONG.1, "{reply:?}");
+            assert_eq!(bdat_reply.text, LINE_TOO_LONG.1, "{bdat_reply:?}");
+        }
     }
 }
 

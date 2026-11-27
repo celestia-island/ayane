@@ -50,26 +50,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the running service (reload = hot swap, traffic = counters); with it
     // disabled nothing in the process can answer a reload, and the recording
     // driver says so in the apply report instead of pretending.
-    let driver: Arc<dyn EngineDriver> = if config.mail.enabled {
-        let engine = ayane::engine::start(&config, store.clone()).await?;
-        tracing::info!(
-            listeners = engine.control().listeners,
-            spool = %config.mail.spool_root.display(),
-            mail_root = %config.mail.mail_root.display(),
-            outbound = config.mail.outbound,
-            dkim = config.mail.dkim_key_env.is_some(),
-            "mail engine started in this process"
-        );
-        Arc::new(NativeDriver::new(engine.control().clone()))
-    } else {
-        Arc::new(RecordingDriver::new(config.compose_file.clone()))
-    };
+    // A mail service that cannot start is reported, never fatal — unless the
+    // deployment said `AYANE_MAIL_REQUIRE_START=1`, which is the only way this
+    // `?` fires. The control plane below is bound and served either way: an
+    // operator whose SMTP port is not up still needs `/api/health` to say so.
+    let (driver, mail_health): (Arc<dyn EngineDriver>, Option<Arc<ayane::MailHealth>>) =
+        if config.mail.enabled {
+            let engine = ayane::engine::start(&config, store.clone()).await?;
+            let listeners = config.mail.listeners.len();
+            if let Some(degraded) = engine.degraded() {
+                tracing::error!(
+                    cause = degraded.cause,
+                    reason = %degraded.reason,
+                    "the mail service is degraded; the control plane serves without it"
+                );
+            } else {
+                tracing::info!(
+                    listeners,
+                    spool = %config.mail.spool_root.display(),
+                    mail_root = %config.mail.mail_root.display(),
+                    outbound = config.mail.outbound,
+                    dkim = config.mail.dkim_key_env.is_some(),
+                    "mail engine started in this process"
+                );
+            }
+            let health = ayane::MailHealth {
+                serving: engine.degraded().is_none(),
+                degraded: engine.degraded().cloned(),
+                listeners,
+            };
+            (
+                Arc::new(NativeDriver::new(engine.control().clone())),
+                Some(Arc::new(health)),
+            )
+        } else {
+            (
+                Arc::new(RecordingDriver::new(config.compose_file.clone())),
+                None,
+            )
+        };
 
     let state = AppState {
         store: store.clone(),
         driver,
         config: Arc::new(config.clone()),
         auth,
+        mail_health: mail_health.clone(),
     };
     let sessions_path = config.state_dir.join("sessions.json");
     let surface = RpcSurface {
@@ -87,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_api = if config.admin_token.is_some() { "enabled" } else { "disabled" },
         auth_mode = policy.mode.as_str(),
         mail = if config.mail.enabled { "native" } else { "disabled" },
+        mail_serving = mail_health.as_ref().is_none_or(|mail| mail.serving),
         "ayane control plane starting"
     );
     axum::serve(listener, ayane::api::full_router(surface)).await?;

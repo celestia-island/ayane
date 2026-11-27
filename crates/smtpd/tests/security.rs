@@ -327,9 +327,10 @@ async fn submission_never_accepts_credentials_on_a_clear_channel() {
         base64_plain("ops@example.com", "s3cret")
     ));
     assert_eq!(reply.code, 538, "clear-text AUTH: {reply:?}");
-    // The rejected attempt leaves no identity behind.
+    // The rejected attempt leaves no identity behind, so the submission is
+    // refused — at `RCPT`, with the code that says "authenticate first".
     client.expect("MAIL FROM:<ops@example.com>", 250);
-    assert_eq!(client.command("RCPT TO:<someone@gmail.com>").code, 550);
+    assert_eq!(client.command("RCPT TO:<someone@gmail.com>").code, 530);
     harness.stop();
 }
 
@@ -869,7 +870,7 @@ async fn an_identity_with_a_crlf_is_refused_and_never_reaches_received() {
     // The session did not authenticate, so the submission is refused — and no
     // message carries the injected field.
     client.expect("MAIL FROM:<ops@example.com>", 250);
-    assert_eq!(client.command("RCPT TO:<someone@gmail.com>").code, 550);
+    assert_eq!(client.command("RCPT TO:<someone@gmail.com>").code, 530);
     assert!(harness.queued().is_empty());
     harness.stop();
 }

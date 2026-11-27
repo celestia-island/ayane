@@ -181,6 +181,7 @@ fn fixture_with(tag: &str, google: bool) -> Fixture {
         )),
         config: Arc::new(config),
         auth: Arc::new(AuthState::new(catalog, http.clone())),
+        mail_health: None,
     };
     let surface = RpcSurface {
         app: app.clone(),

@@ -84,6 +84,12 @@ pub struct MailConfig {
     pub mail_root: PathBuf,
     /// The state snapshot the delivery consumer and the outbound signers read
     /// (default `state/desired-state.json`, written by every apply).
+    ///
+    /// It must be the file the apply writes — under `AYANE_STATE_DIR`, named
+    /// [`crate::apply::SNAPSHOT_PATH`]. A value anywhere else is refused at
+    /// start (degraded, cause `state_path`): a consumer reading a file nothing
+    /// writes routes by a table that never changes, and every apply would
+    /// silently reach the listener and not the delivery.
     pub state_path: PathBuf,
     /// The `SIZE` ceiling for a message.
     pub max_message_size: u64,
@@ -106,6 +112,13 @@ pub struct MailConfig {
     /// The environment variable template each domain's DKIM key is read from
     /// (`{domain}`, dots spelled `_`).
     pub dkim_key_env: Option<String>,
+    /// Whether a mail service that cannot start stops the *process*.
+    ///
+    /// Off by default: the control plane keeps serving and
+    /// `/api/health` carries the reason ([`crate::engine::MailDegraded`]). A
+    /// deployment that wants its supervisor to see a failed start as a failed
+    /// process sets `AYANE_MAIL_REQUIRE_START=1`.
+    pub require_start: bool,
 }
 
 impl Default for MailConfig {
@@ -131,6 +144,7 @@ impl Default for MailConfig {
             outbound: false,
             smtp_port: ayane_smtpd::outbound::SMTP_PORT,
             dkim_key_env: None,
+            require_start: false,
         }
     }
 }
@@ -294,6 +308,12 @@ fn mail_from_env(state_dir: &Path) -> Result<MailConfig, ConfigError> {
         );
     }
     mail.dkim_key_env = std::env::var("AYANE_MAIL_DKIM_KEY_ENV").ok();
+    if let Ok(raw) = std::env::var("AYANE_MAIL_REQUIRE_START") {
+        mail.require_start = matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
     Ok(mail)
 }
 

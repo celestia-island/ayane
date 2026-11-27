@@ -55,6 +55,7 @@ fn fixture(tag: &str) -> Router {
         driver: Arc::new(RecordingDriver::new(root.join("docker-compose.yml"))),
         config: Arc::new(config),
         auth: Arc::new(ayane::auth::AuthState::local()),
+        mail_health: None,
     };
     ayane::api::full_router(RpcSurface {
         app,

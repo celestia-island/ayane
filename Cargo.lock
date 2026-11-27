@@ -254,6 +254,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -310,6 +311,7 @@ version = "0.1.0"
 dependencies = [
  "ayane-mail",
  "ayane-proto",
+ "ayane-store",
  "base64 0.22.1",
  "mail-auth",
  "memchr",

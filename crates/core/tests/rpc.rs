@@ -75,6 +75,7 @@ async fn surface(tag: &str) -> (RpcSurface, PathBuf) {
         )),
         config: Arc::new(config),
         auth: Arc::new(ayane::auth::AuthState::local()),
+        mail_health: None,
     };
     let surface = RpcSurface {
         app,

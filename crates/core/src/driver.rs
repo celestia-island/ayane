@@ -153,6 +153,29 @@ impl std::fmt::Debug for MailControl {
 }
 
 impl MailControl {
+    /// A slot nobody is serving: the engine never reached its listeners.
+    ///
+    /// It exists so a driver built from a degraded start is the same type as one
+    /// built from a healthy one, and so a reload performed after the operator
+    /// fixes the configuration lands somewhere rather than nowhere. The
+    /// configuration it holds is a placeholder — `metrics` records nothing and
+    /// `listeners` is zero, which is what the report then says.
+    #[must_use]
+    pub fn unstarted() -> Self {
+        Self {
+            slot: Arc::new(arc_swap::ArcSwap::from_pointee(unstarted_config())),
+            metrics: Arc::new(ayane_smtpd::metrics::Metrics::new()),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            listeners: 0,
+        }
+    }
+
+    /// Whether any listener is serving from this slot.
+    #[must_use]
+    pub fn serving(&self) -> bool {
+        self.listeners > 0 && self.generation() > 0
+    }
+
     /// Wraps the listener's initial configuration.
     #[must_use]
     pub fn new(config: ServerConfig, metrics: Arc<Metrics>, listeners: usize) -> Self {
@@ -197,6 +220,35 @@ impl MailControl {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The configuration a slot that nobody serves holds.
+fn unstarted_config() -> ServerConfig {
+    let desired = ayane_proto::DesiredState::default();
+    ServerConfig {
+        // An empty name is never put on the wire: no connection reaches it.
+        hostname: String::new(),
+        role: ayane_smtpd::ListenerRole::Inbound,
+        max_message_size: 25 * 1024 * 1024,
+        // A spool rooted in the temporary directory: this configuration is a
+        // placeholder, and opening the real one would create directories a
+        // degraded start has no business creating.
+        spool: ayane_smtpd::queue::Spool::open(std::env::temp_dir().join("ayane-unstarted-spool"))
+            .unwrap_or_else(|_| unreachable!("the temp directory is writable")),
+        policy: ayane_smtpd::policy::AddressPolicy::from_state(&desired),
+        state: desired,
+        passwords: Arc::new(ayane_smtpd::authn::DenyAll),
+        limits: ayane_smtpd::session::Limits::default(),
+        per_ip_limit: 1,
+        command_timeout: ayane_smtpd::server::COMMAND_TIMEOUT,
+        transaction_timeout: ayane_smtpd::server::TRANSACTION_TIMEOUT,
+        verifier: None,
+        tls: None,
+        max_received_headers: 25,
+        max_header_bytes: ayane_smtpd::server::DEFAULT_MAX_HEADER_BYTES,
+        auth_guard: None,
+        metrics: None,
     }
 }
 

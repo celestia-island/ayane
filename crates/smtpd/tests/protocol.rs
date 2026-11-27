@@ -365,11 +365,13 @@ async fn submission_listener_accepts_remote_recipients_after_auth() {
         !reply.advertises_prefix("AUTH"),
         "AUTH is only offered after TLS: {reply:?}"
     );
-    // Without AUTH the listener refuses to relay.
+    // Without AUTH the listener refuses to relay — and says which refusal it
+    // is: RFC 4954 §4's `530 5.7.0`, not the relay verdict a client that *had*
+    // authenticated would get.
     client.expect("MAIL FROM:<ops@example.com>", 250);
     let reply = client.command("RCPT TO:<someone@gmail.com>");
-    assert_eq!(reply.code, 550, "{reply:?}");
-    assert!(reply.text.contains("Relay access denied"), "{reply:?}");
+    assert_eq!(reply.code, 530, "{reply:?}");
+    assert!(reply.text.contains("Authentication required"), "{reply:?}");
     harness.stop();
 }
 
@@ -413,8 +415,8 @@ async fn role_is_structural() {
     client.expect("MAIL FROM:<ops@example.com>", 250);
     assert_eq!(
         client.command("RCPT TO:<someone@gmail.com>").code,
-        550,
-        "unauthenticated submission does not relay either"
+        530,
+        "unauthenticated submission does not relay either, and asks for a login"
     );
     harness_stop(&inbound);
     harness_stop(&submission);

@@ -39,7 +39,7 @@
 | `AYANE_MAIL_LISTENERS` | 空 | 逗号分隔的 `role@addr[,cert=PATH][key=PATH]`；role = `inbound` / `submission` / `submissions-tls`（后两个需证书） |
 | `AYANE_MAIL_SPOOL_ROOT` | `$AYANE_STATE_DIR/spool` | 待投递队列根；**不可**与 `mail_root` 相同或互为子目录 |
 | `AYANE_MAIL_ROOT` | `$AYANE_STATE_DIR/mail` | 落盘 maildir 根（spool 的兄弟目录，块⑤ 保留名教训） |
-| `AYANE_MAIL_STATE` | `$AYANE_STATE_DIR/desired-state.json` | 投递消费与 DKIM 签名读取的路由快照；**由 `admin.apply` 写入** |
+| `AYANE_MAIL_STATE` | `$AYANE_STATE_DIR/desired-state.json` | 投递消费与 DKIM 签名读取的路由快照；**由 `admin.apply` 写入**。设成别的路径会在启动期被拒（degraded，cause `state_path`）：消费端读的文件必须就是 apply 写的那个 |
 | `AYANE_MAIL_MAX_MESSAGE_SIZE` | `26214400` | `SIZE` 上限（字节） |
 | `AYANE_MAIL_MAX_HEADER_BYTES` | `1048576` | 头段上限（超限 `552 5.3.4`） |
 | `AYANE_MAIL_PER_IP_LIMIT` | `8` | 单 IP 并发连接数 |
@@ -50,13 +50,27 @@
 | `AYANE_MAIL_OUTBOUND` | `0` | `1` = 域外收件人经 MX 直投（需 25 出站与 PTR） |
 | `AYANE_MAIL_SMTP_PORT` | `25` | 出站连接端口 |
 | `AYANE_MAIL_DKIM_KEY_ENV` | 空 | 每个域的签名私钥所在环境变量模板，如 `AYANE_DKIM_KEY_{domain}`（域名的点写成 `_`） |
+| `AYANE_MAIL_REQUIRE_START` | `0` | `1` = 邮件面起不来就让进程退出（否则 degraded + 控制面继续服务） |
 
 启动顺序因此是：起控制面（邮件段同时绑定）→ 建域/建账号 → `admin.apply`（写 `desired-state.json`
 与各渲染表）→ 收信。**投递消费按 `AYANE_MAIL_STATE` 路由**：首次 apply 之前它读不到快照，会把这一轮
 记为跳过（日志 `the state snapshot cannot be used`），队列里的信件不会丢，apply 之后自动投递。
 
-分进程形态仍然可用：`ayane-smtpd --serve` / `--deliver` 读同一份 `desired-state.json` 与同一个 spool；
-那种形态下计数器不经过控制面（`admin.net.traffic` 显示为空），这是该形态的已知取舍。
+分进程形态仍然可用：`ayane-smtpd --serve` / `--deliver` 读同一份 `desired-state.json` 与同一个 spool。
+**该形态没有计数器**：`admin.net.traffic` 显示为空（「没有对端」与「没有计数表」是同一张空表），
+所以同进程未开启邮件段时它同样是空的——这是计数的所在，不是故障。
+
+分进程形态的 submission 监听器要真校验凭据，需带 `--password-hashes <apply 渲染的 dovecot passwd>`：
+`ayane-smtpd` 已**没有**「放行所有登录」的开关（`--submission-authenticates` 已删除），不带 hash 文件时
+它照常收信、但拒绝一切登录。
+
+### 1.2 邮件面起不来时
+
+`ayane serve` **不会**因为邮件面配错而整体退出：进程继续提供 API / RPC，`/api/health` 回 `200` 但
+`status` 为 `degraded`，并带 `mail.degraded.{cause,retryable,reason}`。cause 取值：
+`listeners`（无监听器 / submission 无证书）、`hostname`、`spool`、`roots`、`state`、`state_path`、
+`tls`、`outbound`、`bind`（端口被占，唯一 `retryable: true` 的一类）。
+部署脚本若要求「邮件面必须起来」，设 `AYANE_MAIL_REQUIRE_START=1`，那时启动失败才让进程退出。
 
 前门反向代理须把浏览器的原始 `Host` 头原样透传给 ayane（Caddy 的 `reverse_proxy` 默认如此；nginx 须显式
 `proxy_set_header Host $host;`）——否则 `/api/ws` 的同源校验（比对 `Origin` 与 `Host`）会以 403

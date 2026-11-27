@@ -17,6 +17,7 @@
 
 #![warn(missing_docs)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,12 +48,21 @@ struct ServeOptions {
     listen: SocketAddr,
     spool: PathBuf,
     state: PathBuf,
+    /// The account hashes a split-process listener authenticates against.
+    ///
+    /// The state snapshot is the public routing document and never carries a
+    /// credential, so a deployment that runs a **submission** listener in its
+    /// own process points it at the control plane's passwd file instead
+    /// (`--password-hashes`, the same `{SHA512-CRYPT}` entries an apply
+    /// renders). Without one the listener still serves mail; it just refuses
+    /// every login, which is the honest answer for a listener that has no way
+    /// to check one.
+    password_hashes: BTreeMap<String, String>,
     hostname: String,
     tls: Option<(PathBuf, PathBuf)>,
     max_message_size: u64,
     max_header_bytes: u64,
     per_ip_limit: usize,
-    submission_authenticates: bool,
 }
 
 /// The consumer mode's options.
@@ -98,8 +108,8 @@ fn usage() -> &'static str {
     "usage: ayane-smtpd --role inbound|submission|submissions-tls \
         --listen ADDR --spool DIR --state FILE --hostname NAME \
         [--tls-cert FILE --tls-key FILE] [--max-size BYTES] \
-        [--max-header-bytes BYTES] [--per-ip LIMIT] \
-        [--submission-authenticates]\n\
+        [--max-header-bytes BYTES] [--per-ip LIMIT] \\
+        [--password-hashes FILE]\n\
      \x20 or: ayane-smtpd --deliver --spool DIR --mail-root DIR --state FILE \
         --hostname NAME [--retry-max-age-seconds N] [--retry-max-attempts N] \
         [--quota BYTES] [--interval-seconds N] [--outbound] \
@@ -129,7 +139,7 @@ fn parse_options() -> Result<Options, String> {
     let mut max_message_size = 25 * 1024 * 1024;
     let mut max_header_bytes = ayane_smtpd::server::DEFAULT_MAX_HEADER_BYTES;
     let mut per_ip_limit = 8;
-    let mut submission_authenticates = false;
+    let mut hash_file: Option<PathBuf> = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -164,12 +174,12 @@ fn parse_options() -> Result<Options, String> {
                     .parse()
                     .map_err(|err| format!("bad --max-header-bytes: {err}"))?;
             }
+            "--password-hashes" => hash_file = Some(PathBuf::from(value()?)),
             "--per-ip" => {
                 per_ip_limit = value()?
                     .parse()
                     .map_err(|err| format!("bad --per-ip: {err}"))?;
             }
-            "--submission-authenticates" => submission_authenticates = true,
             "--deliver" => deliver = true,
             "--retry-max-age-seconds" => {
                 // The RFC 5321 §4.5.4.1 horizon, expressed in seconds: an
@@ -247,30 +257,121 @@ fn parse_options() -> Result<Options, String> {
         max_message_size,
         max_header_bytes,
         per_ip_limit,
-        submission_authenticates,
+        // Read once, at start: a hash file that changes under a running
+        // listener is a restart, the same rule the DKIM selector map follows.
+        password_hashes: match &hash_file {
+            Some(path) => read_passwd_file(path)?,
+            None => BTreeMap::new(),
+        },
     }))
 }
 
-/// The credential check for a submission listener.
+/// The credential check a submission listener runs.
 ///
-/// W1 does not link the identity store: an operator who turns this on gets a
-/// verifier that accepts every login, which is only ever right behind a
-/// network boundary that already authenticated the client (the internal
-/// submission port the engine rig runs). W2 replaces this with the store's
-/// `verify_password`.
-struct OperatorVerifier {
-    accept_all: bool,
+/// It used to be `--submission-authenticates`, which accepted **every** login:
+/// a flag that turned the submission port into an open relay for anyone who
+/// could reach it, kept alive by a comment saying a later layer would replace
+/// it. This is that replacement, and the flag is gone rather than refused —
+/// a split-process deployment authenticates against the same state snapshot
+/// everything else in this binary reads, so there is no configuration in which
+/// "accept everyone" is the right answer.
+///
+/// # What it can check from a snapshot
+///
+/// The snapshot carries the store's password **hashes** (`{SHA512-CRYPT}…`,
+/// the same entries the control plane renders into Dovecot's passwd file) and
+/// the addresses of shared mailboxes. So:
+///
+/// - an account whose hash is in the snapshot is verified against it;
+/// - a shared mailbox is refused here, because its credential is a plaintext
+///   machine secret the state snapshot deliberately does not carry (a state
+///   read must never leak one) — a shared mailbox logs in through the control
+///   plane's in-process listener, which has the store itself;
+/// - anything else is refused.
+///
+/// `Passwords` is what keeps the listener honest about which of those two
+/// worlds it is in.
+pub struct SnapshotVerifier {
+    /// Addresses with a hash in the snapshot, and the hash itself.
+    hashes: BTreeMap<String, String>,
+    /// Addresses that exist but cannot be checked here (shared mailboxes).
+    unreachable: BTreeSet<String>,
 }
 
-impl PasswordVerifier for OperatorVerifier {
+impl SnapshotVerifier {
+    /// Reads the credential material out of a state snapshot.
+    #[must_use]
+    pub fn from_state(
+        state: &ayane_proto::DesiredState,
+        hashes: &BTreeMap<String, String>,
+    ) -> Self {
+        let mut names = BTreeSet::new();
+        for account in &state.accounts {
+            names.insert(account.address.as_str().to_owned());
+        }
+        for shared in &state.shared {
+            names.insert(shared.address.as_str().to_owned());
+        }
+        let hashes: BTreeMap<String, String> = hashes
+            .iter()
+            .filter(|(address, _)| names.contains(address.as_str()))
+            .map(|(address, hash)| (address.clone(), hash.clone()))
+            .collect();
+        let unreachable = names
+            .into_iter()
+            .filter(|address| !hashes.contains_key(address))
+            .collect();
+        Self {
+            hashes,
+            unreachable,
+        }
+    }
+
+    /// The addresses this listener can verify, and the ones it cannot.
+    #[must_use]
+    pub fn coverage(&self) -> (usize, usize) {
+        (self.hashes.len(), self.unreachable.len())
+    }
+}
+
+impl PasswordVerifier for SnapshotVerifier {
     fn verify<'a>(
         &'a self,
-        _identity: &'a str,
-        _password: &'a str,
+        identity: &'a str,
+        password: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        let accept = self.accept_all;
-        Box::pin(async move { accept })
+        Box::pin(async move {
+            let Ok(address) = ayane_proto::Address::parse(identity) else {
+                return false;
+            };
+            match self.hashes.get(address.as_str()) {
+                Some(hash) => ayane_store::password::verify_password(password, hash).is_ok(),
+                None => false,
+            }
+        })
     }
+}
+
+/// Reads a `{SHA512-CRYPT}$6$rounds=…` passwd file (`address:hash`) into a map.
+///
+/// The file is the one the control plane renders for Dovecot's passwd backend,
+/// so a split-process deployment reads what an apply already writes instead of
+/// a second copy of the hashes.
+fn read_passwd_file(path: &PathBuf) -> Result<BTreeMap<String, String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((address, hash)) = line.split_once(':') else {
+            tracing::warn!(%line, "ignoring a passwd line that is not `address:hash`");
+            continue;
+        };
+        out.insert(address.trim().to_ascii_lowercase(), hash.trim().to_owned());
+    }
+    Ok(out)
 }
 
 fn load_tls(cert: &PathBuf, key: &PathBuf) -> Result<TlsAcceptor, String> {
@@ -378,10 +479,11 @@ async fn serve_listener(options: ServeOptions) -> Result<(), Box<dyn std::error:
         transaction_timeout: ayane_smtpd::server::TRANSACTION_TIMEOUT,
         spool,
         policy,
+        passwords: Arc::new(SnapshotVerifier::from_state(
+            &state,
+            &options.password_hashes,
+        )),
         state,
-        passwords: Arc::new(OperatorVerifier {
-            accept_all: options.submission_authenticates,
-        }),
         verifier,
         tls: match &options.tls {
             Some((cert, key)) => Some(load_tls(cert, key)?),

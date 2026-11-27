@@ -51,6 +51,9 @@ fn fixture(tag: &str, token: Option<&str>) -> Fixture {
         driver: Arc::new(driver),
         config: Arc::new(config),
         auth: Arc::new(ayane::auth::AuthState::local()),
+        // No mail section in these fixtures, so `/api/health` is the payload it
+        // was before the mail engine existed.
+        mail_health: None,
     });
     Fixture {
         app,

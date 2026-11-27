@@ -32,10 +32,11 @@
 //!
 //! A submission listener authenticates against the store: the account's stored
 //! hash through [`ayane_store::password::verify_password`], or a shared
-//! mailbox's machine credential. The operator binary's
-//! `--submission-authenticates` flag (which accepts every login) is not what
-//! this process passes — a listener inside the control plane has the store, so
-//! it uses it.
+//! mailbox's machine credential (compared in constant time). A listener inside
+//! the control plane has the store, so it needs nothing else — and the split
+//! process does not get a way to opt out of checking: `ayane-smtpd` used to
+//! carry `--submission-authenticates`, which accepted every login, and that flag
+//! is gone (see [`ayane_smtpd`]'s `SnapshotVerifier`).
 //!
 //! # The seam that did not survive: rendered files → daemons
 //!
@@ -93,14 +94,39 @@ pub enum MailError {
     /// The stored state cannot be turned into a routing snapshot.
     #[error("state: {0}")]
     State(String),
+    /// The snapshot the delivery loop reads is not the one `admin.apply`
+    /// writes, so nothing would ever update the routing table it uses.
+    #[error(
+        "mail.state_path is {configured} but every apply writes {applied}: \\
+         set AYANE_MAIL_STATE to the applied path (or unset it and let the default stand)"
+    )]
+    StatePath {
+        /// Where the consumer was told to look.
+        configured: std::path::PathBuf,
+        /// Where the apply writes.
+        applied: std::path::PathBuf,
+    },
+    /// A listener cannot serve the role it was configured with.
+    #[error("listener {listen}: {reason}")]
+    Listener {
+        /// The address it was meant to bind.
+        listen: std::net::SocketAddr,
+        /// What is missing.
+        reason: String,
+    },
 }
 
 /// The running mail service: the handles the driver needs, and the tasks that
 /// make it live.
 #[derive(Debug)]
 pub struct RunningEngine {
+    /// The listener slot a reload replaces. Present even when degraded, so the
+    /// driver has one object either way and a reload after a fix is the same
+    /// call.
     control: MailControl,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// `None` when the service is serving; the reason when it is not.
+    degraded: Option<MailDegraded>,
 }
 
 impl RunningEngine {
@@ -108,6 +134,12 @@ impl RunningEngine {
     #[must_use]
     pub fn control(&self) -> &MailControl {
         &self.control
+    }
+
+    /// Why the mail service is not serving, or `None` when it is.
+    #[must_use]
+    pub fn degraded(&self) -> Option<&MailDegraded> {
+        self.degraded.as_ref()
     }
 
     /// Stops the tasks this process started (the listeners and the delivery
@@ -120,17 +152,105 @@ impl RunningEngine {
     }
 }
 
+impl RunningEngine {
+    /// An engine that is up.
+    #[must_use]
+    fn running(control: MailControl, tasks: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        Self {
+            control,
+            tasks,
+            degraded: None,
+        }
+    }
+
+    /// The engine shape a failed start leaves: the control plane keeps serving,
+    /// the mail side does not, and the slot exists for a later fix to reach.
+    ///
+    /// The slot is seeded from the **configured** listeners rather than from a
+    /// store read, because the store may be the very thing that failed; its
+    /// configuration is not served by anyone until a reload lands, and a
+    /// degraded instance is not going to accept a connection anyway.
+    fn not_serving(reason: MailDegraded) -> Self {
+        Self {
+            control: MailControl::unstarted(),
+            tasks: Vec::new(),
+            degraded: Some(reason),
+        }
+    }
+}
+
+/// Why the mail service is not serving, as the process reports it.
+///
+/// `None` on [`RunningEngine::degraded`] means the service is up. Any `Some`
+/// means the control plane is running — its API, its RPC surface, its health
+/// endpoint — while the mail side is not, and the reason says which part and
+/// which kind of fault:
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MailDegraded {
+    /// A stable, machine-readable cause: `listeners`, `hostname`, `spool`,
+    /// `roots`, `state`, `state_path`, `tls`, `outbound`, or `bind` for a
+    /// listener that could not take its address.
+    pub cause: &'static str,
+    /// Whether a restart could fix it without a human — an address that is
+    /// taken, a store that is briefly unreadable — as opposed to a
+    /// configuration only an operator can change.
+    pub retryable: bool,
+    /// The human-readable reason, exactly as the log line carries it.
+    pub reason: String,
+}
+
+impl MailDegraded {
+    /// The class of a [`MailError`], for the report and for the retry hint.
+    #[must_use]
+    pub fn of(err: &MailError) -> Self {
+        let (cause, retryable) = match err {
+            // A taken port is the one fault that is not necessarily a
+            // misconfiguration: another instance, a restart racing its own
+            // socket, a supervisor that has not let go yet.
+            MailError::Bind { .. } => ("bind", true),
+            MailError::Spool { .. } => ("spool", false),
+            MailError::Roots(_) => ("roots", false),
+            MailError::Tls(_) => ("tls", false),
+            MailError::Outbound(_) => ("outbound", false),
+            MailError::Missing(what) => (*what, false),
+            MailError::State(_) => ("state", true),
+            MailError::StatePath { .. } => ("state_path", false),
+            MailError::Listener { .. } => ("listeners", false),
+        };
+        Self {
+            cause,
+            retryable,
+            reason: err.to_string(),
+        }
+    }
+}
+
 /// Starts the mail service for `config`, and the tasks that run it.
 ///
 /// `store` is the live snapshot the listeners route by and the credential check
 /// reads; the caller keeps its own handle (the API needs one too).
 ///
-/// The three tasks are the three jobs the mail service has:
+/// # It never takes the control plane down
+///
+/// A mail service that cannot start is **reported**, not fatal: this returns an
+/// [`RunningEngine`] either way, with [`RunningEngine::degraded`] saying that
+/// nothing is serving and why. The control plane is the process's primary job —
+/// an operator whose SMTP port is not bound yet still needs the panel that tells
+/// them so — and exiting is how one mistyped certificate path came to cost an
+/// instance its entire API. The one exception is
+/// [`crate::config::MailConfig::require_start`], which a deployment sets when it
+/// wants a supervisor to see a failed start as a failed process instead.
+///
+/// What is *not* caught here, on purpose: a panic in the startup path. Every
+/// failure a configuration can produce is an `Err` from the startup path, and a panic
+/// is a bug in this crate rather than in a deployment.
+///
+/// # The tasks
 ///
 /// | task | what it is | cancelled by |
 /// |---|---|---|
 /// | listener × N | `ayane_smtpd::serve` over the bound socket | process exit |
-/// | delivery | the spawn loop below: one pass, then a sleep bounded by the earliest due attempt | process exit |
+/// | delivery | one pass per tick, sleeping no longer than the earliest due attempt | process exit |
 ///
 /// The outbound transport is not a task: it is installed on the deliverer
 /// ([`deliverer`]), so a message for a remote domain leaves the machine
@@ -138,12 +258,53 @@ impl RunningEngine {
 ///
 /// # Errors
 ///
-/// Returns [`MailError`] when a listener cannot be bound, the spool or roots
-/// are unusable, the state cannot be turned into a configuration, or a
-/// certificate cannot be loaded — all of them conditions a deployment has to
-/// fix before it can serve mail, and none of them worth starting a
-/// half-working instance over.
+/// Returns [`MailError`] only when `mail.require_start` is set and the service
+/// cannot start — the one case a deployment asked to be fatal.
 pub async fn start(
+    config: &Config,
+    store: Arc<dyn ayane_store::StateStore>,
+) -> Result<RunningEngine, MailError> {
+    match build(config, store).await {
+        Ok(engine) => Ok(engine),
+        Err(err) => {
+            let degraded = MailDegraded::of(&err);
+            tracing::error!(
+                cause = degraded.cause,
+                retryable = degraded.retryable,
+                reason = %degraded.reason,
+                "the mail service did not start; the control plane keeps serving"
+            );
+            if config.mail.require_start {
+                return Err(err);
+            }
+            Ok(RunningEngine::not_serving(degraded))
+        }
+    }
+}
+
+/// The configuration each listener serves, built once per listener.
+///
+/// `ServerConfig` is deliberately not `Clone` (it owns a spool, a policy and a
+/// verifier), so this is the one place the per-listener copy is made: the
+/// listener's own section for its socket, and — for a *reload* — the sections
+/// [`crate::driver::MailControl`] swaps in, which the driver rebuilds from the
+/// same inputs.
+fn per_listener(
+    mail: &MailConfig,
+    spool: &Spool,
+    desired: &ayane_proto::DesiredState,
+    passwords: &Arc<dyn PasswordVerifier>,
+) -> Result<Vec<ServerConfig>, MailError> {
+    let mut out = Vec::with_capacity(mail.listeners.len());
+    for listener in &mail.listeners {
+        let base = config_for(mail, spool, desired.clone(), passwords.clone())?;
+        out.push(listener_config(mail, base, listener)?);
+    }
+    Ok(out)
+}
+
+/// The startup itself: every step that can fail, with nothing softened.
+async fn build(
     config: &Config,
     store: Arc<dyn ayane_store::StateStore>,
 ) -> Result<RunningEngine, MailError> {
@@ -156,6 +317,47 @@ pub async fn start(
         // has no name; it is the default so a *unit test* can build one, and a
         // deployment that forgot to set it is refused here rather than served.
         return Err(MailError::Missing("hostname"));
+    }
+    // The state the listeners are built from and the state the delivery loop
+    // reads must be **one file**. `admin.apply` writes the store's snapshot
+    // under the state directory; `AYANE_MAIL_STATE` says where the consumer
+    // looks. If they differ, the consumer routes by a file nothing updates and
+    // every apply silently reaches the listener and not the delivery.
+    let canonical = config.state_dir.join(crate::apply::SNAPSHOT_PATH);
+    if mail.state_path != canonical {
+        return Err(MailError::StatePath {
+            configured: mail.state_path.clone(),
+            applied: canonical,
+        });
+    }
+    // The two roots are the one mistake this process cannot survive: a maildir
+    // written into the spool's own `tmp/`/`new/`/`cur/`/`corrupt/` is a failure
+    // that looks like success. Checked before anything is bound.
+    let roots = Deliverer::new(
+        Spool::open(&mail.spool_root).map_err(|err| MailError::Spool {
+            reason: err.to_string(),
+            path: mail.spool_root.clone(),
+        })?,
+        mail.mail_root.clone(),
+        mail.hostname.clone(),
+    );
+    roots
+        .check_roots()
+        .map_err(|err| MailError::Roots(err.to_string()))?;
+    // A submission listener without TLS cannot offer AUTH, and a submission
+    // listener that cannot authenticate accepts nothing: better to say so here
+    // than to serve a port that answers `538` to every login.
+    for listener in &mail.listeners {
+        if listener.role != ListenerRole::Inbound && listener.tls_cert.is_none() {
+            return Err(MailError::Listener {
+                listen: listener.listen,
+                reason: format!(
+                    "role {} needs a certificate: without TLS the AUTH capability is \
+                     not offered and every submission is refused",
+                    listener.role_name
+                ),
+            });
+        }
     }
     let spool_root = mail.spool_root.clone();
     let spool = Spool::open(&spool_root).map_err(|err| MailError::Spool {
@@ -175,10 +377,13 @@ pub async fn start(
         "spool recovered"
     );
 
-    // The shared part — the spool, the counters, the credential check — is
-    // built once; each listener gets its own copy with its own role, TLS
-    // acceptor and verifier.
+    // The delivery side is built **before** any socket is bound: a pair of
+    // roots that collide, or a DKIM key that will not load, is a configuration
+    // fault, and nothing should be left serving because it was discovered one
+    // step later.
     let metrics = Arc::new(Metrics::new());
+    let (deliverer, _spool) = deliverer(mail, metrics.clone())?;
+
     let passwords: Arc<dyn PasswordVerifier> = Arc::new(StoreVerifier {
         store: store.clone(),
     });
@@ -186,31 +391,13 @@ pub async fn start(
         .load()
         .map_err(|err| MailError::State(err.to_string()))?
         .desired;
-    // The listeners start on the configuration the store holds now; a later
-    // apply replaces it through `MailControl`. `ServerConfig` is deliberately
-    // not `Clone` (it holds a spool, a policy and a verifier), so the shared
-    // half is rebuilt per listener from the same inputs rather than copied.
-    // The slot is the configuration a *reload* replaces, and it is seeded with
-    // the first listener's full section (role, counters and all) rather than
-    // with the shared half: a driver that swapped in the shared half would
-    // hand the listener a configuration with no role and no counters, which is
-    // exactly the class of wiring mistake this module can make and its end-to-end
-    // test catches.
-    let first = mail
-        .listeners
-        .first()
-        .ok_or(MailError::Missing("listeners"))?;
-    let seed = listener_config(
-        mail,
-        config_for(mail, &spool, desired.clone(), passwords.clone())?,
-        first,
-        metrics.clone(),
-    )?;
-    let control = MailControl::new(seed, metrics.clone(), mail.listeners.len());
-    let mut tasks = Vec::new();
-    for listener in &mail.listeners {
-        let base = config_for(mail, &spool, desired.clone(), passwords.clone())?;
-        let config = listener_config(mail, base, listener, metrics.clone())?;
+    let configs = per_listener(mail, &spool, &desired, &passwords)?;
+
+    // Bind every socket before serving any of them, then start the tasks: a
+    // listener that cannot take its address is a startup failure, not a
+    // half-served instance.
+    let mut sockets = Vec::with_capacity(configs.len());
+    for (config, listener) in configs.iter().zip(&mail.listeners) {
         let socket = tokio::net::TcpListener::bind(listener.listen)
             .await
             .map_err(|err| MailError::Bind {
@@ -218,28 +405,41 @@ pub async fn start(
                 addr: listener.listen,
             })?;
         tracing::info!(
-            %listener.listen,
+            listen = %listener.listen,
             role = %listener.role_name,
             tls = config.tls.is_some(),
             "mail listener bound"
         );
+        sockets.push(socket);
+    }
+
+    // The slot a reload replaces: seeded with the first listener's full section,
+    // counters attached, so a driver that swaps a configuration in hands the
+    // listener a *usable* one (role, counters and all) rather than the shared
+    // half.
+    let first = per_listener(mail, &spool, &desired, &passwords)?
+        .into_iter()
+        .next()
+        .ok_or(MailError::Missing("listeners"))?;
+    let control = MailControl::new(
+        attach_metrics(first, metrics.clone()),
+        metrics.clone(),
+        mail.listeners.len(),
+    );
+
+    let mut tasks = Vec::new();
+    for (socket, config) in sockets.into_iter().zip(configs) {
+        let served = attach_metrics(config, metrics.clone());
         tasks.push(tokio::spawn(async move {
             // A listener whose `serve` returns has failed permanently (the
-            // socket is gone); the log line is the operator's only signal, and
-            // the process keeps the other listeners and the API alive.
-            if let Err(err) = ayane_smtpd::serve(socket, Arc::new(config)).await {
+            // socket is gone): the log line is the operator's signal, and the
+            // process keeps the other listeners and the API alive.
+            if let Err(err) = ayane_smtpd::serve(socket, Arc::new(served)).await {
                 tracing::error!(%err, "mail listener stopped");
             }
         }));
     }
 
-    // The delivery consumer: recover, then one pass per tick, sleeping no
-    // longer than the earliest attempt that is due.
-    let (deliverer, _spool) = deliverer(mail, metrics.clone())?;
-    // The delivery side's counters (a maildir write, a bounce, a deferral) are
-    // read off the reports each pass returns — see `MetricsDelivery::count_outcomes`.
-    // The *outbound* half is counted by the decorator [`deliverer`] installs on
-    // the transport itself, when the outbound path is enabled.
     let state_path = mail.state_path.clone();
     let interval = std::time::Duration::from_secs(mail.delivery_interval_seconds.max(1));
     tracing::info!(
@@ -252,7 +452,13 @@ pub async fn start(
         run_delivery(deliverer, state_path, interval, metrics).await;
     }));
 
-    Ok(RunningEngine { control, tasks })
+    Ok(RunningEngine::running(control, tasks))
+}
+
+/// Attaches the counters a listener writes to.
+fn attach_metrics(mut config: ServerConfig, metrics: Arc<Metrics>) -> ServerConfig {
+    config.metrics = Some(metrics);
+    config
 }
 
 /// The delivery loop: drain the queue, sleep, repeat.
@@ -362,10 +568,11 @@ fn next_due(passes: &[ayane_smtpd::DeliveryReport]) -> Option<u64> {
 /// The credential check a submission listener uses: the store's password
 /// hashes, verified with the same function the API uses.
 ///
-/// This is the half the operator binary lacked (`--submission-authenticates`
-/// accepted every login). A shared mailbox authenticates with the
-/// server-minted machine credential the store keeps for it, which is what makes
-/// the webmail's shared-mailbox session work over the same listener.
+/// This is the half the operator binary lacked, and the replacement for what it
+/// had instead (`--submission-authenticates`, which accepted every login and is
+/// now deleted). A shared mailbox authenticates with the server-minted machine
+/// credential the store keeps for it, which is what makes the webmail's
+/// shared-mailbox session work over the same listener.
 struct StoreVerifier {
     store: Arc<dyn ayane_store::StateStore>,
 }
@@ -384,13 +591,18 @@ impl PasswordVerifier for StoreVerifier {
                     return false;
                 }
             };
-            let address = match ayane_proto::Address::parse(identity) {
-                Ok(address) => address,
-                Err(_) => return false,
+            let Ok(address) = ayane_proto::Address::parse(identity) else {
+                return false;
             };
             if let Some(hash) = stored.password_hash(&address) {
                 return ayane_store::password::verify_password(password, hash).is_ok();
             }
+            // A shared mailbox logs in with the machine credential the store
+            // mints for it. The comparison is constant-time (`subtle`), for the
+            // same reason the password hashes are verified by a hash function
+            // rather than by a string compare: a byte-at-a-time early exit is a
+            // byte-at-a-time oracle, and this branch is reachable without a
+            // hash to slow it down.
             if stored
                 .desired
                 .shared
@@ -398,12 +610,23 @@ impl PasswordVerifier for StoreVerifier {
                 .any(|shared| shared.address.as_str().eq_ignore_ascii_case(identity))
             {
                 if let Ok(machine) = self.store.shared_imap_password(identity) {
-                    return machine == password;
+                    return constant_time_eq(machine.as_bytes(), password.as_bytes());
                 }
             }
             false
         })
     }
+}
+
+/// Whether two octet strings are equal, in time that depends only on their
+/// lengths.
+///
+/// `subtle`'s constant-time primitives, not a manual XOR loop: the point is that
+/// the comparison cannot be made to leak where the first difference is, and a
+/// loop that a compiler is free to reorder is not that.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    use subtle::ConstantTimeEq as _;
+    left.ct_eq(right).into()
 }
 
 /// The shared half of every listener's configuration: everything that does not
@@ -458,11 +681,9 @@ fn listener_config(
     mail: &MailConfig,
     base: ServerConfig,
     listener: &crate::config::MailListener,
-    metrics: Arc<Metrics>,
 ) -> Result<ServerConfig, MailError> {
     let mut config = base;
     config.role = listener.role;
-    config.metrics = Some(metrics);
     config.tls = match (&listener.tls_cert, &listener.tls_key) {
         (Some(cert), Some(key)) => Some(load_tls(cert, key)?),
         (None, None) => None,
@@ -635,6 +856,169 @@ mod tests {
         let err = deliverer(&same, Arc::new(Metrics::new())).expect_err("one path, two roles");
         assert!(matches!(err, MailError::Roots(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A store with one account, one shared mailbox (with a machine
+    /// credential) and nothing else.
+    fn verifier_fixture(tag: &str) -> (StoreVerifier, std::path::PathBuf) {
+        use ayane_store::{password, RedbStateStore, StateStore, StoredState};
+        let root =
+            std::env::temp_dir().join(format!("ayane-verifier-{tag}-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let store = RedbStateStore::open(root.join("store.redb")).expect("store");
+        let mut hashes = std::collections::HashMap::new();
+        hashes.insert(
+            "inbox@example.test".to_owned(),
+            password::hash_password("the-right-password").expect("hash"),
+        );
+        let stored = StoredState {
+            desired: ayane_proto::DesiredState {
+                domains: vec![ayane_proto::MailDomain {
+                    name: "example.test".to_owned(),
+                    catch_all: None,
+                    enabled: true,
+                    dkim: None,
+                }],
+                accounts: vec![ayane_proto::Account {
+                    id: uuid::Uuid::new_v4(),
+                    address: ayane_proto::Address::parse("inbox@example.test").expect("addr"),
+                    display_name: "Inbox".to_owned(),
+                    quota_bytes: 0,
+                    admin: false,
+                }],
+                shared: vec![ayane_proto::SharedMailbox {
+                    id: uuid::Uuid::new_v4(),
+                    address: ayane_proto::Address::parse("team@example.test").expect("addr"),
+                    members: vec![uuid::Uuid::new_v4()],
+                }],
+                ..Default::default()
+            },
+            password_hashes: hashes,
+            external_identities: Vec::new(),
+        };
+        store.save(&stored).expect("seed");
+        // Mint the shared mailbox's machine credential so the fixture has one
+        // to log in with.
+        store
+            .shared_imap_password("team@example.test")
+            .expect("machine credential");
+        (
+            StoreVerifier {
+                store: std::sync::Arc::new(store) as std::sync::Arc<dyn ayane_store::StateStore>,
+            },
+            root,
+        )
+    }
+
+    /// The five answers a submission listener's credential check can give.
+    ///
+    /// Every row is a separate assertion because every one of them is a
+    /// separable mutation: accepting everything turns the second, third and
+    /// fifth red; verifying against the wrong address turns the first red; a
+    /// verifier that never looks at a shared mailbox turns the fourth red.
+    /// Before these tests the module had none — the end-to-end test could not
+    /// reach the verifier either, because a listener without TLS never offers
+    /// AUTH — so "accept every login" was a change no test could see.
+    #[tokio::test]
+    async fn the_submission_credential_check_has_five_answers() {
+        let (verifier, root) = verifier_fixture("five");
+        // 1. The right account and the right password.
+        assert!(
+            verifier
+                .verify("inbox@example.test", "the-right-password")
+                .await,
+            "an account with its own password authenticates"
+        );
+        // 2. The right account and the wrong password.
+        assert!(
+            !verifier
+                .verify("inbox@example.test", "not-the-password")
+                .await,
+            "a wrong password is refused"
+        );
+        // 3. An account that does not exist, with a password-shaped guess. The
+        //    answer is the same word as 2's and comes from the same path — a
+        //    login that says "no such user" is a directory oracle.
+        assert!(
+            !verifier
+                .verify("nobody@example.test", "the-right-password")
+                .await,
+            "an unknown account is refused"
+        );
+        assert!(
+            !verifier
+                .verify("nobody@example.test", "not-the-password")
+                .await,
+            "an unknown account is refused for a wrong password too"
+        );
+        // 4. A shared mailbox with its machine credential, and with anything
+        //    else.
+        let machine = verifier
+            .store
+            .shared_imap_password("team@example.test")
+            .expect("machine credential");
+        assert!(
+            verifier.verify("team@example.test", &machine).await,
+            "a shared mailbox authenticates with its machine credential"
+        );
+        assert!(
+            !verifier
+                .verify("team@example.test", "not-the-credential")
+                .await,
+            "and not with anything else"
+        );
+        assert!(
+            verifier.verify("team@example.test", &machine).await,
+            "the machine credential is stable across attempts"
+        );
+        // 5. Something that is not an identity at all.
+        for junk in [
+            "",
+            "not-an-address",
+            "inbox@",
+            "@example.test",
+            "in box@example.test",
+        ] {
+            assert!(
+                !verifier.verify(junk, "the-right-password").await,
+                "{junk:?} is not an identity, so it is not a login"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The comparison for the machine credential does not exit at the first
+    /// differing octet.
+    ///
+    /// A byte-at-a-time check is an oracle even when the answer is one bit: the
+    /// number of octets that matched leaks through timing. This cannot measure
+    /// time reliably in a unit test, so it pins the *other* observable property
+    /// of the constant-time comparison — that it agrees with `==` on every
+    /// input pair it is given, including different lengths — and the
+    /// implementation reads `subtle::ConstantTimeEq`, which is the part that
+    /// matters.
+    #[test]
+    fn the_machine_credential_comparison_agrees_with_equality() {
+        for (left, right, expected) in [
+            ("abcdef", "abcdef", true),
+            ("abcdef", "abcdeg", false),
+            ("abcdef", "abcde", false),
+            ("abcdef", "abcdefg", false),
+            ("", "", true),
+            ("", "a", false),
+            ("a", "", false),
+        ] {
+            assert_eq!(
+                constant_time_eq(left.as_bytes(), right.as_bytes()),
+                expected,
+                "{left:?} vs {right:?}"
+            );
+            assert_eq!(
+                constant_time_eq(left.as_bytes(), right.as_bytes()),
+                left == right
+            );
+        }
     }
 
     #[test]

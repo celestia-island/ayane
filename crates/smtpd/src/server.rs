@@ -846,13 +846,14 @@ impl HeaderBudget {
     /// head half.** A head that measures fine says nothing about the body
     /// behind the blank line: that part has no line structure either, and it is
     /// where a smuggled envelope would be put. It is scanned separately, by
-    /// [`scan_record`], on the octets after `section` — so a record is refused
+    /// `scan_record`, on the octets after `section` — so a record is refused
     /// for a bare `LF` in the head (here, as [`MalformedHead`]) or in the body
-    /// (there, as [`MalformedBody`]), whichever comes first, and both refusals
-    /// are answered identically to `DATA` (`554 5.6.0 Transaction failed`
-    /// through `fail_data` + `reply_end(false)`). Splitting the scan in two
-    /// rather than scanning the whole record once is what keeps this function's
-    /// answer — the size of the section — the *only* thing it decides.
+    /// (there, as [`BodyFault::BareLf`]), whichever comes first, and both
+    /// refusals are answered identically to `DATA` (`554 5.6.0 Transaction
+    /// failed` through `fail_data` + `reply_end(false)`). Splitting the scan in
+    /// two rather than scanning the whole record once is what keeps this
+    /// function's answer — the size of the section — the *only* thing it
+    /// decides.
     ///
     /// # Errors
     ///
@@ -930,58 +931,86 @@ enum BodyFault {
 ///
 /// # The bound it measures
 ///
-/// `DATA`'s rule is `line content + CRLF > MAX_BODY_LINE + 2` (see
-/// [`Connection::read_body_line`]), so a body line of exactly `MAX_BODY_LINE`
-/// octets of content is accepted, and refusal starts where `DATA` starts it:
-/// `DATA` refuses once `content + 2 > MAX_BODY_LINE + 2`, so one octet past the
-/// bound still fits inside the two the `CRLF` is allowed to occupy and two
-/// octets past it do not. Over `DATA` a one-octet overflow is therefore
-/// accepted as a line and the *next* octet fails it; over `BDAT` — where the
-/// whole line is visible at once — that overflow is the last octet of the
-/// stream and the message is accepted with it. The shapes that differ are
-/// exactly those one octet wide, and they are pinned in the tests below rather
-/// than papered over: the bound is a resource bound, and spending a byte of it
-/// on `DATA`'s framing allowance is not a rule any sender can build a second
-/// message out of. The last body line needs no ending to be measured: `DATA`
-/// reads to the end of the message there, and so does this.
+/// Both shapes a body line has are measured against the same constant
+/// ([`RUN_BODY_LINE_BOUND`], which `DATA`'s own comparison reduces to): a
+/// `CRLF`-terminated line of up to `MAX_BODY_LINE + 1` octets of content is
+/// accepted and a longer one is refused, and the last line — which runs to the
+/// end of the message with no ending at all, the shape `DATA` accepts as its
+/// final line — is refused at the identical width. Measuring the unterminated
+/// tail against `MAX_BODY_LINE` alone made `BDAT` two octets stricter than
+/// `DATA` there, which is one message refused by one transport and accepted by
+/// the other.
 ///
 /// # Errors
 ///
 /// Returns [`BodyFault::BareLf`] when a `\n` in the body is not directly
 /// preceded by a `\r`, or when the body's first octet is a `\n`; returns
-/// [`BodyFault::LineTooLong`] when any line's content runs past
-/// [`MAX_BODY_LINE`] (checked first: a bare `LF` that ends a too-long line is
-/// still a `LF`, and a `LF` is checked after its own line ends).
+/// [`BodyFault::LineTooLong`] when a line's content is longer than
+/// [`RUN_BODY_LINE_BOUND`] (the bare-`LF` scan is first: a `LF` that ends an
+/// over-long line is still checked as a `LF`, which is the order `DATA` gets
+/// from reading the line's ending before it has seen the whole line).
 fn scan_record(record: &[u8], body_from: usize) -> Result<(), BodyFault> {
     let body = record.get(body_from..).unwrap_or_default();
     if has_bare_lf(body) {
         return Err(BodyFault::BareLf);
     }
-    // Every line of `body` ends in `LF` (the scan above proved each one is part
-    // of a `CRLF`), except the last, which may run to the end with no ending —
-    // the shape `DATA` accepts as a final line.
+    // One rule for both shapes, because `DATA` measures both at one width: it
+    // refuses a terminated line when its `LF` passes `RUN_BODY_LINE_BOUND`, and
+    // refuses the line it is still collecting when that buffer passes the same
+    // octet — the unterminated tail counted as a line with no ending.
     let mut line_start = 0usize;
     let mut at = 0usize;
     loop {
-        let line_end = match memchr::memchr(b'\n', body.get(at..).unwrap_or_default()) {
-            Some(found) => at + found,
-            None => {
-                return if body.len() - line_start > MAX_BODY_LINE {
-                    Err(BodyFault::LineTooLong)
-                } else {
-                    Ok(())
-                };
+        let line_end =
+            memchr::memchr(b'\n', body.get(at..).unwrap_or_default()).map(|found| at + found);
+        // A terminated line is measured by its `LF` index, the tail by how long
+        // it is — the two shapes `DATA` bounds, each with its own width.
+        match line_end {
+            Some(line_end) => {
+                if line_end.saturating_sub(line_start) > RUN_BODY_LINE_BOUND {
+                    return Err(BodyFault::LineTooLong);
+                }
             }
-        };
-        // `line_end` is the `LF`; the `\r` before it is part of the ending, and
-        // the content is everything in between.
-        if line_end.saturating_sub(line_start) > MAX_BODY_LINE + 2 {
-            return Err(BodyFault::LineTooLong);
+            None => {
+                if body.len().saturating_sub(line_start) > TAIL_BODY_LINE_BOUND {
+                    return Err(BodyFault::LineTooLong);
+                }
+                return Ok(());
+            }
         }
-        line_start = line_end + 1;
-        at = line_end + 1;
+        if let Some(line_end) = line_end {
+            line_start = line_end + 1;
+            at = line_end + 1;
+        }
     }
 }
+
+/// The index of a body line's **last octet**, counted from where the line
+/// began, for a line that ends in `CRLF`: the `LF` of its ending.
+///
+/// `DATA` asks the question twice, and both times it is this one number:
+///
+/// - **after the `LF` arrived** it refuses at `LF index + 1 > MAX_BODY_LINE + 2`,
+///   i.e. the last acceptable `LF` index is `MAX_BODY_LINE + 1`;
+/// - **before the `LF` arrived** it refuses once the buffer passes
+///   `MAX_BODY_LINE + 2` octets, and what it refuses then is the line whose `LF`
+///   would sit at index `MAX_BODY_LINE + 2` — one past the same bound.
+///
+/// So a `CRLF`-terminated line carries at most `MAX_BODY_LINE` octets of content
+/// before its ending. The **last line**, which has no ending anywhere, is the
+/// other width ([`TAIL_BODY_LINE_BOUND`]): `BDAT`'s chunks are that shape, and
+/// so is a `DATA` transfer whose client stopped.
+const RUN_BODY_LINE_BOUND: usize = MAX_BODY_LINE + 1;
+
+/// How long the **last** line of a message may be: the body's tail, with no
+/// `CRLF` after it, which is the shape of a `BDAT` chunk chain's final line and
+/// of a `DATA` transfer whose client stopped sending.
+///
+/// It is one octet more than [`RUN_BODY_LINE_BOUND`] because `DATA` holds one
+/// more octet of a line it has not finished: a buffer of `MAX_BODY_LINE + 2`
+/// octets is accepted before the next read, and the octet at the end of it is
+/// where a `CRLF`'s `LF` would go. Measured on the wire, both ways.
+const TAIL_BODY_LINE_BOUND: usize = MAX_BODY_LINE + 2;
 
 /// How many octets of `message` are header section: up to and including the
 /// blank line that ends it, or the whole message when it has none. `None` when
@@ -1609,7 +1638,9 @@ impl Connection {
             }
             ListenerRole::Submission | ListenerRole::SubmissionsTls => {
                 if self.session.authenticated().is_none() {
-                    return Outcome::RelayDenied;
+                    // Not "relay denied": the client has not authenticated, and
+                    // RFC 4954 §4's `530 5.7.0` is the answer that tells it to.
+                    return Outcome::AuthenticationRequired;
                 }
                 match self.session.transaction() {
                     Transaction::Open(envelope) => {
@@ -1624,7 +1655,7 @@ impl Connection {
                             Outcome::RecipientInvalid
                         }
                     }
-                    Transaction::Idle => Outcome::RelayDenied,
+                    Transaction::Idle => Outcome::AuthenticationRequired,
                 }
             }
         }
@@ -2937,7 +2968,24 @@ impl Connection {
 
             let before = self.read_buf.len();
             match self.fill(want, None).await {
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                    // The client stopped sending with `read_buf.len()` octets of
+                    // this line already in hand. `DATA` takes what arrived as
+                    // its last line (the way it takes a body whose final line
+                    // has no ending); returning `None` would call octets that
+                    // are a whole line "nothing to answer". The line is still
+                    // bounded — by the tail width, one octet past a terminated
+                    // line's, which is where its ending would have gone.
+                    if self.read_buf.len() > TAIL_BODY_LINE_BOUND {
+                        return Ok(Some(Err(LINE_TOO_LONG)));
+                    }
+                    let mut octets = std::mem::take(&mut self.read_buf);
+                    octets.extend_from_slice(b"\r\n");
+                    return Ok(Some(Ok(BodyLine {
+                        octets: Some(octets),
+                        end_of_message: false,
+                    })));
+                }
                 Err(err) => return Err(err.into()),
                 Ok(()) => {
                     if self.read_buf.is_empty() {
@@ -3817,51 +3865,61 @@ mod tests {
     }
 
     #[test]
-    fn the_body_scan_applies_the_data_line_bound() {
-        // `DATA` refuses a line whose content plus `CRLF` is past
-        // `MAX_BODY_LINE + 2` (see `read_body_line`); the chained record has to
-        // answer the same question the same way, and this is where that rule
-        // lives for it. The boundary is asserted on both sides, and on both
-        // shapes a body line can have: ended by `CRLF`, and running to the end
-        // of the message with no ending at all (the one `DATA` reads as its
-        // last line).
-        fn line_of(content: usize) -> Vec<u8> {
+    fn the_body_scan_applies_the_data_line_bound_at_the_same_octet() {
+        // Two shapes, two widths, one constant — and the widths are the ones
+        // `DATA` draws on the wire (`header_bound` measures them there):
+        //
+        // - a `CRLF`-terminated line carries at most `MAX_BODY_LINE` octets of
+        //   content, because its `LF` index may reach `MAX_BODY_LINE + 1` and
+        //   nothing past it;
+        // - the last line carries at most `MAX_BODY_LINE + 2`, which is the
+        //   buffer `DATA` was still holding for a line it had not finished.
+        //
+        // The previous version asserted the second as `MAX_BODY_LINE` and the
+        // first as `MAX_BODY_LINE + 1`: two octets too strict on one side and
+        // one too loose on the other, which is one message with two answers.
+        fn terminated(content: usize) -> Vec<u8> {
             let mut line = vec![b'x'; content];
             line.extend_from_slice(b"\r\n");
             line
         }
-        assert_eq!(scan_record(&line_of(MAX_BODY_LINE), 0), Ok(()));
+        for content in [MAX_BODY_LINE.saturating_sub(1), MAX_BODY_LINE] {
+            assert_eq!(
+                scan_record(&terminated(content), 0),
+                Ok(()),
+                "a {content}-octet terminated line: DATA accepts it, so this must too"
+            );
+        }
         assert_eq!(
-            scan_record(&line_of(MAX_BODY_LINE + 1), 0),
-            Ok(()),
-            "one octet past the bound is inside the two the CRLF may occupy, \
-             which is where DATA's own comparison puts the boundary"
+            scan_record(&terminated(MAX_BODY_LINE + 1), 0),
+            Err(BodyFault::LineTooLong),
+            "DATA's `LF` index check refuses this at MAX_BODY_LINE + 2, and so does this"
         );
+        for run in [MAX_BODY_LINE, MAX_BODY_LINE + 1, MAX_BODY_LINE + 2] {
+            assert_eq!(
+                scan_record(&vec![b'x'; run], 0),
+                Ok(()),
+                "a {run}-octet last line: it is the buffer DATA was still willing to hold"
+            );
+        }
         assert_eq!(
-            scan_record(&line_of(MAX_BODY_LINE + 2), 0),
+            scan_record(&vec![b'x'; MAX_BODY_LINE + 3], 0),
             Err(BodyFault::LineTooLong)
         );
-        // The 70 KiB shape the defect was measured with: accepted over `BDAT`
-        // before this bound existed, refused over `DATA` all along.
+        // The 70 KiB shape the defect was measured with, in both shapes.
         assert_eq!(
-            scan_record(&line_of(70 * 1024), 0),
+            scan_record(&terminated(70 * 1024), 0),
             Err(BodyFault::LineTooLong)
         );
-        // A short body line in front of it does not change the answer, and a
-        // line that is over the bound is reported as over it even when it is
-        // the last thing in the message.
+        assert_eq!(
+            scan_record(&vec![b'x'; 70 * 1024], 0),
+            Err(BodyFault::LineTooLong)
+        );
+        // A short line in front changes neither answer.
         let mut several = b"short\r\n".to_vec();
-        several.extend_from_slice(&line_of(70 * 1024));
+        several.extend_from_slice(&vec![b'y'; MAX_BODY_LINE + 3]);
         assert_eq!(scan_record(&several, 0), Err(BodyFault::LineTooLong));
-        let mut unended = b"short\r\n".to_vec();
-        unended.extend(std::iter::repeat_n(b'y', MAX_BODY_LINE + 1));
-        assert_eq!(scan_record(&unended, 0), Err(BodyFault::LineTooLong));
-        assert_eq!(
-            scan_record(&vec![b'y'; MAX_BODY_LINE], 0),
-            Ok(()),
-            "a last line of exactly the bound is accepted, as over DATA"
-        );
-        // The head is not body: a long *header* line is not this scan's
+        // The head is not body: a long *header* line is the header bound's
         // question, and the offset is what keeps them apart.
         let mut with_head = b"X: ".to_vec();
         with_head.extend(std::iter::repeat_n(b'p', MAX_BODY_LINE));

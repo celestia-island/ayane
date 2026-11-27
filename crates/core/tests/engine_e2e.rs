@@ -27,6 +27,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
+
 use ayane::config::{MailConfig, MailListener};
 use ayane::driver::{EngineDriver, NativeDriver};
 use ayane_store::{password, RedbStateStore, StateStore, StoredState};
@@ -319,10 +323,11 @@ async fn an_enabled_engine_delivers_mail_and_counts_it() {
         "the delivery pass counted the maildir write: {snapshot:?}"
     );
 
-    // 4. Apply, then reload: the second apply rewrites nothing and the reload
-    //    reaches the listener through the hot swap.
-    // The consumer reads the snapshot the apply writes; write it the way the
-    // apply does so the delivery loop keeps a valid state afterwards.
+    // 4. Apply, then reload. The first apply above was the one that gave the
+    //    delivery loop a routing table; this one runs against a store whose
+    //    snapshot is already written, so it must rewrite nothing — and its
+    //    reload still has to reach the listener through the hot swap (a reload
+    //    is not conditional on a file changing).
     let report = ayane::apply::apply(
         fixture.store.as_ref(),
         &state_dir,
@@ -395,6 +400,11 @@ async fn an_enabled_engine_delivers_mail_and_counts_it() {
             driver: Arc::new(driver.clone()),
             config: Arc::new(control_config),
             auth: Arc::new(ayane::auth::AuthState::local()),
+            mail_health: Some(Arc::new(ayane::MailHealth {
+                serving: engine.degraded().is_none(),
+                degraded: engine.degraded().cloned(),
+                listeners: 1,
+            })),
         },
         sessions,
     };
@@ -464,32 +474,522 @@ async fn a_disabled_engine_binds_nothing_and_counts_nothing() {
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
 
+/// The mail service cannot start and the control plane serves anyway.
+///
+/// This is the shape that made a mistyped certificate path cost an instance its
+/// entire API: `engine::start` used to propagate the error into `main`, which
+/// returned it, and `axum::serve` was never reached. Now the failure is *reported*
+/// — `MailDegraded` with a cause and a `retryable` flag — and the process is a
+/// control plane with a mail section that is not serving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_engine_without_a_hostname_or_listeners_refuses_to_start() {
-    // A deployment that turned the mail section on and said nothing else is
-    // refused at start rather than served: a greeting of `localhost` is a mail
-    // server that tells every peer it has no name.
-    let fixture = Fixture::new("bystart");
-    let mut mail = fixture.mail_config().await.0;
-    mail.listeners.clear();
+async fn a_mail_service_that_cannot_start_leaves_the_control_plane_serving() {
+    let fixture = Fixture::new("degraded");
+    // Every shape of not-starting, one per row: what the operator broke, the
+    // cause it is reported under, and whether a restart could fix it.
+    let cases: Vec<(&str, MailConfig, &'static str, bool)> = vec![
+        (
+            "no listeners",
+            MailConfig {
+                listeners: Vec::new(),
+                ..fixture.mail_config().await.0
+            },
+            "listeners",
+            false,
+        ),
+        (
+            "no hostname",
+            MailConfig {
+                hostname: "localhost".to_owned(),
+                ..fixture.mail_config().await.0
+            },
+            "hostname",
+            false,
+        ),
+        (
+            "certificate that is not there",
+            {
+                let (mut mail, address) = fixture.mail_config().await;
+                mail.listeners = vec![MailListener {
+                    role: ayane_smtpd::ListenerRole::Submission,
+                    listen: address,
+                    role_name: "submission".to_owned(),
+                    tls_cert: Some(fixture.root.join("no-such-cert.pem")),
+                    tls_key: Some(fixture.root.join("no-such-key.pem")),
+                }];
+                mail
+            },
+            "tls",
+            false,
+        ),
+        (
+            "mail root nested in the spool's names",
+            // The reserved child is created by the loop, right before this
+            // row starts (see `arm` in the cases below): it is the *state* of
+            // the mail root, so it must not exist while the earlier rows run.
+            fixture.mail_config().await.0,
+            "roots",
+            false,
+        ),
+        (
+            "state path the apply does not write",
+            {
+                let (mut mail, _) = fixture.mail_config().await;
+                mail.state_path = fixture.root.join("elsewhere.json");
+                mail
+            },
+            "state_path",
+            false,
+        ),
+        (
+            "a submission listener without TLS",
+            {
+                let (mut mail, address) = fixture.mail_config().await;
+                mail.listeners = vec![MailListener {
+                    role: ayane_smtpd::ListenerRole::Submission,
+                    listen: address,
+                    role_name: "submission".to_owned(),
+                    tls_cert: None,
+                    tls_key: None,
+                }];
+                mail
+            },
+            "listeners",
+            false,
+        ),
+    ];
+    for (what, mail, cause, retryable) in cases {
+        if what == "mail root nested in the spool's names" {
+            std::fs::create_dir_all(mail.mail_root.join("new")).expect("maildir");
+        }
+        let store: Arc<dyn StateStore> = fixture.store.clone();
+        let engine = ayane::engine::start(&fixture.config(mail), store)
+            .await
+            .unwrap_or_else(|err| panic!("{what}: start must not fail the process: {err}"));
+        let degraded = engine
+            .degraded()
+            .unwrap_or_else(|| panic!("{what}: the engine must report itself degraded"))
+            .clone();
+        assert_eq!(degraded.cause, cause, "{what}: {degraded:?}");
+        assert_eq!(degraded.retryable, retryable, "{what}: {degraded:?}");
+        assert!(
+            !degraded.reason.is_empty(),
+            "{what}: a degradation has a reason"
+        );
+        engine.shutdown();
+        // Clean the fixture up for the next row.
+        let _ = std::fs::remove_dir_all(fixture.mail.join("new"));
+    }
+
+    // And the payload an operator (and a supervisor) reads: `/api/health`.
     let store: Arc<dyn StateStore> = fixture.store.clone();
-    let err = ayane::engine::start(&fixture.config(mail), store)
+    let (mut mail, _) = fixture.mail_config().await;
+    mail.listeners.clear();
+    let engine = ayane::engine::start(&fixture.config(mail.clone()), store)
         .await
-        .expect_err("no listeners is not a mail service");
+        .expect("start returns");
+    let state = ayane::state::AppState {
+        store: fixture.store.clone(),
+        driver: Arc::new(ayane::driver::NativeDriver::new(engine.control().clone())),
+        config: Arc::new(fixture.config(mail)),
+        auth: Arc::new(ayane::auth::AuthState::local()),
+        mail_health: Some(Arc::new(ayane::MailHealth {
+            serving: engine.degraded().is_none(),
+            degraded: engine.degraded().cloned(),
+            listeners: 0,
+        })),
+    };
+    let app = ayane::api::router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("the control plane answers");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "health answers 200 even when the mail side is down: it is a report, not a probe"
+    );
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    // The bytes of the report, not the code: `status` says `degraded` and the
+    // reason is in it, so a panel can show the operator what to fix.
+    assert_eq!(body["status"], "degraded", "{body}");
+    assert_eq!(body["mail"]["serving"], false, "{body}");
+    assert_eq!(body["mail"]["degraded"]["cause"], "listeners", "{body}");
     assert!(
-        matches!(err, ayane::engine::MailError::Missing("listeners")),
+        body["mail"]["degraded"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("listeners")),
+        "{body}"
+    );
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+/// A listener that cannot take its address is a `bind` degradation, and it is
+/// the one that is marked retryable: the port may be held by a restart that has
+/// not let go yet, and a supervisor may simply try again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_taken_port_is_a_retryable_degradation() {
+    let fixture = Fixture::new("bind");
+    let (mail, address) = fixture.mail_config().await;
+    // Somebody else owns the port — a supervisor's old instance, another
+    // service, or (here) the test itself.
+    let held = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("the test holds the port");
+    let store: Arc<dyn StateStore> = fixture.store.clone();
+    let engine = ayane::engine::start(&fixture.config(mail), store)
+        .await
+        .expect("a taken port is not a process failure");
+    let degraded = engine.degraded().expect("degraded");
+    assert_eq!(degraded.cause, "bind", "{degraded:?}");
+    assert!(
+        degraded.retryable,
+        "a taken port may free itself: {degraded:?}"
+    );
+    assert!(
+        degraded.reason.contains(&address.to_string()),
+        "the report names the address: {degraded:?}"
+    );
+    engine.shutdown();
+    drop(held);
+
+    // The one way it is fatal: a deployment that says so.
+    let (mail, address) = fixture.mail_config().await;
+    let held = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("the test holds the port");
+    let mut fatal = mail;
+    fatal.require_start = true;
+    let store: Arc<dyn StateStore> = fixture.store.clone();
+    let err = ayane::engine::start(&fixture.config(fatal), store)
+        .await
+        .expect_err("AYANE_MAIL_REQUIRE_START=1 makes a failed start fatal");
+    assert!(
+        matches!(err, ayane::engine::MailError::Bind { .. }),
         "{err}"
+    );
+    drop(held);
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+// ── the submission listener: credentials that are actually checked ────────
+//
+// S1-2, both halves. The half that could not be tested before was *reachability*:
+// a submission listener without TLS does not advertise AUTH, so every login was
+// answered `538` and the credential check — whatever it did — was never called.
+// These two tests are the two answers to that:
+//
+// 1. a submission listener with no certificate is refused at **start** (it is a
+//    configuration fault, reported as degraded, not a port that looks alive);
+// 2. a submission listener with one is reachable end to end — `STARTTLS`,
+//    `AUTH PLAIN` with the account's password succeeds, the wrong password is
+//    `535`, and the authenticated client can then send a message.
+
+/// A `STARTTLS` + `AUTH` client, just enough of one for the test.
+struct SubmissionClient {
+    plain: std::net::TcpStream,
+    reader: std::io::BufReader<std::net::TcpStream>,
+    tls: Option<(rustls::ClientConnection, std::net::TcpStream)>,
+    /// Bytes decrypted but not yet handed out as a line.
+    tls_reader: String,
+}
+
+/// The client half of the fixture's self-signed certificate: trust it by
+/// name, since nothing signed it but itself.
+fn test_client_tls() -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    let pem = include_str!("fixtures/mx-test-cert.pem");
+    let mut reader = std::io::BufReader::new(pem.as_bytes());
+    for cert in rustls_pemfile::certs(&mut reader) {
+        roots
+            .add(cert.expect("fixture certificate"))
+            .expect("add root");
+    }
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+}
+
+impl SubmissionClient {
+    fn connect(address: std::net::SocketAddr) -> Self {
+        let plain = std::net::TcpStream::connect(address).expect("connect");
+        plain
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let reader = std::io::BufReader::new(plain.try_clone().expect("clone"));
+        let mut client = Self {
+            plain,
+            reader,
+            tls: None,
+            tls_reader: String::new(),
+        };
+        let greeting = client.reply();
+        assert_eq!(greeting.0, 220, "{greeting:?}");
+        client
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        use std::io::Write as _;
+        match self.tls.as_mut() {
+            Some((connection, socket)) => {
+                connection.writer().write_all(bytes).expect("tls write");
+                let mut out = Vec::new();
+                while connection.wants_write() {
+                    connection.write_tls(&mut out).expect("write tls");
+                }
+                socket.write_all(&out).expect("send tls");
+                socket.flush().expect("flush");
+            }
+            None => {
+                self.plain.write_all(bytes).expect("write");
+                self.plain.flush().expect("flush");
+            }
+        }
+    }
+
+    fn reply(&mut self) -> (u16, String) {
+        use std::io::BufRead as _;
+        let mut all = String::new();
+        loop {
+            let mut line = String::new();
+            match self.tls.as_mut() {
+                Some((connection, socket)) => {
+                    // Reassemble one line from what rustls has decrypted,
+                    // reading a record from the socket whenever the component
+                    // is empty.
+                    while !self.tls_reader.ends_with('\n') {
+                        let available = match connection.reader().fill_buf() {
+                            Ok(buf) => buf.to_vec(),
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                let mut buffer = [0u8; 4096];
+                                use std::io::Read as _;
+                                let read = match socket.read(&mut buffer) {
+                                    Ok(0) => panic!("closed during a tls read"),
+                                    Ok(read) => read,
+                                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                        continue
+                                    }
+                                    Err(err) => panic!("tls read: {err}"),
+                                };
+                                connection.read_tls(&mut &buffer[..read]).expect("read tls");
+                                connection.process_new_packets().expect("tls packets");
+                                continue;
+                            }
+                            Err(err) => panic!("fill_buf: {err}"),
+                        };
+                        if available.is_empty() {
+                            let mut buffer = [0u8; 4096];
+                            use std::io::Read as _;
+                            let read = match socket.read(&mut buffer) {
+                                Ok(0) => panic!("closed during a tls read"),
+                                Ok(read) => read,
+                                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                    continue
+                                }
+                                Err(err) => panic!("tls read: {err}"),
+                            };
+                            connection.read_tls(&mut &buffer[..read]).expect("read tls");
+                            connection.process_new_packets().expect("tls packets");
+                            continue;
+                        }
+                        let take = available
+                            .iter()
+                            .position(|byte| *byte == b'\n')
+                            .map_or(available.len(), |index| index + 1);
+                        self.tls_reader
+                            .extend(available[..take].iter().map(|b| *b as char));
+                        connection.reader().consume(take);
+                    }
+                    let complete = std::mem::take(&mut self.tls_reader);
+                    line.push_str(&complete);
+                }
+                None => {
+                    let read = self.reader.read_line(&mut line).expect("read");
+                    assert!(read > 0, "closed while reading a reply: {all:?}");
+                }
+            }
+            let code = line.get(..3).and_then(|digits| digits.parse::<u16>().ok());
+            let more = line.as_bytes().get(3) == Some(&b'-');
+            all.push_str(&line);
+            if !more {
+                return (code.unwrap_or(0), all.trim_end().to_owned());
+            }
+        }
+    }
+
+    fn command(&mut self, line: &str) -> (u16, String) {
+        self.write(format!("{line}\r\n").as_bytes());
+        self.reply()
+    }
+
+    fn expect(&mut self, line: &str, code: u16) -> String {
+        let reply = self.command(line);
+        assert_eq!(reply.0, code, "`{line}` answered {reply:?}");
+        reply.1
+    }
+
+    /// `STARTTLS` and the handshake.
+    ///
+    /// The client drives `rustls` by hand rather than through `StreamOwned:
+    /// the plaintext reader may have pulled octets past the `220` into its own
+    /// buffer, and those belong to the TLS stream.
+    fn upgrade(self) -> Self {
+        let mut this = self;
+        this.expect("STARTTLS", 220);
+        let leftover = this.reader.buffer().to_vec();
+        let mut socket = this.plain.try_clone().expect("clone");
+        let mut connection = rustls::ClientConnection::new(
+            Arc::new(test_client_tls()),
+            rustls::pki_types::ServerName::try_from("mx.test").expect("name"),
+        )
+        .expect("client connection");
+        // A blocking socket: `TcpStream` is not `Send`-checked here, and a
+        // handshake that reads on a non-blocking socket spins.
+        socket.set_nonblocking(false).expect("blocking");
+        // Anything the plaintext reader already consumed comes first, then
+        // whatever the socket has.
+        let prelude = leftover.to_vec();
+        // The handshake: one round of `write_tls` / `read_tls` until rustls says
+        // it is done. The server's hello is read after our own is written.
+        let mut pending: std::collections::VecDeque<u8> = prelude.into();
+        loop {
+            let mut out = Vec::new();
+            while connection.wants_write() {
+                connection.write_tls(&mut out).expect("write tls");
+            }
+            if !out.is_empty() {
+                use std::io::Write as _;
+                socket.write_all(&out).expect("send");
+            }
+            if !connection.is_handshaking() {
+                break;
+            }
+            // Read at least one record.
+            let mut buffer = [0u8; 4096];
+            let read = if pending.is_empty() {
+                use std::io::Read as _;
+                match socket.read(&mut buffer) {
+                    Ok(0) => panic!("the server closed during the handshake"),
+                    Ok(read) => read,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(err) => panic!("handshake read: {err}"),
+                }
+            } else {
+                let take = buffer.len().min(pending.len());
+                for (slot, byte) in buffer.iter_mut().zip(pending.drain(..take)) {
+                    *slot = byte;
+                }
+                take
+            };
+            assert!(read > 0, "the server closed during the handshake");
+            connection.read_tls(&mut &buffer[..read]).expect("read tls");
+            connection.process_new_packets().expect("handshake packets");
+        }
+        this.tls = Some((connection, socket));
+        this
+    }
+}
+
+/// A submission listener without a certificate is refused at start.
+///
+/// It would otherwise advertise no `AUTH`, answer `538` to every login and
+/// accept no mail: a port that looks alive and does nothing. The reason names
+/// the role and the consequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_submission_listener_without_tls_is_refused_at_start() {
+    let fixture = Fixture::new("submission-notls");
+    let (mut mail, address) = fixture.mail_config().await;
+    mail.listeners = vec![MailListener {
+        role: ayane_smtpd::ListenerRole::Submission,
+        listen: address,
+        role_name: "submission".to_owned(),
+        tls_cert: None,
+        tls_key: None,
+    }];
+    let store: Arc<dyn StateStore> = fixture.store.clone();
+    let engine = ayane::engine::start(&fixture.config(mail), store)
+        .await
+        .expect("start returns");
+    let degraded = engine.degraded().expect("degraded");
+    assert_eq!(degraded.cause, "listeners", "{degraded:?}");
+    assert!(
+        degraded.reason.contains("certificate") && degraded.reason.contains("submission"),
+        "{degraded:?}"
+    );
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+/// The submission listener with TLS: `AUTH` is reachable, the store's password
+/// is what it checks, and a wrong password is `535`.
+///
+/// Every assertion here is one the pre-change code could not make. `AUTH` was
+/// unreachable without TLS (every attempt `538`), so no test exercised the
+/// credential check at all; and the check was a `StoreVerifier` mutation — an
+/// accept-everything version — that nothing would have caught.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_submission_listener_authenticates_against_the_store() {
+    let fixture = Fixture::new("submission-tls");
+    let (mut mail, address) = fixture.mail_config().await;
+    mail.listeners = vec![MailListener {
+        role: ayane_smtpd::ListenerRole::Submission,
+        listen: address,
+        role_name: "submission".to_owned(),
+        tls_cert: Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mx-test-cert.pem"),
+        ),
+        tls_key: Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mx-test-key.pem"),
+        ),
+    }];
+    let store: Arc<dyn StateStore> = fixture.store.clone();
+    let engine = ayane::engine::start(&fixture.config(mail), store)
+        .await
+        .expect("start returns");
+    assert!(
+        engine.degraded().is_none(),
+        "a submission listener with a certificate starts: {:?}",
+        engine.degraded()
     );
 
-    let mut mail = fixture.mail_config().await.0;
-    mail.hostname = "localhost".to_owned();
-    let store: Arc<dyn StateStore> = fixture.store.clone();
-    let err = ayane::engine::start(&fixture.config(mail), store)
-        .await
-        .expect_err("a nameless host is not a mail service");
-    assert!(
-        matches!(err, ayane::engine::MailError::Missing("hostname")),
-        "{err}"
-    );
+    // 1. The capability is advertised once TLS is up — this is the bit that was
+    //    missing, and it is why nothing ever checked a credential.
+    let mut client = SubmissionClient::connect(address);
+    let ehlo = client.expect("EHLO client.test", 250);
+    assert!(ehlo.contains("STARTTLS"), "STARTTLS is offered: {ehlo}");
+    let mut client = client.upgrade();
+    let ehlo = client.expect("EHLO client.test", 250);
+    assert!(ehlo.contains("AUTH"), "AUTH is offered over TLS: {ehlo}");
+
+    // 2. The wrong password: `535`, and the connection survives to try again.
+    use base64::Engine as _;
+    let wrong = base64::engine::general_purpose::STANDARD.encode("\0inbox@example.test\0not-it");
+    let reply = client.command(&format!("AUTH PLAIN {wrong}"));
+    assert_eq!(reply.0, 535, "a wrong password is refused: {reply:?}");
+
+    // 3. The right one — the store's hash is what decided both answers.
+    let right = base64::engine::general_purpose::STANDARD
+        .encode("\0inbox@example.test\0hunter2-correct-horse");
+    client.expect(&format!("AUTH PLAIN {right}"), 235);
+
+    // 4. And an authenticated submission really sends: the envelope opens and
+    //    the message is queued.
+    client.expect("MAIL FROM:<inbox@example.test>", 250);
+    client.expect("RCPT TO:<inbox@example.test>", 250);
+    client.expect("DATA", 354);
+    client.write(b"From: <inbox@example.test>\r\nSubject: submitted\r\n\r\nbody\r\n.\r\n");
+    let queued = client.reply();
+    assert_eq!(queued.0, 250, "the submission is queued: {queued:?}");
+    engine.shutdown();
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
