@@ -1,6 +1,6 @@
 ---
 title: "Ayane"
-description: "Почтовый сервис Celestia — плоскость управления, веб-почта и защитный слой поверх проверенного стека Postfix/Dovecot."
+description: "Почтовый сервис Celestia — собственный SMTP-движок, путь чтения maildir и плоскость управления."
 ---
 
 <div align="center">
@@ -10,25 +10,25 @@ description: "Почтовый сервис Celestia — плоскость уп
 <h1 align="center">Ayane</h1>
 
 <div align="center">
-  <strong>Почтовый сервис Celestia — плоскость управления, веб-почта и защитный слой поверх проверенного стека Postfix/Dovecot</strong>
+  <strong>Почтовый сервис Celestia — собственный SMTP-движок, путь чтения maildir и плоскость управления</strong>
 </div>
 
 <br />
 
-> **Статус: в эксплуатации.** Плоскость управления, отрисовываемая веб-почта, защитный слой и
-> вход через Celestia ID работают в промышленной среде (`mail.acgsyzx.me`); почтовый
-> движок (Postfix / Dovecot / rspamd / ClamAV) развёрнут вместе с DKIM, SPF и DMARC.
-> Входящий SMTP на порт 25 проверен и работает, rspamd отсекает спам уже на входе;
-> исходящие сообщения к крупным провайдерам там ограничены по скорости (PTR действует,
-> Postfix повторяет попытки).
+> **Статус: в эксплуатации.** Плоскость управления, отрисовываемая веб-почта и вход через
+> Celestia ID работают в промышленной среде (`mail.acgsyzx.me`). Почтовый движок —
+> собственный код этого репозитория: `crates/smtpd` говорит SMTP на приёме и на отправке,
+> проверяет SPF/DKIM/ARC/DMARC, доставляет в maildir и отправляет письма чужих доменов по
+> MX с подписью DKIM. Веб-почта читает те же maildir напрямую: сервера IMAP в стеке больше
+> нет, и Dovecot настраивать не нужно.
 
 ## Зачем это нужно
 
 Самостоятельно размещённая почта — решённая задача на уровне *движка* и нерешённая на
 уровне *организации*: общие почтовые ящики, catch-all с политикой разрешений и запретов,
 карантин, безопасная отрисовка, мастер DNS, по которому оператор действительно может
-пройти, и поверхность для агентов. Ayane как раз строит этот слой, а SMTP, IMAP и
-хранение оставляет демонам, десятилетиями работающим в промышленной эксплуатации.
+пройти, и поверхность для агентов. Ayane как раз строит этот слой, а SMTP и формат
+maildir говорит сам, вместо того чтобы настраивать чужой демон.
 
 ## Имя
 
@@ -50,55 +50,44 @@ description: "Почтовый сервис Celestia — плоскость уп
 flowchart LR
   subgraph Internet
     Peer[Remote MTA]
-    Relay[Relay / ingress host]
   end
-  subgraph Engine[Engine — separate processes, no copyleft in this crate]
-    PF[Postfix<br/>MTA · submission]
-    DC[Dovecot + Pigeonhole<br/>IMAP · LMTP · Sieve]
-    RS[rspamd<br/>SPF · DKIM · DMARC · ARC · spam]
-    AV[ClamAV<br/>antivirus]
-    VK[Valkey<br/>rspamd state]
-    PG[(PostgreSQL<br/>control-plane authority)]
-    PF --> DC
-    PF --> RS
-    RS --> AV
-    RS --> VK
-    PF --> PG
-    DC --> PG
-  end
-  subgraph Ayane[ayane — this repository]
+  subgraph Ayane[ayane — one process when AYANE_MAIL_ENABLED=1]
+    LSN[smtpd listeners<br/>inbound · submission]
+    VER[verify<br/>SPF · DKIM · ARC · DMARC]
+    Q[(spool<br/>crash-safe queue)]
+    DEL[delivery<br/>retry · bounce · forward]
+    OUT[outbound<br/>MX · STARTTLS · DKIM sign]
+    MD[(maildirs<br/>new · cur · tmp)]
     API[control plane<br/>domains · mailboxes · policy · audit]
-    WEB[webmail API<br/>safe rendering · image proxy]
-    MCP[MCP surface]
-    WIZ[deployment & DNS wizard]
+    WEB[webmail RPC<br/>mail.list · mail.read · mail.send]
   end
-  Peer --> PF
-  PF --> Relay
-  API -->|renders config · reloads| Engine
-  WEB -->|IMAP · submission| Engine
-  MCP --> API
-  WIZ --> API
+  Peer --> LSN
+  LSN --> VER
+  VER --> Q
+  Q --> DEL
+  DEL --> MD
+  DEL --> OUT
+  OUT --> Peer
+  WEB -->|reads and renames| MD
+  WEB -->|stages a send| Q
+  API -->|writes the routing snapshot| DEL
 ```
 
 ## Движки и лицензии
 
-Ayane не содержит ни строки кода протоколов. Среда выполнения состоит из независимых
-процессов, каждый из которых можно эксплуатировать и распространять, не затрагивая
-лицензию этого репозитория:
+Почтовый движок — собственный код этого репозитория (SySL 1.0). Всё copyleft остаётся
+вне крейта:
 
 | Компонент | Роль | Лицензия | Граница |
 |---|---|---|---|
-| Postfix | MTA, submission (587) | IPL-1.0 / EPL-2.0 | отдельный процесс |
-| Dovecot + Pigeonhole | IMAP, LMTP, Sieve, ACL | LGPL-2.1 | отдельный процесс |
-| rspamd | спам, DKIM/SPF/DMARC/ARC, milter | Apache-2.0 | отдельный процесс |
-| ClamAV | антивирус (управляется rspamd) | GPL-2.0 | отдельный процесс |
-| Valkey | статистика и ограничения скорости rspamd | BSD-3-Clause | отдельный процесс |
-| PostgreSQL | источник истины плоскости управления | PostgreSQL Licence | библиотека |
+| `ayane-smtpd` | SMTP на приёме и отправке, проверка, очередь, доставка, maildir | SySL 1.0 | этот крейт |
+| `ayane-engine` | детерминированные рендереры выведенных из эксплуатации конфигураций Postfix/Dovecot | SySL 1.0 | этот крейт |
+| maildir | формат почтового ящика на диске (`new`/`cur`/`tmp` в каждой папке) | — | раскладка файлов |
 
-Сознательно **не** используются: Stalwart (AGPL-3.0), mailcow (GPL-3.0, включает SOGo
-под AGPL-3.0), Roundcube / SnappyMail (веб-почта у нас своя) и `acme.sh` (GPL-3.0 —
-ACME сделан на Rust через `instant-acme`, Apache-2.0). Список разрешённых лицензий
-`cargo deny` в `deny.toml` обеспечивает соблюдение правила на стороне зависимостей.
+Намеренно **не** используются: Stalwart (AGPL-3.0), mailcow (GPL-3.0, включает SOGo
+AGPL-3.0), Roundcube / SnappyMail (веб-почта своя) и `acme.sh`
+(GPL-3.0 — ACME на Rust через `instant-acme`, Apache-2.0). Список разрешённых в
+`deny.toml` для `cargo deny` вводит в силу зависимостную сторону этого правила.
 
 ## Структура репозитория
 
@@ -107,7 +96,8 @@ ayane/
   crates/
     proto/    wire types + validation (no I/O)
     mail/     routing, recipient policy, MIME construction (lettre, client only)
-    engine/   deterministic renderers for Postfix / Dovecot / rspamd config
+    engine/   deterministic renderers (the retired Postfix / Dovecot configs)
+    smtpd/    the mail engine: SMTP, verification, queue, delivery, maildir reader
     core/     HTTP surface (`ayane` binary)
   deploy/     compose topology, parameter table, Stage-0 verification checklist
   docs/      user-facing documentation
@@ -136,9 +126,9 @@ curl -s http://127.0.0.1:3023/api/health
 - **Stage 0** — каркас рабочего пространства, рендереры конфигурации, поверхность
   проверки работоспособности, таблица параметров развёртывания и контрольный список
   проверки движков.
-- **Stage 1** — compose движков (Postfix/Dovecot/rspamd/ClamAV/Valkey) и плоскость
-  управления: домены, учётные записи, псевдонимы, общие ящики, политика catch-all,
-  аудит, цикл перезагрузки отрисованной конфигурации.
+- **Stage 1** — почтовый движок (входящий SMTP, проверка, очередь, доставка,
+  исходящие) и плоскость управления: домены, учётные записи, псевдонимы, общие ящики,
+  политика catch-all, аудит, цикл перезагрузки.
 - **Stage 2** — API и интерфейс веб-почты на hikari: безопасная отрисовка, серверный
   прокси изображений, хеширование вложений, предпросмотр в песочнице.
 - **Stage 3** — глубина защиты: эвристики фишинга, сценарий карантина, мастер DNS с

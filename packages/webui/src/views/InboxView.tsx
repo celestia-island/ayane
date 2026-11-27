@@ -35,7 +35,9 @@ interface MailboxListing {
 }
 
 interface EnvelopeRow {
-  uid: number;
+  /** The message id: the maildir file name (`<unique>:2,<flags>`). It used
+   *  to be an IMAP UID number; the field keeps its name, the value changed. */
+  uid: string;
   mailbox: string;
   from: string | null;
   subject: string | null;
@@ -79,7 +81,7 @@ export default defineComponent({
     const total = ref(0);
     const loading = ref(true);
     const error = ref<string | undefined>(undefined);
-    const rowMenuUid = ref<number | null>(null);
+    const rowMenuUid = ref<string | null>(null);
     const rowMenuAnchor = ref<HTMLElement | null>(null);
     /** The purge flow's armed row (the confirm dialog owns the rest). */
     const purgeRow = ref<EnvelopeRow | null>(null);
@@ -143,15 +145,19 @@ export default defineComponent({
       // and the sidebar badge follow.
       if (!row.seen) {
         void rpc
-          .call("mail.markSeen", {
+          .call<{ uid?: string }>("mail.markSeen", {
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
             seen: true,
             ...identityParams(),
           })
-          .then(() => {
+          .then((answer) => {
             refreshUnreadAfterSeen(row, true);
             row.seen = true;
+            // Marking read renames the maildir file, so the row follows the
+            // id the server answered with — the next action on this row must
+            // name the file that exists, not the one it had.
+            if (answer?.uid) row.uid = answer.uid;
           })
           .catch(() => undefined);
       }
@@ -266,7 +272,7 @@ export default defineComponent({
       try {
         if (key === "seen") {
           const target = !row.seen;
-          await rpc.call("mail.markSeen", {
+          const answer = await rpc.call<{ uid?: string }>("mail.markSeen", {
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
             seen: target,
@@ -274,21 +280,27 @@ export default defineComponent({
           });
           refreshUnreadAfterSeen(row, target);
           row.seen = target;
+          if (answer?.uid) row.uid = answer.uid;
         } else if (key === "star") {
           const target = !row.flagged;
-          await rpc.call("mail.star", {
+          const answer = await rpc.call<{ uid?: string }>("mail.star", {
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
             starred: target,
             ...identityParams(),
           });
           row.flagged = target;
+          if (answer?.uid) row.uid = answer.uid;
         } else if (key === "trash") {
           await rpc.call("mail.trash", {
             uid: row.uid,
             mailbox: row.mailbox || props.mailbox,
             ...identityParams(),
           });
+          // The row is gone from this folder: the detail pane must let go of
+          // it too, or the next action on it would name a mailbox the message
+          // no longer lives in.
+          if (selected.value === row) selected.value = null;
           rows.value = rows.value.filter((r) => r.uid !== row.uid);
           total.value = Math.max(0, total.value - 1);
         } else if (key === "purge") {
@@ -314,6 +326,7 @@ export default defineComponent({
           mailbox: row.mailbox || props.mailbox,
           ...identityParams(),
         });
+        if (selected.value === row) selected.value = null;
         rows.value = rows.value.filter((r) => r.uid !== row.uid);
         total.value = Math.max(0, total.value - 1);
         purgeRow.value = null;

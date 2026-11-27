@@ -1,6 +1,6 @@
 ---
 title: "Ayane"
-description: "Celestia が運用するメールサービス — 実績ある Postfix/Dovecot スタック上のコントロールプレーン、Webmail、保護レイヤー。"
+description: "Celestia が運用するメールサービス — 自前の SMTP エンジン、maildir の読み取り経路、コントロールプレーン。"
 ---
 
 <div align="center">
@@ -10,25 +10,24 @@ description: "Celestia が運用するメールサービス — 実績ある Pos
 <h1 align="center">Ayane</h1>
 
 <div align="center">
-  <strong>Celestia が運用するメールサービス — 実績ある Postfix/Dovecot スタック上のコントロールプレーン、Webmail、保護レイヤー</strong>
+  <strong>Celestia が運用するメールサービス — 自前の SMTP エンジン、maildir の読み取り経路、コントロールプレーン</strong>
 </div>
 
 <br />
 
-> **ステータス：稼働中。** コントロールプレーン、描画型 Webmail、保護レイヤー、そして
-> Celestia ID によるサインインは、すでに本番環境（`mail.acgsyzx.me`）で動いています。
-> メールエンジン（Postfix / Dovecot / rspamd / ClamAV）も DKIM・SPF・DMARC 付きで
-> デプロイ済みです。受信側の SMTP/25 は実測で動作を確認しており、rspamd は入口の
-> 時点で迷惑メールを弾きます。大手プロバイダ宛の送信はこの環境ではレート制限を受け
-> ます（PTR は有効化済みで、Postfix が自動的に再試行します）。
+> **ステータス：稼働中。** コントロールプレーン、描画型 Webmail、Celestia ID による
+> サインインは本番環境（`mail.acgsyzx.me`）で動いています。メールエンジンはこのリポジトリ
+> 自身のコードです。`crates/smtpd` が受信と submission の SMTP を話し、SPF・DKIM・ARC・
+> DMARC を検証し、maildir へ配送し、他ドメイン宛は DKIM 署名付きで MX へ送ります。
+> Webmail は同じ maildir を直接読みます。IMAP サーバはもう無く、Dovecot の設定もありません。
 
 ## なぜこれを作るのか
 
 セルフホストのメールは、**エンジン**層ではすでに解決済みの問題ですが、**組織**層では
 まだ解決していません。共有メールボックス、許可・拒否ポリシー付きの catch-all、隔離、
 安全な描画、運用者が実際にたどれる DNS ウィザード、そしてエージェント向けの操作面が
-必要です。Ayane が作るのはこの層であり、SMTP・IMAP・ストレージは何十年も本番で
-動いてきたデーモンに任せます。
+必要です。Ayane が作るのはこの層であり、SMTP と maildir 形式は自分で話し、
+他人のデーモンを設定するのではなくなります。
 
 ## 名前の由来
 
@@ -47,55 +46,44 @@ description: "Celestia が運用するメールサービス — 実績ある Pos
 flowchart LR
   subgraph Internet
     Peer[Remote MTA]
-    Relay[Relay / ingress host]
   end
-  subgraph Engine[Engine — separate processes, no copyleft in this crate]
-    PF[Postfix<br/>MTA · submission]
-    DC[Dovecot + Pigeonhole<br/>IMAP · LMTP · Sieve]
-    RS[rspamd<br/>SPF · DKIM · DMARC · ARC · spam]
-    AV[ClamAV<br/>antivirus]
-    VK[Valkey<br/>rspamd state]
-    PG[(PostgreSQL<br/>control-plane authority)]
-    PF --> DC
-    PF --> RS
-    RS --> AV
-    RS --> VK
-    PF --> PG
-    DC --> PG
-  end
-  subgraph Ayane[ayane — this repository]
+  subgraph Ayane[ayane — one process when AYANE_MAIL_ENABLED=1]
+    LSN[smtpd listeners<br/>inbound · submission]
+    VER[verify<br/>SPF · DKIM · ARC · DMARC]
+    Q[(spool<br/>crash-safe queue)]
+    DEL[delivery<br/>retry · bounce · forward]
+    OUT[outbound<br/>MX · STARTTLS · DKIM sign]
+    MD[(maildirs<br/>new · cur · tmp)]
     API[control plane<br/>domains · mailboxes · policy · audit]
-    WEB[webmail API<br/>safe rendering · image proxy]
-    MCP[MCP surface]
-    WIZ[deployment & DNS wizard]
+    WEB[webmail RPC<br/>mail.list · mail.read · mail.send]
   end
-  Peer --> PF
-  PF --> Relay
-  API -->|renders config · reloads| Engine
-  WEB -->|IMAP · submission| Engine
-  MCP --> API
-  WIZ --> API
+  Peer --> LSN
+  LSN --> VER
+  VER --> Q
+  Q --> DEL
+  DEL --> MD
+  DEL --> OUT
+  OUT --> Peer
+  WEB -->|reads and renames| MD
+  WEB -->|stages a send| Q
+  API -->|writes the routing snapshot| DEL
 ```
 
 ## エンジンとライセンス
 
-Ayane はプロトコル実装のコードを一切持ちません。実行時のスタックは独立したプロセス群
-で構成されており、どのプロセスも本リポジトリのライセンスに触れることなく運用・再
-配布できます。
+メールエンジンはこのリポジトリ自身のコードです（SySL 1.0）。copyleft のものはすべて
+クレートの外に置きます:
 
 | コンポーネント | 役割 | ライセンス | 境界 |
 |---|---|---|---|
-| Postfix | MTA、submission（587） | IPL-1.0 / EPL-2.0 | 独立プロセス |
-| Dovecot + Pigeonhole | IMAP、LMTP、Sieve、ACL | LGPL-2.1 | 独立プロセス |
-| rspamd | 迷惑メール、DKIM/SPF/DMARC/ARC、milter | Apache-2.0 | 独立プロセス |
-| ClamAV | アンチウイルス（rspamd から駆動） | GPL-2.0 | 独立プロセス |
-| Valkey | rspamd の統計・レート制限 | BSD-3-Clause | 独立プロセス |
-| PostgreSQL | コントロールプレーンの権威 | PostgreSQL Licence | ライブラリ |
+| `ayane-smtpd` | SMTP の受信・送信、検証、キュー、配送、maildir | SySL 1.0 | このクレート |
+| `ayane-engine` | 廃止した Postfix / Dovecot 設定の決定的レンダラ | SySL 1.0 | このクレート |
+| maildir | ディスク上のメールボックス形式（各フォルダの `new`/`cur`/`tmp`） | — | ファイル配置 |
 
-意図的に**使わない**もの：Stalwart（AGPL-3.0）、mailcow（GPL-3.0、SOGo
-AGPL-3.0 を同梱）、Roundcube / SnappyMail（Webmail は自前で提供）、`acme.sh`
-（GPL-3.0 — ACME は Rust の `instant-acme` で実装、Apache-2.0）。`deny.toml` の
-`cargo deny` allow-list が、この規則の依存関係側を機械的に担保します。
+意図的に**使わない**もの: Stalwart（AGPL-3.0）、mailcow（GPL-3.0、SOGo AGPL-3.0 を同梱）、
+Roundcube / SnappyMail（Webmail は自前）、`acme.sh`（GPL-3.0 — ACME は Rust の
+`instant-acme`、Apache-2.0）。`deny.toml` の `cargo deny` 許可リストが、この規約の
+依存関係側を強制します。
 
 ## リポジトリ構成
 
@@ -104,7 +92,8 @@ ayane/
   crates/
     proto/    wire types + validation (no I/O)
     mail/     routing, recipient policy, MIME construction (lettre, client only)
-    engine/   deterministic renderers for Postfix / Dovecot / rspamd config
+    engine/   deterministic renderers (the retired Postfix / Dovecot configs)
+    smtpd/    the mail engine: SMTP, verification, queue, delivery, maildir reader
     core/     HTTP surface (`ayane` binary)
   deploy/     compose topology, parameter table, Stage-0 verification checklist
   docs/      user-facing documentation
@@ -131,9 +120,9 @@ ACME）、PostgreSQL の DSN、送信リレー、初期管理者で記述され�
 
 - **Stage 0** — ワークスペースの骨組み、設定レンダラー、ヘルスチェック面、デプロイ
   パラメータ表、エンジン検証チェックリスト。
-- **Stage 1** — エンジンの compose（Postfix/Dovecot/rspamd/ClamAV/Valkey）と
+- **Stage 1** — メールエンジン（受信 SMTP、検証、キュー、配送、送信）と
   コントロールプレーン：ドメイン、アカウント、エイリアス、共有メールボックス、
-  catch-all ポリシー、監査、レンダリング済み設定の再読み込みループ。
+  catch-all ポリシー、監査、再読み込みループ。
 - **Stage 2** — hikari 上の Webmail API と UI：安全な描画、サーバー側画像プロキシ、
   添付ファイルのハッシュ、サンドボックス付きプレビュー。
 - **Stage 3** — 保護の深化：フィッシングのヒューリスティック、隔離ワークフロー、

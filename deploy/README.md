@@ -38,7 +38,7 @@
 | `AYANE_MAIL_HOSTNAME` | `localhost` | 问候语 / `Received:` / DMARC `authserv-id` 的名；`localhost` 会被拒绝启动 |
 | `AYANE_MAIL_LISTENERS` | 空 | **分号**分隔的 `role@addr[,cert=PATH][,key=PATH]`；role = `inbound` / `submission` / `submissions-tls`（后两个必须带 `cert=` 与 `key=`）。例：`inbound@0.0.0.0:25;submission@0.0.0.0:587,cert=/etc/ayane/tls/fullchain.pem,key=/etc/ayane/tls/privkey.pem`。条目里用 `,`、条目之间用 `;`——`cert=`/`key=` 是条目自己的选项，不是另起一个监听器 |
 | `AYANE_MAIL_SPOOL_ROOT` | `$AYANE_STATE_DIR/spool` | 待投递队列根；**不可**与 `mail_root` 相同或互为子目录 |
-| `AYANE_MAIL_ROOT` | `$AYANE_STATE_DIR/mail` | 落盘 maildir 根（spool 的兄弟目录，块⑤ 保留名教训） |
+| `AYANE_MAIL_ROOT` | `$AYANE_STATE_DIR/mail` | 落盘 maildir 根（spool 的兄弟目录，块⑤ 保留名教训）。**同一个根既是投递写入口，也是 Webmail 的读取口**：每个账号 `<root>/<domain>/<local>/Maildir/{new,cur,tmp}`，子文件夹 `<Name>` = `.<Name>/{new,cur,tmp}`。没有 IMAP 服务器，也不再需要任何「IMAP 端点」参数 |
 | `AYANE_MAIL_STATE` | `$AYANE_STATE_DIR/desired-state.json` | 投递消费与 DKIM 签名读取的路由快照；**由 `admin.apply` 写入**。设成别的路径会在启动期被拒（degraded，cause `state_path`）：消费端读的文件必须就是 apply 写的那个 |
 | `AYANE_MAIL_MAX_MESSAGE_SIZE` | `26214400` | `SIZE` 上限（字节） |
 | `AYANE_MAIL_MAX_HEADER_BYTES` | `1048576` | 头段上限（超限 `552 5.3.4`） |
@@ -94,8 +94,7 @@
 
 1. 解析域名：`AYANE_HOSTNAME` 的 A/AAAA 与邮件域的 MX 指向本实例入口。
 2. 起 PostgreSQL，建库建角色；DSN 写进 `.env`。
-3. （可选）起老引擎容器：`ayane serve` 自带的邮件面已在步骤 4 内，这一步只对「读侧仍由 Dovecot 提供
-   IMAP」的既有实例有意义；新实例不需要它。
+3. 不需要任何老引擎容器：`ayane serve` 自带的邮件面既收信也提供 Webmail 的读路径（直接读 maildir）。
 4. 起控制面（`ayane serve`，邮件段打开时同一进程即绑定 SMTP 监听）；`/api/health` 返回 `status=ok`。
 5. 控制面渲染配置文件并写路由快照（先 diff 再写盘）→ 热替换监听器配置；投递消费随即读到快照。
    **不再有 `docker compose exec … reload`**：邮件面在本进程内，reload = 换 `Arc<ServerConfig>`。
@@ -122,7 +121,7 @@
 |---|---|---|
 | 1 | 入站 25 | 外部主机 `nc -vz <entry> 25` 通，且 `EHLO` 返回 250 |
 | 2 | 出站 25 / 中继 | 实发一封到外部邮箱，SPF/DKIM/DMARC 三绿 |
-| 3 | 收信到信箱 | 外部 → `@example.com` 落进 Dovecot，IMAP 可读 |
+| 3 | 收信到信箱 | 外部 → `@example.com` 落进 `<AYANE_MAIL_ROOT>/<domain>/<local>/Maildir/new/`，且 Webmail 的 `mail.list` 能列出它（id = 文件名） |
 | 4 | catch-all + 白/黑名单 | 未知收件人进指定信箱；黑名单拒；白名单外进隔离 |
 | 5 | 共享邮箱 ACL | 两个账号可同时打开同一信箱，第三个账号被拒 |
 | 6 | 自动转发 / Sieve | 转发规则生效；保留副本开关按预期 |

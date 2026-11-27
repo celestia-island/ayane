@@ -29,6 +29,9 @@ pub enum AddressError {
     /// A domain label is malformed (empty, leading/trailing dot or dash).
     #[error("address domain is malformed")]
     MalformedDomain,
+    /// The local part is `.` or `..` — a path component no mailbox can be.
+    #[error("address local part is a bare path component")]
+    MalformedLocalPart,
     /// The address exceeds the SMTP length limits (64 / 254 octets).
     #[error("address is too long")]
     TooLong,
@@ -73,10 +76,24 @@ impl Address {
             return Err(AddressError::TooLong);
         }
         for ch in local.chars() {
-            let allowed = ch.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~.".contains(ch);
+            // `/` is RFC 5322 atext, but every consumer of an address here
+            // splices the local part into a *path* — `ayane_smtpd::maildir_home`
+            // renders `/var/mail/vhosts/<domain>/<local>` — and a local part
+            // holding `/` would deliver one message into a directory tree of
+            // its own (`a/b@d` → `<domain>/a/b/Maildir`), outside any account
+            // the operator created. It is refused at the door rather than
+            // escaped at every sink.
+            let allowed = ch.is_ascii_alphanumeric() || "!#$%&'*+-=?^_`{|}~.".contains(ch);
             if !allowed {
                 return Err(AddressError::IllegalCharacter(ch));
             }
+        }
+        // `.` alone is a legal (if useless) mailbox name that folds to an
+        // empty one — [`Address::fold_dots`] is total over it. `..` is not: a
+        // path component that walks up is never a mailbox this stack can
+        // store, and no fold produces it.
+        if local == ".." {
+            return Err(AddressError::MalformedLocalPart);
         }
         validate_domain(domain)?;
         Ok(Self(format!(
@@ -822,6 +839,11 @@ mod tests {
             "user@-example.com",
             "user@example.com.",
             "user\r\n@example.com",
+            // A `/` is atext, but these consumers splice the local part into
+            // a filesystem path — it must never climb or descend.
+            "a/b@example.com",
+            "..@example.com",
+            "a\\b@example.com",
         ] {
             assert!(
                 Address::parse(raw).is_err(),

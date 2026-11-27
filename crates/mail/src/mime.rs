@@ -38,6 +38,10 @@ pub struct ParsedMessage {
     /// The Date field rendered as RFC 3339 (offset preserved), when the
     /// header parses.
     pub date: Option<String>,
+    /// [`ParsedMessage::date`] as seconds since the epoch — the arrival key a
+    /// listing sorts by, `None` when the header is absent or unparsable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_epoch: Option<i64>,
     /// `Subject` header.
     pub subject: Option<String>,
     /// Raw `X-Ayane-Draft-To` header — the composer's recipient input as
@@ -84,7 +88,15 @@ pub fn parse(raw: &[u8]) -> Option<ParsedMessage> {
     let cc = addresses(message.cc());
     let bcc = addresses(message.bcc());
 
-    let text = message.body_text(0).map(|t| t.into_owned());
+    // Only a real `text/plain` part is the text body. `body_text` also
+    // answers for an HTML part (it iterates the markup's text nodes), which
+    // would make an HTML-only message look like it had a plain-text body —
+    // and the roster's preview line is drawn from exactly this field.
+    let text = message
+        .text_body()
+        .find(|part| matches!(part.kind(), mail_parser::PartKind::Text))
+        .and_then(|part| part.text())
+        .map(|t| t.into_owned());
     // Sanitise aggressively: no media/embed/form tags, no scripts, no
     // event handlers, and NO url schemes at all — every remote reference
     // (tracking pixels included) is dropped, so the read view loads
@@ -137,6 +149,7 @@ pub fn parse(raw: &[u8]) -> Option<ParsedMessage> {
         cc,
         bcc,
         date: message.date().map(|d| d.to_rfc3339()),
+        date_epoch: message.date().and_then(epoch_of),
         subject: message.subject().map(str::to_owned),
         draft_to: message
             .headers()
@@ -147,6 +160,58 @@ pub fn parse(raw: &[u8]) -> Option<ParsedMessage> {
         html,
         attachments,
     })
+}
+
+/// The `Date:` header of a message, rendered RFC 3339, when it parses.
+#[must_use]
+pub fn date_header_rfc3339(raw: &str) -> Option<String> {
+    mail_parser::DateTime::parse_rfc822(raw.trim()).map(|date| date.to_rfc3339())
+}
+
+/// An RFC 5322 `Date:` header's value as seconds since the epoch.
+#[must_use]
+pub fn date_header_epoch(raw: &str) -> Option<i64> {
+    mail_parser::DateTime::parse_rfc822(raw.trim()).and_then(epoch_of)
+}
+
+/// An RFC 3339 stamp as seconds since the epoch.
+#[must_use]
+pub fn rfc3339_epoch(stamp: &str) -> Option<i64> {
+    mail_parser::DateTime::parse_rfc3339(stamp).and_then(epoch_of)
+}
+
+/// A parsed `mail-parser` date as seconds since the epoch.
+///
+/// The struct is the calendar fields plus an offset, so the arithmetic is
+/// days-from-civil (Howard Hinnant's) rather than a calendar library: this
+/// crate already depends on `mail-parser` for the parse, and a second date
+/// library to subtract a zone offset would be the tail wagging the dog. The
+/// caller's failure answer is `None`, and it must not be on this path.
+fn epoch_of(date: mail_parser::DateTime) -> Option<i64> {
+    let offset = i64::from(date.tz_hour) * 3600 + i64::from(date.tz_minute) * 60;
+    let offset = if date.tz_before_gmt { -offset } else { offset };
+    let days = days_from_civil(
+        i64::from(date.year),
+        i64::from(date.month),
+        i64::from(date.day),
+    );
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(date.hour) * 3600)?
+        .checked_add(i64::from(date.minute) * 60)?
+        .checked_add(i64::from(date.second))?;
+    seconds.checked_sub(offset)
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's
+/// `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "ayane-mail"
-description = "Pure routing and recipient policy for the ayane mail service, plus its submission and IMAP clients"
+description = "Pure routing and recipient policy for the ayane mail service, plus the MIME reading and building the webmail needs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,21 +11,15 @@ readme = "../../README.md"
 
 [dependencies]
 ayane-proto = { workspace = true }
-async-imap = { workspace = true }
-# The FETCH response types (`SectionPath` / `MessageSection`) live here;
-# async-imap re-exports none of them, and the preview's partial text
-# section needs the explicit path.
-imap-proto = "0.17"
 pulldown-cmark = { workspace = true }
-futures-util = { workspace = true }
+# `lettre` is a *builder* here: it renders the MIME a message needs and never
+# opens a transport (the SMTP side is the engine's own outbound path).
 lettre = { workspace = true }
 serde = { workspace = true }
 mail-parser = { workspace = true }
 ammonia = { workspace = true }
-base64 = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true }

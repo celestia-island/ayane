@@ -121,8 +121,6 @@ impl Fixture {
             state_dir: self.root.join("state"),
             admin_token: None,
             compose_file: self.root.join("docker-compose.yml"),
-            imap: "127.0.0.1:1".to_owned(),
-            submission: "127.0.0.1:1".to_owned(),
             cert_file: None,
             mail,
         }
@@ -1021,7 +1019,17 @@ fn set_mail_env(key: &str, value: Option<&str>) {
 /// Rust tests share a process and the environment is process-wide, so the
 /// variables are set for the duration of the call and removed afterwards; the
 /// variables this test sets are the ones no other test in this crate reads.
+/// The environment is one per process, so two tests that write it must not
+/// run at once: this serialises every [`with_mail_env`] section. Without it,
+/// a test that sets `AYANE_MAIL_LISTENERS` can read a value another test set
+/// a moment earlier — the failure looks like a parser bug and is not one.
+static MAIL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn with_mail_env<T>(vars: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
+    // A poisoned lock means a previous holder panicked; the environment is
+    // still restored by `Drop` of the previous section's own loop, so the
+    // section is safe to enter.
+    let _guard = MAIL_ENV.lock().unwrap_or_else(|poison| poison.into_inner());
     let previous: Vec<(String, Option<String>)> = vars
         .iter()
         .map(|(key, _)| ((*key).to_owned(), std::env::var(key).ok()))
@@ -1152,4 +1160,424 @@ fn the_listener_grammar_refuses_what_it_cannot_mean() {
     assert_eq!(ok.len(), 2);
     assert_eq!(ok[1].tls_cert, Some(PathBuf::from("/c")));
     assert_eq!(ok[1].tls_key, Some(PathBuf::from("/k")));
+}
+
+// ── the webmail's read path over the maildirs the engine writes ───────────
+
+/// The account the read-path test signs in as.
+const READER: &str = "inbox@example.test";
+/// Its password, as [`Fixture::new`] hashed it. Invented here.
+const READER_PASSWORD: &str = "hunter2-correct-horse";
+
+/// A running engine plus a mailbox session on the RPC surface, under one
+/// temporary root.
+struct ReadFixture {
+    fixture: Fixture,
+    surface: ayane::transport::RpcSurface,
+    token: String,
+    engine: ayane::engine::RunningEngine,
+    address: std::net::SocketAddr,
+}
+
+impl ReadFixture {
+    async fn start(tag: &str) -> Self {
+        let fixture = Fixture::new(tag);
+        let (mail, address) = fixture.mail_config().await;
+        let store: Arc<dyn StateStore> = fixture.store.clone();
+        let engine = ayane::engine::start(&fixture.config(mail.clone()), store)
+            .await
+            .expect("the engine starts");
+        let sessions = Arc::new(ayane::session::SessionStore::new());
+        let (token, _session) = sessions
+            .login(fixture.store.as_ref(), READER, READER_PASSWORD)
+            .expect("a mailbox session");
+        let surface = ayane::transport::RpcSurface {
+            app: ayane::state::AppState {
+                store: fixture.store.clone(),
+                driver: Arc::new(NativeDriver::new(engine.control().clone())),
+                config: Arc::new(fixture.config(mail)),
+                auth: Arc::new(ayane::auth::AuthState::local()),
+                mail_health: Some(Arc::new(ayane::MailHealth {
+                    serving: engine.degraded().is_none(),
+                    degraded: engine.degraded().cloned(),
+                    listeners: 1,
+                })),
+            },
+            sessions,
+        };
+        Self {
+            fixture,
+            surface,
+            token,
+            engine,
+            address,
+        }
+    }
+
+    /// Deliver one message into the running engine over SMTP.
+    async fn deliver(&self, subject: &str) {
+        let mut client = Client::connect(self.address);
+        let answer = send_message(&mut client, "someone@remote.test", READER, subject);
+        assert!(
+            answer.starts_with("250"),
+            "the message is accepted: {answer}"
+        );
+        // The delivery consumer routes by the snapshot `admin.apply` writes;
+        // the pass under test is the send-then-route ordering a deployment
+        // has.
+        let stored = self.fixture.store.load().expect("load");
+        ayane::apply::apply(
+            self.fixture.store.as_ref(),
+            &self.fixture.root.join("state"),
+            &stored,
+            Arc::new(ayane::driver::RecordingDriver::new(
+                self.fixture.root.join("docker-compose.yml"),
+            )),
+        )
+        .await
+        .expect("apply");
+    }
+
+    async fn call(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let mut params = params;
+        params["token"] = serde_json::Value::String(self.token.clone());
+        call_rpc(
+            &self.surface,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            }),
+        )
+        .await
+    }
+
+    fn shutdown(self) {
+        let root = self.fixture.root.clone();
+        self.engine.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// The whole read path, end to end: a real SMTP delivery lands in a maildir,
+/// and every `mail.*` method the webmail calls reads and mutates that same
+/// tree — list, read (marking seen), star, star roster, trash, purge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_webmail_reads_and_mutates_the_maildirs_the_engine_writes() {
+    let fixture = ReadFixture::start("readpath").await;
+
+    // 1. An empty INBOX answers an empty listing (the sidebar asks before
+    //    anything has arrived).
+    let empty = fixture
+        .call(
+            "mail.list",
+            serde_json::json!({"mailbox": "INBOX", "limit": 50}),
+        )
+        .await;
+    assert!(empty.get("error").is_none(), "{empty}");
+    assert_eq!(empty["result"]["total"], 0, "{empty}");
+
+    // 2. Deliver a real message over a real socket.
+    fixture.deliver("read path hello").await;
+    eventually(
+        "the delivery to land in a maildir",
+        Duration::from_secs(20),
+        || !maildir_deliveries(&fixture.fixture.mail).is_empty(),
+    )
+    .await;
+
+    // 3. `mail.list` sees it, with the columns the roster draws.
+    let listing = fixture
+        .call(
+            "mail.list",
+            serde_json::json!({"mailbox": "INBOX", "limit": 50}),
+        )
+        .await;
+    assert!(listing.get("error").is_none(), "{listing}");
+    assert_eq!(listing["result"]["total"], 1, "{listing}");
+    assert_eq!(listing["result"]["unread"], 1, "delivered mail is unread");
+    let row = &listing["result"]["messages"][0];
+    assert_eq!(row["subject"], "read path hello", "{row}");
+    assert_eq!(row["from"], "someone@remote.test", "{row}");
+    assert_eq!(row["seen"], false, "{row}");
+    let id = row["id"].as_str().expect("the file name").to_owned();
+    // A delivery lands in `new/` with the maildir unique the deliverer built
+    // and no info suffix yet; the id is that name, and it is a plain file
+    // name.
+    assert!(!id.is_empty(), "the row has an id");
+    assert!(
+        !id.contains('/') && !id.starts_with('.'),
+        "the id is a plain maildir file name: {id}"
+    );
+    assert!(
+        id.contains(",S="),
+        "the delivery's own size token is in the name: {id}"
+    );
+    assert!(
+        row["preview"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("The body of read path hello")),
+        "the preview comes from the body: {row}"
+    );
+
+    // 4. `mail.read` opens it and (by default) marks it seen, answering the
+    //    name the file has afterwards.
+    let opened = fixture
+        .call(
+            "mail.read",
+            serde_json::json!({"uid": id, "mailbox": "INBOX"}),
+        )
+        .await;
+    assert!(opened.get("error").is_none(), "{opened}");
+    assert_eq!(
+        opened["result"]["message"]["subject"], "read path hello",
+        "{opened}"
+    );
+    assert_eq!(opened["result"]["flags"]["seen"], true, "{opened}");
+    let seen_id = opened["result"]["uid"]
+        .as_str()
+        .expect("the seen id")
+        .to_owned();
+    assert_ne!(seen_id, id, "marking seen renames the file");
+
+    // The `S` really is in the name, and the mailbox counts it read.
+    let listing = fixture
+        .call(
+            "mail.list",
+            serde_json::json!({"mailbox": "INBOX", "limit": 50}),
+        )
+        .await;
+    assert_eq!(listing["result"]["unread"], 0, "{listing}");
+    assert_eq!(listing["result"]["messages"][0]["id"], seen_id, "{listing}");
+
+    // 5. `mail.markSeen {seen:false}` puts it back to unread, and `mail.star`
+    //    adds `F` — both are renames, both answer the new name.
+    let unread = fixture
+        .call(
+            "mail.markSeen",
+            serde_json::json!({"uid": seen_id, "mailbox": "INBOX", "seen": false}),
+        )
+        .await;
+    assert_eq!(unread["result"]["seen"], false, "{unread}");
+    let unread_id = unread["result"]["uid"]
+        .as_str()
+        .expect("the unread id")
+        .to_owned();
+    assert!(
+        !unread_id.split(":2,").nth(1).unwrap_or("").contains('S'),
+        "the suffix drops S: {unread_id}"
+    );
+
+    let starred = fixture
+        .call(
+            "mail.star",
+            serde_json::json!({"uid": unread_id, "mailbox": "INBOX", "starred": true}),
+        )
+        .await;
+    assert_eq!(starred["result"]["starred"], true, "{starred}");
+    let starred_id = starred["result"]["uid"]
+        .as_str()
+        .expect("the starred id")
+        .to_owned();
+    assert!(
+        starred_id.split(":2,").nth(1).unwrap_or("").contains('F'),
+        "the suffix carries F: {starred_id}"
+    );
+
+    // 6. The 已加星标 roster is a query over the real folders.
+    let roster = fixture
+        .call("mail.listStarred", serde_json::json!({"limit": 50}))
+        .await;
+    assert_eq!(roster["result"]["total"], 1, "{roster}");
+    assert_eq!(
+        roster["result"]["messages"][0]["id"], starred_id,
+        "{roster}"
+    );
+
+    // 7. Trash moves the file into `.Trash/`; purge removes it for good.
+    let trashed = fixture
+        .call(
+            "mail.trash",
+            serde_json::json!({"uid": starred_id, "mailbox": "INBOX"}),
+        )
+        .await;
+    assert!(trashed.get("error").is_none(), "{trashed}");
+    let in_trash = trashed["result"]["uid"]
+        .as_str()
+        .expect("the trashed id")
+        .to_owned();
+    // The move is a rename inside the account's maildir, so the *name* does
+    // not change — the folder does. The receipt says which, because the id
+    // alone cannot: the same bytes answering to two folders is exactly what a
+    // caller has to disambiguate when the next action names a mailbox.
+    assert_eq!(in_trash, starred_id, "a move keeps the name: {trashed}");
+    assert_eq!(trashed["result"]["mailbox"], "Trash", "{trashed}");
+    let inbox = fixture
+        .call(
+            "mail.list",
+            serde_json::json!({"mailbox": "INBOX", "limit": 50}),
+        )
+        .await;
+    assert_eq!(inbox["result"]["total"], 0, "{inbox}");
+    let trash = fixture
+        .call(
+            "mail.list",
+            serde_json::json!({"mailbox": "Trash", "limit": 50}),
+        )
+        .await;
+    assert_eq!(trash["result"]["total"], 1, "{trash}");
+    assert_eq!(trash["result"]["messages"][0]["id"], in_trash, "{trash}");
+    assert!(
+        fixture
+            .fixture
+            .mail
+            .join("example.test/inbox/Maildir/.Trash/cur")
+            .is_dir(),
+        "the trash copy lives in the account's own Maildir"
+    );
+
+    let purged = fixture
+        .call(
+            "mail.purge",
+            serde_json::json!({"uid": in_trash, "mailbox": "Trash"}),
+        )
+        .await;
+    assert!(purged.get("error").is_none(), "{purged}");
+    let trash = fixture
+        .call(
+            "mail.list",
+            serde_json::json!({"mailbox": "Trash", "limit": 50}),
+        )
+        .await;
+    assert_eq!(trash["result"]["total"], 0, "{trash}");
+    // A purge that names no folder is refused: the folder is what makes the
+    // delete a Trash step rather than a permanent one, so it is required
+    // rather than defaulted.
+    let unfiled = fixture
+        .call("mail.purge", serde_json::json!({"uid": in_trash}))
+        .await;
+    assert!(
+        unfiled["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Mail.MalformedParams:")),
+        "a purge with no folder is refused: {unfiled}"
+    );
+    // Purging the same message again is "not there", not a success.
+    let again = fixture
+        .call(
+            "mail.purge",
+            serde_json::json!({"uid": in_trash, "mailbox": "Trash"}),
+        )
+        .await;
+    assert!(
+        again["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Mail.NotFound:")),
+        "{again}"
+    );
+
+    fixture.shutdown();
+}
+
+/// Saving a draft the composer was opened on replaces it, and sending with
+/// that id retires the copy that exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saving_a_continued_draft_replaces_it_instead_of_adding_a_second() {
+    let fixture = ReadFixture::start("readpath-draft").await;
+    let first = fixture
+        .call(
+            "mail.saveDraft",
+            serde_json::json!({
+                "to": "someone@example.test",
+                "subject": "draft one",
+                "body": "first pass",
+            }),
+        )
+        .await;
+    let first_id = first["result"]["uid"]
+        .as_str()
+        .expect("the draft id")
+        .to_owned();
+
+    let second = fixture
+        .call(
+            "mail.saveDraft",
+            serde_json::json!({
+                "to": "someone@example.test",
+                "subject": "draft one",
+                "body": "second pass",
+                "draftUid": first_id,
+            }),
+        )
+        .await;
+    let second_id = second["result"]["uid"]
+        .as_str()
+        .expect("the replaced draft's id")
+        .to_owned();
+    assert_ne!(second_id, first_id, "a save appends a new copy");
+
+    let drafts = fixture
+        .call(
+            "mail.list",
+            serde_json::json!({"mailbox": "Drafts", "limit": 50}),
+        )
+        .await;
+    assert_eq!(
+        drafts["result"]["total"], 1,
+        "the previous copy was retired, not kept: {drafts}"
+    );
+    assert_eq!(drafts["result"]["messages"][0]["id"], second_id, "{drafts}");
+
+    // The retired id is gone, so a composer holding a stale one is told.
+    let stale = fixture
+        .call(
+            "mail.read",
+            serde_json::json!({"uid": first_id, "mailbox": "Drafts", "markSeen": false}),
+        )
+        .await;
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Mail.NotFound:")),
+        "the replaced draft is not there any more: {stale}"
+    );
+    fixture.shutdown();
+}
+
+/// A folder name is checked before it becomes a directory: the webmail's
+/// `mailbox` parameter is the one path component a browser can steer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_name_that_would_leave_the_maildir_is_refused() {
+    let fixture = ReadFixture::start("readpath-guard").await;
+    for bad in ["../escape", "a/b", ".Sent", "..", "cur"] {
+        let reply = fixture
+            .call(
+                "mail.list",
+                serde_json::json!({"mailbox": bad, "limit": 50}),
+            )
+            .await;
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("Mail.MalformedParams:")),
+            "`{bad}` must be refused as a folder, got {reply}"
+        );
+    }
+    // A message id is held to the same rule.
+    let reply = fixture
+        .call(
+            "mail.read",
+            serde_json::json!({"uid": "../../etc/passwd", "mailbox": "INBOX"}),
+        )
+        .await;
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Mail.MalformedParams:")),
+        "a path as an id is refused, got {reply}"
+    );
+    // Nothing was created outside the account's maildir.
+    assert!(!fixture.fixture.mail.join("escape").exists());
+    fixture.shutdown();
 }

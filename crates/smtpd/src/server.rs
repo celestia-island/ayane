@@ -3448,6 +3448,20 @@ pub fn format_rfc5322(epoch_secs: u64) -> String {
     )
 }
 
+/// Formats seconds since the epoch as RFC 3339 in UTC (`2026-11-26T00:00:00Z`).
+///
+/// The queue's `received_at` is RFC 3339 while the `Received:` field is RFC
+/// 5322; the two are rendered from the same clock here rather than from a
+/// calendar library, exactly as [`format_rfc5322`] is.
+#[must_use]
+pub fn format_rfc3339(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86_400) as i64;
+    let rem = epoch_secs % 86_400;
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 /// Howard Hinnant's `civil_from_days`: days since 1970-01-01 → (y, m, d).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -3538,6 +3552,21 @@ mod tests {
             format_rfc5322(1_835_395_200),
             "Tue, 29 Feb 2028 00:00:00 +0000"
         );
+    }
+
+    #[test]
+    fn rfc3339_dates_are_the_same_instant_as_the_rfc5322_ones() {
+        // The queue's `received_at` and the `Received:` field are two
+        // spellings of one clock reading; the fixtures below are the ones
+        // `rfc5322_dates_are_utc` pins, so a civil-date regression shows up in
+        // both formats at once.
+        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339(1_784_000_000), "2026-07-14T03:33:20Z");
+        assert_eq!(format_rfc3339(1_835_395_200), "2028-02-29T00:00:00Z");
+        // The shape the queue and the RPC replies promise.
+        let now = format_rfc3339(received_now_epoch());
+        assert_eq!(now.len(), 20, "{now}");
+        assert!(now.ends_with('Z'), "{now}");
     }
 
     #[test]

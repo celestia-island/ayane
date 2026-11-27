@@ -35,7 +35,7 @@ interface ParsedMessage {
   attachments: AttachmentMeta[];
 }
 
-const props = defineProps<{ uid: number; mailbox: string; embedded?: boolean }>();
+const props = defineProps<{ uid: string; mailbox: string; embedded?: boolean }>();
 const router = useRouter();
 const message = ref<ParsedMessage | null>(null);
 const links = ref<LinkVerdict[]>([]);
@@ -43,15 +43,25 @@ const loading = ref(true);
 
 const suspicious = computed(() => links.value.filter((l) => l.verdict !== "ok"));
 
+/** The id the file has now: opening a message marks it read, and marking
+ *  read renames the maildir file. The continue-draft link must carry this
+ *  one, or it points at a name that no longer exists. */
+const currentId = ref<string>(props.uid);
+
 onMounted(async () => {
   try {
-    const result = await rpc.call<{ message: ParsedMessage; links: LinkVerdict[] }>("mail.read", {
+    const result = await rpc.call<{
+      uid?: string;
+      message: ParsedMessage;
+      links: LinkVerdict[];
+    }>("mail.read", {
       uid: props.uid,
       mailbox: props.mailbox,
       ...identityParams(),
     });
     message.value = result.message;
     links.value = result.links;
+    if (result.uid) currentId.value = result.uid;
   } catch (e) {
     toastError(e);
   } finally {
@@ -69,7 +79,7 @@ onMounted(async () => {
       <HkButton
         v-if="props.mailbox === 'Drafts'"
         size="sm"
-        @click="router.push(`/compose?draft=${props.uid}`)"
+        @click="router.push(`/compose?draft=${encodeURIComponent(currentId)}`)"
       >
         <SquarePen :size="14" /> {{ t("read.continueDraft") }}
       </HkButton>

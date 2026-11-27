@@ -41,7 +41,9 @@ const router = createRouter({
           path: "read/:uid",
           component: () => import("./views/ReadView.vue"),
           props: (route) => ({
-            uid: Number(route.params.uid),
+            // The id is the maildir file name; `Number()` here would turn it
+            // into NaN and every open message would 404 against the reader.
+            uid: decodeURIComponent(String(route.params.uid)),
             mailbox: String(route.query.box || "INBOX"),
           }),
         },

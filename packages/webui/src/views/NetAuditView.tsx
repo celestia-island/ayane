@@ -13,7 +13,9 @@ import { t } from "../lib/i18n";
 import { toastError } from "../lib/toast";
 
 interface AuditHit {
-  uid: number;
+  /** The message id (a maildir file name), absent when the reader did not
+   *  name one; the table does not render it. */
+  uid?: string;
   subject: string | null;
   from: string | null;
   keyword?: string;

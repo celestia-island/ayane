@@ -21,6 +21,8 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 const PASSWORD: &str = "correct-horse-battery";
+/// The fixture account's id, fixed so the shared mailbox can name it.
+const ACCOUNT_ID: uuid::Uuid = uuid::Uuid::nil();
 const ADMIN: &str = "admin-secret-token";
 
 async fn surface(tag: &str) -> (RpcSurface, PathBuf) {
@@ -40,11 +42,19 @@ async fn surface(tag: &str) -> (RpcSurface, PathBuf) {
                 dkim: None,
             }],
             accounts: vec![ayane_proto::Account {
-                id: uuid::Uuid::new_v4(),
+                id: ACCOUNT_ID,
                 address: ayane_proto::Address::parse("test@example.test").expect("addr"),
                 display_name: "Test".to_owned(),
                 quota_bytes: 0,
                 admin: false,
+            }],
+            // A shared mailbox the account is a member of, so the send leg
+            // that judges the *header* sender has something to judge: the
+            // From picker's 公共信箱 entry.
+            shared: vec![ayane_proto::SharedMailbox {
+                id: uuid::Uuid::new_v4(),
+                address: ayane_proto::Address::parse("team@example.test").expect("addr"),
+                members: vec![ACCOUNT_ID],
             }],
             ..Default::default()
         },
@@ -58,15 +68,20 @@ async fn surface(tag: &str) -> (RpcSurface, PathBuf) {
         state_dir: root.join("state"),
         admin_token: Some(ADMIN.to_owned()),
         compose_file: root.join("docker-compose.yml"),
-        // Nothing listens here in tests: the mail arm must fail with
-        // Mail.ImapFailed rather than anything catastrophic.
-        imap: "127.0.0.1:1".to_owned(),
-        submission: "127.0.0.1:1".to_owned(),
         cert_file: None,
-        // The mail section is off in every control-plane test: the default
-        // `MailConfig` is what an installation that has not enabled it gets,
-        // and a test that does not opt in must not bind a port.
-        mail: ayane::config::MailConfig::default(),
+        // The mail section is off in every control-plane test: what an
+        // installation that has not enabled it gets, so no port is bound.
+        // The roots are spelled absolutely even so: a test that reaches the
+        // mail methods (a granted `mail.send` stages into the spool) must
+        // write under this test's temporary root, never the process's cwd —
+        // `MailConfig::default()`'s relative roots are resolved against the
+        // state directory by `from_env`, and nothing here went through it.
+        mail: ayane::config::MailConfig {
+            spool_root: root.join("state/spool"),
+            mail_root: root.join("state/mail"),
+            state_path: root.join("state/desired-state.json"),
+            ..ayane::config::MailConfig::default()
+        },
     };
     let app = AppState {
         store: Arc::new(store),
@@ -152,7 +167,7 @@ async fn wrong_password_is_a_path_error() {
 }
 
 #[tokio::test]
-async fn login_then_mail_fails_gracefully_without_imap() {
+async fn a_mailbox_session_reads_an_empty_maildir_as_empty() {
     let (surface, _) = surface("mailgate").await;
     let login = call(
         &surface,
@@ -166,20 +181,54 @@ async fn login_then_mail_fails_gracefully_without_imap() {
     let token = login["result"]["token"].as_str().expect("token").to_owned();
     assert_eq!(login["result"]["address"], "test@example.test");
 
+    // The read path walks this process's mail root, which the default
+    // `MailConfig` places under the state directory — a directory nothing
+    // has written to in this fixture. A folder that does not exist lists as
+    // empty, which is the honest answer for a fresh account.
     let reply = call(
         &surface,
         rpc_request("mail.list", json!({ "token": token }), json!(2)),
     )
     .await;
-    assert_eq!(reply["error"]["code"], json!(-32000));
-    assert!(
-        reply["error"]["message"]
-            .as_str()
-            .expect("message")
-            .starts_with("Mail.ImapFailed:"),
-        "got {}",
-        reply["error"]["message"]
-    );
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(reply["result"]["total"], 0, "{reply}");
+    assert_eq!(reply["result"]["mailbox"], "INBOX", "{reply}");
+}
+
+/// An admin-token session is not a mailbox session, and the mail methods say
+/// so. It is minted with the synthetic address `admin@localhost` and no
+/// password, so `mailbox_locked()` is false for it — the "mailbox session
+/// required" gate is what keeps it out of a mailbox it never proved.
+#[tokio::test]
+async fn an_admin_session_cannot_read_a_mailbox() {
+    let (surface, _) = surface("admingate-mail").await;
+    let admin = call(
+        &surface,
+        rpc_request("session.adminLogin", json!({ "token": ADMIN }), json!(1)),
+    )
+    .await;
+    let token = admin["result"]["token"]
+        .as_str()
+        .expect("admin token")
+        .to_owned();
+
+    for (method, params) in [
+        ("mail.list", json!({})),
+        ("mail.read", json!({ "uid": "1700000000.M1P2Q3.host:2," })),
+        ("mail.listStarred", json!({})),
+        (
+            "mail.send",
+            json!({ "to": "boss@example.test", "subject": "x", "body": "y" }),
+        ),
+    ] {
+        let mut params = params;
+        params["token"] = json!(token);
+        let reply = call(&surface, rpc_request(method, params, json!(2))).await;
+        assert_eq!(
+            reply["error"]["message"], "Session.Required: mailbox session required",
+            "{method} must refuse an admin session: {reply}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -233,12 +282,12 @@ async fn admin_methods_require_an_admin_session() {
     assert_eq!(state["result"]["domains"][0]["name"], "example.test");
 }
 
-/// The send-identity path of `mail.send`, observed without a mail server:
-/// nothing listens on the submission port here, so a From the policy GRANTS
-/// runs through the composer and fails at the relay (`Mail.SubmissionFailed`),
-/// while a From it REFUSES is answered by `resolve_send_identity` first and
-/// never reaches the socket. That difference is the assertion: the switch
-/// changes which refusal the caller sees, not merely whether the send works.
+/// The send-identity path of `mail.send`, observed without a mail server: a
+/// From the policy GRANTS runs through the composer and is staged in this
+/// process's own queue (`queued: true`), while a From it REFUSES is answered
+/// by `resolve_send_identity` first and never reaches the spool. That
+/// difference is the assertion: the switch changes which refusal the caller
+/// sees, not merely whether the send works.
 #[tokio::test]
 async fn mail_send_accepts_a_tagged_from_only_when_the_switch_is_on() {
     let (surface, _) = surface("fromvariants").await;
@@ -277,7 +326,8 @@ async fn mail_send_accepts_a_tagged_from_only_when_the_switch_is_on() {
         )
     };
     // The reply's path-style message, or a marker when the call succeeded
-    // (it cannot here: nothing listens on the relay).
+    // (a granted send stages itself in this process's own queue and does not
+    // need anything listening beside it).
     fn message(reply: &Value) -> String {
         reply["error"]["message"]
             .as_str()
@@ -309,13 +359,13 @@ async fn mail_send_accepts_a_tagged_from_only_when_the_switch_is_on() {
     .await;
     assert_eq!(saved["result"]["saved"], json!(true), "{saved}");
 
-    // The same tagged From is now granted: it gets as far as the relay.
-    // (The envelope sender stays the account — `compose` pins it — so the
-    // variant only ever changes the From header.)
+    // The same tagged From is now granted: the message is staged in this
+    // process's queue. (The envelope sender stays the account — `compose`
+    // pins it — so the variant only ever changes the From header.)
     let granted = call(&surface, send("test+news@example.test")).await;
     assert!(
-        message(&granted).starts_with("Mail.SubmissionFailed:"),
-        "a granted variant must reach the relay, got {granted}"
+        granted.get("error").is_none() && granted["result"]["queued"] == json!(true),
+        "a granted variant must be queued, got {granted}"
     );
     // The dot switch is still off, so a dotted From stays refused.
     let dotted = call(&surface, send("te.st@example.test")).await;
@@ -342,9 +392,163 @@ async fn mail_send_accepts_a_tagged_from_only_when_the_switch_is_on() {
     assert_eq!(saved["result"]["saved"], json!(true), "{saved}");
     let dotted = call(&surface, send("te.st@example.test")).await;
     assert!(
-        message(&dotted).starts_with("Mail.SubmissionFailed:"),
-        "a granted dotted variant must reach the relay, got {dotted}"
+        dotted.get("error").is_none() && dotted["result"]["queued"] == json!(true),
+        "a granted dotted variant must be queued, got {dotted}"
     );
+}
+
+/// `mail.send` runs the operator's sender rules before it writes anything: a
+/// deny-listed sender is refused at the door, the same answer the submission
+/// listener gives an SMTP client with the same reverse-path.
+#[tokio::test]
+async fn mail_send_refuses_a_deny_listed_sender() {
+    let (surface, _) = surface("senddeny").await;
+    let login = call(
+        &surface,
+        rpc_request(
+            "session.login",
+            json!({ "address": "test@example.test", "password": PASSWORD }),
+            json!(1),
+        ),
+    )
+    .await;
+    let token = login["result"]["token"].as_str().expect("token").to_owned();
+    // The policy is edited under the admin token, the way an operator does.
+    let admin = call(
+        &surface,
+        rpc_request("session.adminLogin", json!({ "token": ADMIN }), json!(2)),
+    )
+    .await;
+    let admin_token = admin["result"]["token"]
+        .as_str()
+        .expect("admin token")
+        .to_owned();
+
+    let send = |token: &str| {
+        rpc_request(
+            "mail.send",
+            json!({
+                "token": token,
+                "to": "boss@example.test",
+                "subject": "denied",
+                "body": "body",
+            }),
+            json!(7),
+        )
+    };
+
+    // The fixture's policy has an empty deny list: the send is accepted into
+    // the queue (whether the recipient is reachable is the delivery layer's
+    // business, not this handler's).
+    let allowed = call(&surface, send(&token)).await;
+    assert!(allowed.get("error").is_none(), "{allowed}");
+
+    // Deny the sender's own domain through the policy surface, then send
+    // again: the rule that judges a sender is what refuses it.
+    let saved = call(
+        &surface,
+        rpc_request(
+            "admin.policy.put",
+            json!({
+                "token": admin_token,
+                "allowlist": [],
+                "denylist": ["@example.test"],
+                "variants": {},
+            }),
+            json!(3),
+        ),
+    )
+    .await;
+    assert_eq!(saved["result"]["saved"], json!(true), "{saved}");
+
+    let denied = call(&surface, send(&token)).await;
+    assert_eq!(
+        denied["error"]["message"], "Mail.Rejected: the policy refuses this sender",
+        "a deny-listed sender must be refused before anything is written: {denied}"
+    );
+}
+
+/// A deny list on the address the *recipient reads* stops the send, even
+/// when the envelope sender is a different address that is not denied.
+///
+/// Sending from a shared mailbox is exactly that shape: the envelope is the
+/// account (it is what authenticated), the `From:` is the shared address. A
+/// rule written against that address has to bind the header too, or the
+/// operator's rule is bypassed by the From picker.
+#[tokio::test]
+async fn mail_send_refuses_a_deny_listed_from_header() {
+    let (surface, _) = surface("senddenyfrom").await;
+    let login = call(
+        &surface,
+        rpc_request(
+            "session.login",
+            json!({ "address": "test@example.test", "password": PASSWORD }),
+            json!(1),
+        ),
+    )
+    .await;
+    let token = login["result"]["token"].as_str().expect("token").to_owned();
+    let admin = call(
+        &surface,
+        rpc_request("session.adminLogin", json!({ "token": ADMIN }), json!(2)),
+    )
+    .await;
+    let admin_token = admin["result"]["token"]
+        .as_str()
+        .expect("admin token")
+        .to_owned();
+
+    // Deny the shared address only; the account's own address stays allowed.
+    let saved = call(
+        &surface,
+        rpc_request(
+            "admin.policy.put",
+            json!({
+                "token": admin_token,
+                "allowlist": [],
+                "denylist": ["team@example.test"],
+                "variants": {},
+            }),
+            json!(3),
+        ),
+    )
+    .await;
+    assert_eq!(saved["result"]["saved"], json!(true), "{saved}");
+
+    let send_as_team = rpc_request(
+        "mail.send",
+        json!({
+            "token": token,
+            "to": "boss@example.test",
+            "subject": "from the shared mailbox",
+            "body": "body",
+            "from": "team@example.test",
+        }),
+        json!(4),
+    );
+    let denied = call(&surface, send_as_team).await;
+    assert_eq!(
+        denied["error"]["message"], "Mail.Rejected: the policy refuses this sender",
+        "the From the recipient reads is judged too: {denied}"
+    );
+
+    // The same account sending as itself is still allowed: the rule names one
+    // address, and the other is untouched.
+    let own = call(
+        &surface,
+        rpc_request(
+            "mail.send",
+            json!({
+                "token": token,
+                "to": "boss@example.test",
+                "subject": "from the account",
+                "body": "body",
+            }),
+            json!(5),
+        ),
+    )
+    .await;
+    assert!(own.get("error").is_none(), "{own}");
 }
 
 fn rpc_request(method: &str, params: Value, id: Value) -> Value {
