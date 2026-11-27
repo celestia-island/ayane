@@ -99,6 +99,7 @@ impl Fixture {
                 role_name: "inbound".to_owned(),
                 tls_cert: None,
                 tls_key: None,
+                imap_tls: None,
             }],
             spool_root: self.spool.clone(),
             mail_root: self.mail.clone(),
@@ -513,6 +514,7 @@ async fn a_mail_service_that_cannot_start_leaves_the_control_plane_serving() {
                     role_name: "submission".to_owned(),
                     tls_cert: Some(fixture.root.join("no-such-cert.pem")),
                     tls_key: Some(fixture.root.join("no-such-key.pem")),
+                    imap_tls: None,
                 }];
                 mail
             },
@@ -548,6 +550,7 @@ async fn a_mail_service_that_cannot_start_leaves_the_control_plane_serving() {
                     role_name: "submission".to_owned(),
                     tls_cert: None,
                     tls_key: None,
+                    imap_tls: None,
                 }];
                 mail
             },
@@ -913,6 +916,7 @@ async fn a_submission_listener_without_tls_is_refused_at_start() {
         role_name: "submission".to_owned(),
         tls_cert: None,
         tls_key: None,
+        imap_tls: None,
     }];
     let store: Arc<dyn StateStore> = fixture.store.clone();
     let engine = ayane::engine::start(&fixture.config(mail), store)
@@ -949,6 +953,7 @@ async fn a_submission_listener_authenticates_against_the_store() {
         tls_key: Some(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mx-test-key.pem"),
         ),
+        imap_tls: None,
     }];
     let store: Arc<dyn StateStore> = fixture.store.clone();
     let engine = ayane::engine::start(&fixture.config(mail), store)

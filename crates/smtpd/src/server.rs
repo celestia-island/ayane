@@ -1635,6 +1635,10 @@ impl Connection {
                     RecipientVerdict::RelayDenied => Outcome::RelayDenied,
                 }
             }
+            // An IMAP listener never reaches this function: it is served by
+            // `crate::imap_server`, not by this driver. The arm exists so a
+            // future role cannot be added without deciding what it accepts.
+            ListenerRole::Imap => Outcome::RelayDenied,
             ListenerRole::Submission | ListenerRole::SubmissionsTls => {
                 if self.session.authenticated().is_none() {
                     // Not "relay denied": the client has not authenticated, and

@@ -88,6 +88,24 @@ macro_rules! answer {
     };
 }
 
+/// The address a session is built over before it has a mailbox.
+///
+/// An [`ImapSession`] is scoped to one account, and a connection has none until
+/// its client has logged in — but the greeting and the unauthenticated commands
+/// still have to be rendered by *something*. A session built over this address
+/// answers exactly those ([`ImapSession::greeting`],
+/// [`ImapSession::capabilities`], and the `not authenticated` refusals
+/// [`ImapSession::handle`] returns for everything else); it can read no
+/// mailbox, because no credential ever opens one.
+///
+/// `ayane.invalid` is under the RFC 2606 §2 reserved TLD: it can never be
+/// delivered to and never belongs to anyone.
+#[must_use]
+pub fn unassigned() -> Address {
+    Address::parse("ayane-unassigned@ayane.invalid")
+        .expect("a reserved-TLD address is a valid mailbox address")
+}
+
 /// The mapping file's name, inside the folder it describes.
 pub const UIDLIST: &str = "ayane-uidlist";
 
@@ -317,6 +335,26 @@ pub struct Outcome {
     pub close: bool,
 }
 
+impl Outcome {
+    /// An answer: bytes to write, nothing else.
+    #[must_use]
+    pub fn out(out: Vec<u8>) -> Self {
+        Self {
+            out,
+            ..Self::default()
+        }
+    }
+
+    /// The line that precedes the TLS handshake, and nothing else.
+    #[must_use]
+    pub fn start_tls(line: Vec<u8>) -> Self {
+        Self {
+            start_tls: Some(line),
+            ..Self::default()
+        }
+    }
+}
+
 /// A folder as one command sees it: where it is, its UID table, and its
 /// messages.
 struct Folder {
@@ -407,6 +445,15 @@ pub struct ImapSession<'a> {
     state: State,
     selected: Option<Selected>,
     passwords: &'a dyn PasswordVerifier,
+    /// Whether this listener can actually accept a `STARTTLS`.
+    ///
+    /// The transport says what a command arrived over; this says what the
+    /// listener *can do*, and the two differ on a port with no certificate at
+    /// all: a command there still arrived in the clear, but there is nothing to
+    /// upgrade to, so `STARTTLS` must not be advertised. A session that is not
+    /// told (a unit test driving the table) assumes it can — which is what
+    /// makes [`Transport`] alone a safe default.
+    starttls: bool,
 }
 
 impl std::fmt::Debug for ImapSession<'_> {
@@ -438,7 +485,15 @@ impl<'a> ImapSession<'a> {
             state: State::NotAuthenticated,
             selected: None,
             passwords,
+            starttls: true,
         }
+    }
+
+    /// Records whether the listener has a certificate to offer `STARTTLS` with.
+    #[must_use]
+    pub fn with_starttls(mut self, starttls: bool) -> Self {
+        self.starttls = starttls;
+        self
     }
 
     /// The state the session is in.
@@ -451,7 +506,7 @@ impl<'a> ImapSession<'a> {
     #[must_use]
     pub fn greeting(&self) -> Vec<u8> {
         let mut out = self.notice(
-            Code::Capability(capabilities(self.transport)),
+            Code::Capability(capabilities(self.transport, self.starttls)),
             &self.hostname,
         );
         trim_crlf(&mut out);
@@ -462,10 +517,98 @@ impl<'a> ImapSession<'a> {
     /// What this connection advertises, as text.
     #[must_use]
     pub fn capabilities(&self) -> &'static str {
-        match self.transport {
-            Transport::Clear => "IMAP4rev1 STARTTLS LOGINDISABLED MOVE LITERAL+",
-            Transport::Tls => "IMAP4rev1 AUTH=PLAIN MOVE LITERAL+",
+        match (self.transport, self.starttls) {
+            (Transport::Clear, true) => "IMAP4rev1 STARTTLS LOGINDISABLED MOVE LITERAL+",
+            (Transport::Clear, false) => "IMAP4rev1 LOGINDISABLED MOVE LITERAL+",
+            (Transport::Tls, _) => "IMAP4rev1 AUTH=PLAIN MOVE LITERAL+",
         }
+    }
+
+    // ── the connection half ──────────────────────────────────────────────
+    //
+    // What is below is the *same* protocol state, entered from the socket's
+    // side rather than from a command's. A connection asks the state machine
+    // for the parts of RFC 3501 §3 that happen before a mailbox exists — the
+    // unauthenticated `CAPABILITY`/`NOOP`/`LOGOUT`/`STARTTLS`, and the
+    // refusals for everything else — and then hands over to
+    // [`ImapSession::handle`] once [`ImapSession::mark_authenticated`] has
+    // said who the client is. All of it renders through the same `line`
+    // helper, so a reply written here is spelled exactly as the same reply
+    // written from `handle`.
+
+    /// Records that the connection's credential check succeeded.
+    ///
+    /// Called by the listener *after* it has verified the password: the
+    /// session exists for one mailbox and is built over the account the
+    /// credential opened, so this takes the check's result as a fact rather
+    /// than repeating it. It leaves the session in [`State::Authenticated`].
+    pub fn mark_authenticated(&mut self) {
+        self.state = State::Authenticated;
+    }
+
+    /// The tagged `OK` that answers a successful `LOGIN` / `AUTHENTICATE`.
+    #[must_use]
+    pub fn logged_in(&self, tag: &str) -> Vec<u8> {
+        line(
+            tag,
+            Kind::Ok,
+            Some(Code::Capability(capabilities(
+                self.transport,
+                self.starttls,
+            ))),
+            "Logged in",
+            true,
+        )
+    }
+
+    /// The untagged `OK [CAPABILITY …]` line a `CAPABILITY` command answers
+    /// with, and the greeting carries.
+    #[must_use]
+    pub fn notice_line(&self) -> Vec<u8> {
+        self.notice(
+            Code::Capability(capabilities(self.transport, self.starttls)),
+            &self.hostname,
+        )
+    }
+
+    /// The untagged `BYE` that ends a `LOGOUT`.
+    #[must_use]
+    pub fn bye_line(&self) -> Vec<u8> {
+        self.contained(&Status::bye(None, "Logging out").expect("bye"))
+    }
+
+    /// The untagged `OK [<code>] …` line a command answers with, for the
+    /// commands a connection answers before a session exists.
+    #[must_use]
+    pub fn notice_with(&self, code: Code<'_>, text: &str) -> Vec<u8> {
+        self.notice(code, text)
+    }
+
+    /// The tagged `OK` that completes a command, for the commands a
+    /// connection answers itself.
+    #[must_use]
+    pub fn done(&self, tag: &str, name: &str) -> Vec<u8> {
+        self.ok(tag, &format!("{name} completed"))
+    }
+
+    /// A tagged `NO` line, for the answers a connection writes itself before
+    /// it has a session to ask.
+    #[must_use]
+    pub fn refuse_no(&self, tag: &str, text: &str) -> Vec<u8> {
+        line(tag, Kind::No, None, text, true)
+    }
+
+    /// A tagged `BAD` line, for the same reason as [`ImapSession::refuse_no`].
+    #[must_use]
+    pub fn refuse_bad(&self, tag: &str, text: &str) -> Vec<u8> {
+        line(tag, Kind::Bad, None, text, true)
+    }
+
+    /// The line that answers `STARTTLS` — no CRLF, because the handshake
+    /// follows it (RFC 3501 §6.2.1).
+    #[must_use]
+    pub fn starttls_line(tag: &str) -> Vec<u8> {
+        line(tag, Kind::Ok, None, "Begin TLS negotiation now", false)
     }
 
     /// Handle one parsed command and answer with what to write.
@@ -482,7 +625,7 @@ impl<'a> ImapSession<'a> {
             B::Capability => self.reply(
                 &tag,
                 "CAPABILITY",
-                Data::Capability(capabilities(self.transport)),
+                Data::Capability(capabilities(self.transport, self.starttls)),
             ),
             B::Noop | B::Check => self.refresh(&tag),
             B::Logout => {
@@ -641,7 +784,10 @@ impl ImapSession<'_> {
             out: line(
                 tag,
                 Kind::Ok,
-                Some(Code::Capability(capabilities(self.transport))),
+                Some(Code::Capability(capabilities(
+                    self.transport,
+                    self.starttls,
+                ))),
                 "Logged in",
                 true,
             ),
@@ -1301,9 +1447,12 @@ impl ImapSession<'_> {
 
 /// One of the three status kinds a reply line can carry.
 #[derive(Debug, Clone, Copy)]
-enum Kind {
+pub(crate) enum Kind {
+    /// `OK`.
     Ok,
+    /// `NO`.
     No,
+    /// `BAD`.
     Bad,
 }
 
@@ -1352,11 +1501,12 @@ fn state_refusal(state: State, body: &CommandBody<'_>) -> Option<&'static str> {
 }
 
 /// This connection's capabilities.
-fn capabilities(transport: Transport) -> NonEmptyVec<Capability<'static>> {
+fn capabilities(transport: Transport, starttls: bool) -> NonEmptyVec<Capability<'static>> {
     let mut caps = vec![Capability::Imap4Rev1];
-    caps.extend(match transport {
-        Transport::Clear => vec![Capability::StartTls, Capability::LoginDisabled],
-        Transport::Tls => vec![Capability::Auth(AuthMechanism::Plain)],
+    caps.extend(match (transport, starttls) {
+        (Transport::Clear, true) => vec![Capability::StartTls, Capability::LoginDisabled],
+        (Transport::Clear, false) => vec![Capability::LoginDisabled],
+        (Transport::Tls, _) => vec![Capability::Auth(AuthMechanism::Plain)],
     });
     caps.extend([Capability::Move, Capability::LiteralPlus]);
     NonEmptyVec::try_from(caps).expect("capabilities are never empty")
@@ -1464,6 +1614,13 @@ fn encode(response: &Response<'_>) -> Vec<u8> {
         }
     }
     out
+}
+
+/// The name of a command, for a `BAD` that names what it refused — including
+/// the one a connection writes itself, before it has a session to ask.
+#[must_use]
+pub fn command_name(body: &CommandBody<'_>) -> &'static str {
+    name_of(body)
 }
 
 /// The name of a command, for a `BAD` that names what it refused.

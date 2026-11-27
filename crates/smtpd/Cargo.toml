@@ -48,3 +48,11 @@ path = "src/bin/ayane-smtpd.rs"
 
 [lints]
 workspace = true
+
+[[test]]
+# The `imaplib` end-to-end driver needs a `{SHA512-CRYPT}` hash for the passwd
+# file the split-process listener reads; this test writes one from the same
+# `sha-crypt` crate the store hashes and verifies with.
+name = "imap_hashgen"
+path = "tests/imap_hashgen.rs"
+harness = false

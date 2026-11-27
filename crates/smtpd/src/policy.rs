@@ -32,6 +32,16 @@ pub enum ListenerRole {
     Submission,
     /// 465 implicit TLS: accepts submissions after AUTH.
     SubmissionsTls,
+    /// 143 with `STARTTLS` (or 993, implicit TLS): serves one mailbox per
+    /// connection over [`crate::imap_server`].
+    ///
+    /// A role here and not a fourth boolean because it answers the same
+    /// question the other three do — *which serve loop owns this socket* — and
+    /// the shape of that socket's TLS decides whether a password may cross it.
+    /// An IMAP listener never runs the SMTP session at all, which is why the
+    /// driver that owns it ([`crate::imap_server::serve`]) never consults
+    /// [`inbound_recipient`] or [`submission_recipient`].
+    Imap,
 }
 
 impl ListenerRole {
@@ -46,6 +56,17 @@ impl ListenerRole {
     #[must_use]
     pub fn offers_auth(self) -> bool {
         !matches!(self, Self::Inbound)
+    }
+
+    /// Whether this listener speaks SMTP at all.
+    ///
+    /// The three mail roles do; [`ListenerRole::Imap`] does not, and a driver
+    /// that asked an IMAP listener for an SMTP capability list would be
+    /// serving two protocols on one port. This is the one place that fact is
+    /// written down outside the two drivers.
+    #[must_use]
+    pub fn serves_smtp(self) -> bool {
+        !matches!(self, Self::Imap)
     }
 
     /// Whether this listener cannot run without a certificate.
