@@ -730,7 +730,12 @@ struct Connection {
     /// from the refused upload's tail opens no transaction (`503`) — see
     /// [`Connection::quarantine_refused_upload`] for the trade behind that
     /// (first command after a refusal is `503`, a retry recovers; 2026-11-26).
-    /// Spent on that first command.
+    ///
+    /// **Spent by whichever command arrives first, not only by a `MAIL FROM`:**
+    /// it lives for one command, not for one transaction. A `NOOP` after the
+    /// refusal spends it as surely as a `MAIL FROM` does — the flag is about
+    /// how far into the refusal the connection still is, and any command the
+    /// client sends moves it past that point.
     refused: bool,
     auth_state: Option<AuthState>,
     tls: bool,
@@ -1239,15 +1244,14 @@ impl Connection {
                 Transaction::Open(envelope) if envelope.smtputf8
             );
             let text = String::from_utf8_lossy(&line).into_owned();
-            // One command after a refusal is the last of what the refused
-            // upload put on the wire: it opens no envelope
+            // One command after a refusal opens no envelope
             // ([`Connection::quarantine_refused_upload`]). Every *other*
             // command is answered normally — this is about who may open a
-            // transaction, not about the connection being unusable — and the
-            // flag is spent by whichever command this is, so the client's
-            // retry after that one is served.
-            let one_shot_refusal = self.refused;
-            self.refused = false;
+            // transaction, not about the connection being unusable — so the
+            // gate is asked and spent here, before the command runs, and it is
+            // spent by **whatever** command arrives: it lives for one command,
+            // not for one transaction.
+            let one_shot_refusal = std::mem::take(&mut self.refused);
             let reply = match command::parse(&text, allow_utf8) {
                 Ok(Command::Mail { .. }) if one_shot_refusal => Some(Reply {
                     code: 503,
@@ -2204,23 +2208,50 @@ impl Connection {
         self.refused = true;
     }
 
-    /// Spends `settling` on one read: the octets that read brought are the
-    /// tail of an upload this connection already refused, so nothing in them is
-    /// executed.
+    /// Spends `settling` on one read.
     ///
-    /// A *complete line* is kept. Nothing about a line's content can tell a
-    /// tail from a command the client wrote — both are just an `LF`-terminated
-    /// line — but a line that arrives **while a forged transaction in it would
-    /// be pointless** is handled by the session instead: the refusal left the
-    /// session with no envelope (see [`Session::end_after_refusal`]), so a
-    /// `MAIL FROM` among them is answered `503 Bad sequence` and runs nothing.
-    /// What survives here is a **new transaction the client starts after the
-    /// refusal** — the case the attacker cannot gain from, because starting a
-    /// transaction requires being allowed to send commands at all.
+    /// The read that follows a refusal is offered three different things, and
+    /// two of them look the same on the wire (`<something>\r\n`):
+    ///
+    /// | what arrived | what it is | what this does |
+    /// |---|---|---|
+    /// | `xNOOP\r\n` | a fragment that ran into the client's next command | dropped whole |
+    /// | `MAIL FROM:…\r\n` | a clean command, or a tail that happened to be one | kept — the session refuses the envelope (`503`) |
+    ///
+    /// They cannot be told apart, so this picks the reading that fails safe
+    /// for the **session** rather than for the parser: a line that looks like
+    /// a command is kept and the session decides whether it may open a
+    /// transaction ([`Connection::quarantine_refused_upload`]), and anything
+    /// that is **not** a well-formed command — a fragment glued onto one is
+    /// not — is dropped instead of being answered `500`.
+    ///
+    /// # What this can and cannot decide
+    ///
+    /// A tail and a command the client wrote are the same octets, and a
+    /// fragment glued onto a command arrives as one line exactly as a clean
+    /// command does. So the rule is: **the drop happens at the last `LF` of
+    /// whatever is not a command, and a buffer that is one complete
+    /// command-shaped line is left for the session.** The cost is that a tail
+    /// which happened to be `NOOP\r\n` runs (a no-op, and it is the same
+    /// octets a client would have sent) — while a tail that would open a
+    /// transaction does not, because the session refuses it.
+    ///
+    /// Cutting at an `LF` never splits a line: it is a line's last octet.
     fn settle(&mut self) {
         self.settling = false;
-        if !self.read_buf.contains(&b'\n') {
-            self.read_buf.clear();
+        // Is what arrived exactly one complete, command-shaped line?
+        let single_line = match self.read_buf.iter().position(|octet| *octet == b'\n') {
+            Some(end) if end + 1 == self.read_buf.len() => command_shaped(&self.read_buf[..end]),
+            _ => false,
+        };
+        if single_line {
+            return;
+        }
+        match self.read_buf.iter().rposition(|octet| *octet == b'\n') {
+            Some(last) => {
+                self.read_buf.drain(..=last);
+            }
+            None => self.read_buf.clear(),
         }
     }
 
@@ -2249,8 +2280,8 @@ impl Connection {
         // The stream is drained up to the client's terminator (or until the
         // client stops sending), and the drain buffer goes with it: there is
         // nothing left of the failed transfer to keep.
-        let dbg_end = self.drain_until_dot(deadline).await;
-        match dbg_end {
+        let drained = self.drain_until_dot(deadline).await;
+        match drained {
             DrainEnd::Terminator => {
                 // The terminator was consumed, so the *next* octets to arrive
                 // belong to a transfer the client wrote before it learned the
@@ -2419,8 +2450,12 @@ impl Connection {
                 Ok(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                 Ok(Err(err)) => return Err(err.into()),
                 Ok(Ok(())) => {
-                    // The settled read is discarded whole: loop for the next
-                    // command rather than treating an empty buffer as EOF.
+                    // The settled read carried the refused upload's tail, and
+                    // `settle` dropped it by line: what is left, if anything,
+                    // is the start of the command still arriving. Scan it now —
+                    // the loop's next iteration would go straight to another
+                    // read, and a command that is already complete would wait
+                    // for octets nobody is sending.
                     if settled {
                         continue;
                     }
@@ -2515,6 +2550,23 @@ impl Connection {
             }
         }
     }
+}
+
+/// Whether a line (its line ending removed) is one a command parser would
+/// recognise: an ASCII verb — letters and the characters SMTP verbs use —
+/// followed by nothing or by a space.
+///
+/// This is not a parser; it is the shape test the refusal needs to tell
+/// `NOOP`-like octets from `xNOOP`-like ones, where the second is what a tail
+/// fragment produces when it runs into the command behind it. Anything that is
+/// not command-shaped cannot be a command the client meant, so it is thrown
+/// away rather than answered `500 Command unrecognized`.
+fn command_shaped(line: &[u8]) -> bool {
+    let verb_end = line
+        .iter()
+        .position(|octet| !octet.is_ascii_alphabetic())
+        .unwrap_or(line.len());
+    verb_end > 0 && (verb_end == line.len() || line[verb_end] == b' ')
 }
 
 /// Whether a drained line (its `<CRLF>` removed) is the terminator `.`.

@@ -1285,3 +1285,162 @@ async fn a_refusal_costs_one_503_and_a_retry_recovers() {
     );
     harness.stop();
 }
+
+// ── S2-1: the tail that has already become a line ────────────────────────
+//
+// The refusal's one read drops the refused upload's tail, but a tail does not
+// arrive at a line boundary: a sender (or a network path) can leave the last
+// fragment without its `LF`. When that fragment is joined to the client's next
+// command by whichever read follows, the command is no longer a command —
+// `x` + `NOOP\r\n` is `xNOOP`, and a legitimate client gets `500 Command
+// unrecognized: XNOOP` for a request it wrote correctly. So the drop has to be
+// by **line**, not by buffer: everything up to and including the last `LF` in
+// what the read brought is the tail, and only the unterminated remainder — if
+// any — belongs to the command still arriving.
+
+/// A fragment that ran into the client's next command is **not** glued onto
+/// it and **not** answered as a broken command.
+///
+/// `x` written by the client (junk after learning its transfer failed) plus
+/// `NOOP\r\n` it meant to send arrive as one line: `xNOOP`. The server must not
+/// run that as a command — and it must not answer `500 Command unrecognized:
+/// XNOOP` either, which tells a client that wrote its command correctly that it
+/// made a syntax error.
+///
+/// `xNOOP` cannot be told from a command a client wrote as `xNOOP`, so no server
+/// can turn this line into its `NOOP`. What it can do is refuse to pretend: the
+/// line is dropped with the tail, and the connection is **not** poisoned by it —
+/// the command after it is read, answered and served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tail_fragment_is_dropped_rather_than_glued_or_scolded() {
+    let harness = Harness::start("s2-fragment", bounded()).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    let mut first = b"From: <a@example.net>\r\nSubject: s2\r\n\r\n".to_vec();
+    first.extend_from_slice(b"prompt\n.\r\n");
+    client.send_raw(&first);
+    let refusal = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the refused transfer is answered");
+    assert_eq!(
+        (refusal.code, refusal.text.as_str()),
+        (554, "5.6.0 Transaction failed")
+    );
+
+    // One write: the fragment and the command the client meant, which is what
+    // makes them one read. (Writing them apart lets the server drop the
+    // fragment on its own and the join never happens.)
+    client.send_raw(b"xNOOP\r\n");
+    assert!(
+        client
+            .try_read_reply_within(Duration::from_millis(400))
+            .is_none(),
+        "a line the client did not write is dropped, not answered `500`"
+    );
+
+    // The connection is not poisoned: the next command works.
+    client.send("NOOP");
+    let reply = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the next command is answered");
+    assert_eq!(
+        (reply.code, reply.text.as_str()),
+        (250, "2.0.0 OK"),
+        "a command written after the fragment is a command: {reply:?}"
+    );
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tail_line_opens_no_transaction_and_the_next_command_runs() {
+    let harness = Harness::start("s2-whole-line", bounded()).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    let mut first = b"From: <a@example.net>\r\nSubject: s2\r\n\r\n".to_vec();
+    first.extend_from_slice(b"prompt\n.\r\n");
+    client.send_raw(&first);
+    assert_eq!(
+        client
+            .try_read_reply_within(Duration::from_secs(5))
+            .map(|r| r.code),
+        Some(554)
+    );
+
+    // The tail, as a complete `MAIL FROM` line: refused by the session, never
+    // turned into an envelope.
+    client.send("MAIL FROM:<evil@example.net>");
+    let tail = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the tail line is answered");
+    assert_eq!(
+        (tail.code, tail.text.as_str()),
+        (503, "5.5.1 Bad sequence of commands"),
+        "a `MAIL FROM` in the refused upload's tail opens nothing: {tail:?}"
+    );
+
+    // And the client's next command — the retry — runs.
+    client.send("MAIL FROM:<a@example.net>");
+    let opened = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the command after the tail is answered");
+    assert_eq!(
+        opened.code, 250,
+        "a command written after the refusal is served: {opened:?}"
+    );
+    let senders: Vec<String> = harness
+        .queued()
+        .iter()
+        .map(|m| m.envelope.mail_from.clone())
+        .collect();
+    assert!(senders.is_empty(), "nothing was queued: {senders:?}");
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tail_fragment_does_not_corrupt_a_whole_retry() {
+    let harness = Harness::start("s2-fragment-retry", bounded()).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    let mut first = b"From: <a@example.net>\r\nSubject: s2\r\n\r\n".to_vec();
+    first.extend_from_slice(b"prompt\n.\r\n");
+    client.send_raw(&first);
+    assert_eq!(
+        client
+            .try_read_reply_within(Duration::from_secs(5))
+            .map(|r| r.code),
+        Some(554)
+    );
+
+    // The fragment, then the retry. The first `MAIL` is what arrives with the
+    // fragment and is answered `503` (it may be the tail); the client retries
+    // once, which is the whole cost of the refusal.
+    client.send_raw(b"x");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    client.send("MAIL FROM:<a@example.net>");
+    let first = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the first command after the refusal is answered");
+    assert_eq!(
+        first.code, 503,
+        "the fragment-free retry is the second command: {first:?}"
+    );
+    client.expect("MAIL FROM:<a@example.net>", 250);
+    client.expect("RCPT TO:<inbox@example.com>", 250);
+    client.expect("DATA", 354);
+    client.send_raw(b"From: <a@example.net>\r\n\r\nretried\r\n.\r\n");
+    let queued = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the retried message is answered");
+    assert_eq!(
+        (queued.code, queued.text.as_str()),
+        (250, "2.0.0 OK: queued"),
+        "{queued:?}"
+    );
+    let senders: Vec<String> = harness
+        .queued()
+        .iter()
+        .map(|m| m.envelope.mail_from.clone())
+        .collect();
+    assert_eq!(senders, vec!["a@example.net".to_owned()], "{senders:?}");
+    harness.stop();
+}
