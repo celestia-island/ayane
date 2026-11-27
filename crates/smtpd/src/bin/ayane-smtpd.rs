@@ -1,13 +1,17 @@
 //! The operator's entry point: one listener per role, configured from a
-//! state snapshot and a TLS certificate.
+//! state snapshot and a TLS certificate — or, with `--deliver`, the delivery
+//! consumer over the same spool.
 //!
-//! W1 ships the receiving half only. The binary binds a listener, runs the
-//! spool's recovery once, and serves until it is stopped; delivery from the
-//! queue is W2's.
+//! Receiving and delivering are two modes of one process because they are two
+//! jobs over one spool: the listener binds, recovers the queue once and
+//! serves; the consumer recovers, drains what is due and sleeps until the
+//! next attempt is due. Neither is a daemon with its own copy of the queue.
 //!
 //! ```text
 //! ayane-smtpd --role inbound --listen 127.0.0.1:3025 --spool state/spool \
 //!             --state state/desired-state.json --hostname mx.example.com
+//! ayane-smtpd --deliver --spool /var/mail/vhosts --state state/desired-state.json \
+//!             --hostname mx.example.com [--retry-max-age-seconds N] [--quota BYTES]
 //! ```
 
 #![warn(missing_docs)]
@@ -15,6 +19,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ayane_smtpd::authn::PasswordVerifier;
 use ayane_smtpd::policy::AddressPolicy;
@@ -27,7 +32,16 @@ use tokio_rustls::TlsAcceptor;
 
 /// What the command line asks for.
 #[derive(Debug)]
-struct Options {
+enum Options {
+    /// Bind a listener and serve until stopped.
+    Serve(ServeOptions),
+    /// Drain the queue until stopped.
+    Deliver(DeliverOptions),
+}
+
+/// The listener mode's options.
+#[derive(Debug)]
+struct ServeOptions {
     role: ListenerRole,
     listen: SocketAddr,
     spool: PathBuf,
@@ -40,16 +54,36 @@ struct Options {
     submission_authenticates: bool,
 }
 
+/// The consumer mode's options.
+#[derive(Debug)]
+struct DeliverOptions {
+    spool: PathBuf,
+    state: PathBuf,
+    hostname: String,
+    retry_max_age: Duration,
+    retry_max_attempts: u32,
+    quota: Option<u64>,
+    interval: Duration,
+}
+
 fn usage() -> &'static str {
     "usage: ayane-smtpd --role inbound|submission|submissions-tls \
         --listen ADDR --spool DIR --state FILE --hostname NAME \
         [--tls-cert FILE --tls-key FILE] [--max-size BYTES] \
         [--max-header-bytes BYTES] [--per-ip LIMIT] \
-        [--submission-authenticates]"
+        [--submission-authenticates]\n\
+     \x20 or: ayane-smtpd --deliver --spool DIR --state FILE --hostname NAME \
+        [--retry-max-age-seconds N] [--retry-max-attempts N] \
+        [--quota BYTES] [--interval-seconds N]"
 }
 
 fn parse_options() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
+    let mut deliver = false;
+    let mut retry_max_age = ayane_smtpd::retry::RetryPolicy::DEFAULT_MAX_AGE;
+    let mut retry_max_attempts = 0u32;
+    let mut quota = None;
+    let mut interval = Duration::from_secs(30);
     let mut role = None;
     let mut listen = None;
     let mut spool = None;
@@ -100,26 +134,73 @@ fn parse_options() -> Result<Options, String> {
                     .map_err(|err| format!("bad --per-ip: {err}"))?;
             }
             "--submission-authenticates" => submission_authenticates = true,
+            "--deliver" => deliver = true,
+            "--retry-max-age-seconds" => {
+                // The RFC 5321 §4.5.4.1 horizon, expressed in seconds: an
+                // operator who needs a longer one says so, and the default is
+                // not silently shortened by a unit mix-up.
+                retry_max_age = Duration::from_secs(
+                    value()?
+                        .parse()
+                        .map_err(|err| format!("bad --retry-max-age-seconds: {err}"))?,
+                );
+            }
+            "--retry-max-attempts" => {
+                retry_max_attempts = value()?
+                    .parse()
+                    .map_err(|err| format!("bad --retry-max-attempts: {err}"))?;
+            }
+            "--quota" => {
+                quota = Some(
+                    value()?
+                        .parse()
+                        .map_err(|err| format!("bad --quota: {err}"))?,
+                );
+            }
+            "--interval-seconds" => {
+                interval = Duration::from_secs(
+                    value()?
+                        .parse()
+                        .map_err(|err| format!("bad --interval-seconds: {err}"))?,
+                );
+            }
             other => return Err(format!("unknown flag {other}")),
         }
+    }
+    let spool = spool.ok_or("--spool is required")?;
+    let state = state.ok_or("--state is required")?;
+    let hostname = hostname.ok_or("--hostname is required")?;
+    if deliver {
+        if role.is_some() || listen.is_some() {
+            return Err("--deliver does not take --role or --listen".to_owned());
+        }
+        return Ok(Options::Deliver(DeliverOptions {
+            spool,
+            state,
+            hostname,
+            retry_max_age,
+            retry_max_attempts,
+            quota,
+            interval,
+        }));
     }
     let tls = match (cert, key) {
         (Some(cert), Some(key)) => Some((cert, key)),
         (None, None) => None,
         _ => return Err("--tls-cert and --tls-key go together".to_owned()),
     };
-    Ok(Options {
+    Ok(Options::Serve(ServeOptions {
         role: role.ok_or("--role is required")?,
         listen: listen.ok_or("--listen is required")?,
-        spool: spool.ok_or("--spool is required")?,
-        state: state.ok_or("--state is required")?,
-        hostname: hostname.ok_or("--hostname is required")?,
+        spool,
+        state,
+        hostname,
         tls,
         max_message_size,
         max_header_bytes,
         per_ip_limit,
         submission_authenticates,
-    })
+    }))
 }
 
 /// The credential check for a submission listener.
@@ -171,6 +252,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(2);
         }
     };
+    match options {
+        Options::Serve(options) => serve_listener(options).await,
+        Options::Deliver(options) => deliver_forever(options).await,
+    }
+}
+
+/// The receiving half: bind, recover, serve until the process is stopped.
+async fn serve_listener(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
     let state: ayane_proto::DesiredState = serde_json::from_slice(&std::fs::read(&options.state)?)?;
     state.validate()?;
     let spool = Spool::open(&options.spool)?;
@@ -227,4 +316,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%options.listen, role = ?options.role, "listening");
     serve(listener, config).await?;
     Ok(())
+}
+
+/// The delivery half: drain the queue, sleep until something is due, repeat.
+///
+/// Each iteration re-reads the state snapshot, so an operator who changes an
+/// alias does not have to restart the consumer for the change to reach
+/// delivery — the same reason the listener reads its snapshot per connection.
+/// The sleep is bounded by the earliest due attempt the last pass reported
+/// (never longer than `--interval-seconds`, never shorter than one second), so
+/// a message that is due in fifteen minutes is not retried every thirty
+/// seconds and not discovered an hour late.
+async fn deliver_forever(options: DeliverOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let retry = ayane_smtpd::retry::RetryPolicy {
+        max_age: options.retry_max_age,
+        max_attempts: options.retry_max_attempts,
+        ..ayane_smtpd::retry::RetryPolicy::default()
+    };
+    let deliverer = ayane_smtpd::deliver::Deliverer::new(
+        Spool::open(&options.spool)?,
+        options.hostname.clone(),
+    )
+    .with_retry(retry)
+    .with_quota(options.quota);
+    tracing::info!(
+        spool = %options.spool.display(),
+        max_age_seconds = options.retry_max_age.as_secs(),
+        max_attempts = options.retry_max_attempts,
+        "delivery consumer started"
+    );
+    loop {
+        let state: ayane_proto::DesiredState =
+            serde_json::from_slice(&std::fs::read(&options.state)?)?;
+        state.validate()?;
+        let passes = deliverer.run(&state)?;
+        let due = next_due(&passes);
+        let reports = passes.len();
+        let waiting: usize = passes
+            .iter()
+            .map(|pass| pass.waiting().count())
+            .sum::<usize>();
+        tracing::info!(reports, waiting, "delivery pass finished");
+        let cap = options.interval.as_secs().max(1);
+        let sleep = due
+            .map_or(cap, |due| due.saturating_sub(now_epoch()))
+            .clamp(1, cap);
+        tokio::time::sleep(Duration::from_secs(sleep)).await;
+    }
+}
+
+/// The earliest instant the last pass said something would be due.
+fn next_due(passes: &[ayane_smtpd::DeliveryReport]) -> Option<u64> {
+    passes
+        .iter()
+        .flat_map(|pass| pass.waiting())
+        .filter_map(|report| match &report.outcome {
+            ayane_smtpd::RecipientOutcome::Deferred {
+                next_attempt_epoch, ..
+            } => Some(*next_attempt_epoch),
+            _ => None,
+        })
+        .min()
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }

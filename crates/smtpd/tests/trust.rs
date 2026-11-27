@@ -105,8 +105,13 @@ async fn tb17_a_signed_message_keeps_its_bytes_and_one_received_on_top() {
         DKIM_MESSAGE
             .lines()
             .filter(|line| line.starts_with("Received:"))
-            .count(),
-        "the MTA adds no Received of its own here (verification is off in this fixture)"
+            .count()
+            + 1,
+        "the hop adds exactly one Received: of its own, even with verification off"
+    );
+    assert!(
+        stored_text.starts_with("Received: "),
+        "and it is the topmost field: {stored_text:.160}"
     );
 }
 

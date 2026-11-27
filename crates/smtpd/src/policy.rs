@@ -194,7 +194,14 @@ pub fn inbound_recipient(state: &DesiredState, sender: &Address, recipient: &Add
         };
     }
     match route(state, sender, recipient) {
-        Route::Mailbox(_) | Route::Shared(_) | Route::Forward(_) => Verdict {
+        Route::Mailbox(_) | Route::Forward(_) => Verdict {
+            verdict: RecipientVerdict::Exists,
+        },
+        // A shared mailbox is a real mailbox here — `route` answers `Shared`
+        // only for an entry in `state.shared` — and `DesiredState::validate`
+        // refuses a state where one is also an alias source or a catch-all,
+        // so this arm is the existence proof its name promises.
+        Route::Shared(_) => Verdict {
             verdict: RecipientVerdict::Exists,
         },
         // Quarantine is reached by an allow-listed sender sending to an

@@ -428,6 +428,14 @@ pub enum StateError {
     /// A shared mailbox has no members.
     #[error("shared mailbox `{0}` has no members")]
     EmptySharedMailbox(String),
+    /// A shared mailbox is the alias source or the catch-all of a domain: an
+    /// alias keeps no local copy and a catch-all has to name a mailbox, so
+    /// neither can be a shared mailbox — `route` would otherwise have to
+    /// answer two contradictory things for one address (forward the mail away
+    /// / deliver it here), and one of the two would be silently chosen by the
+    /// order of a match arm.
+    #[error("shared mailbox `{0}` may not also be an alias source or a catch-all")]
+    SharedMailboxConflict(String),
     /// A hosted domain name is not a valid DNS name.
     #[error("hosted domain is malformed: {0}")]
     MalformedDomain(String),
@@ -492,6 +500,30 @@ impl DesiredState {
             }
             if !seen.insert(format!("@{}", domain.name)) {
                 return Err(StateError::DuplicateAddress(domain.name.clone()));
+            }
+        }
+        // One address, one answer. `route` returns a single `Route` per
+        // recipient, so an address that is both a shared mailbox (local —
+        // deliver it here) and an alias source (forward it away) would be
+        // resolved by whichever match arm happened to come first. This runs
+        // before the duplicate-address scan, so such a state is refused for
+        // the contradiction it *is* rather than for the duplicate it also
+        // trips.
+        for shared in &self.shared {
+            let also_forwarded = self
+                .aliases
+                .iter()
+                .any(|alias| alias.source == shared.address);
+            let also_catch_all = self.domains.iter().any(|domain| {
+                domain
+                    .catch_all
+                    .as_ref()
+                    .is_some_and(|catch_all| *catch_all == shared.address)
+            });
+            if also_forwarded || also_catch_all {
+                return Err(StateError::SharedMailboxConflict(
+                    shared.address.to_string(),
+                ));
             }
         }
         for address in self.addresses() {
@@ -683,6 +715,31 @@ mod tests {
         assert!(matches!(
             state.validate(),
             Err(StateError::EmptySharedMailbox(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_shared_mailbox_that_is_also_an_alias_source() {
+        // `route` answers one `Route` per recipient: an alias source forwards
+        // and a shared mailbox is local, and letting one address be both
+        // would leave the delivery consumer to pick an arm order, silently.
+        let mut state = fixture();
+        state.aliases[0].source = address("team@example.com");
+        assert!(matches!(
+            state.validate(),
+            Err(StateError::SharedMailboxConflict(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_shared_mailbox_that_is_also_a_catch_all() {
+        let mut state = fixture();
+        state.domains[0].catch_all = Some(address("team@example.com"));
+        state.accounts[0].address = address("other@example.com");
+        state.aliases.clear();
+        assert!(matches!(
+            state.validate(),
+            Err(StateError::SharedMailboxConflict(_))
         ));
     }
 

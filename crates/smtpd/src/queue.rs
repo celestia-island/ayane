@@ -112,6 +112,8 @@ impl Envelope {
             smtputf8: false,
             sha256: String::new(),
             size: 0,
+            forwarded_from: None,
+            forward_hops: 0,
         }
     }
 }
@@ -147,6 +149,21 @@ pub struct Envelope {
     pub sha256: String,
     /// Length of the `.eml` file in octets.
     pub size: u64,
+    /// The address an alias of this instance forwarded this entry from, when
+    /// it is a forward's child rather than a message that arrived over SMTP.
+    ///
+    /// The delivery consumer sets it; the spool only carries it. `None` for
+    /// everything the receiving side writes.
+    #[serde(default)]
+    pub forwarded_from: Option<String>,
+    /// How many forwards produced this entry (`0` for an original).
+    ///
+    /// Together with the `Received:` fields every hop prepends, this is what
+    /// bounds a forwarding loop: the trace field is what an operator sees, the
+    /// count is what the queue can still count after a trace field has been
+    /// stripped somewhere upstream.
+    #[serde(default)]
+    pub forward_hops: u32,
 }
 
 /// One committed queue entry.
@@ -530,13 +547,72 @@ impl Spool {
     pub fn claim(&self, id: &str) -> io::Result<()> {
         let new = self.root.join("new");
         let cur = self.root.join("cur");
+        // The boundary between "waiting" and "being delivered" is the end of
+        // this method, never the middle of it. Two renames across two
+        // directories are not atomic, so a crash (or a filesystem reordering
+        // an un-fsynced rename against the other directory's sync) can leave
+        // the entry in both `new/` and `cur/`. That state is defined rather
+        // than avoided: an entry in `cur/` *is* claimed, and
+        // [`Spool::reclaim_cur`] is what the delivery layer runs before it
+        // acts on such an entry, so the `new/` shell is removed instead of
+        // being delivered a second time.
+        //
+        // The order of the syncs is the durability half of that definition:
+        // the metadata reaches `cur/` before the message does, and both
+        // renames reach `cur/` before the entry is made to leave `new/` —
+        // so the state a crash can leave is never "gone from both".
         std::fs::rename(
             new.join(format!("{id}.json")),
             cur.join(format!("{id}.json")),
         )?;
-        std::fs::rename(new.join(format!("{id}.eml")), cur.join(format!("{id}.eml")))?;
-        self.sync_dir(FsyncOp::Claim, &new)?;
         self.sync_dir(FsyncOp::Claim, &cur)?;
+        std::fs::rename(new.join(format!("{id}.eml")), cur.join(format!("{id}.eml")))?;
+        self.sync_dir(FsyncOp::Claim, &cur)?;
+        // The entry has to be gone from `new/` on the medium as well, or a
+        // crash after this point resurrects it there while it is also in
+        // `cur/` — which is still safe (see above), just slower.
+        self.sync_dir(FsyncOp::Claim, &new)?;
+        Ok(())
+    }
+
+    /// Finishes a claim a crash interrupted.
+    ///
+    /// A message found in `new/` **and** in `cur/` is half-moved: the first
+    /// rename landed, the second did not, or a crash between the renames
+    /// revived the `new/` half. The `cur/` copy is the newer one — the claim
+    /// only ever writes into `cur/` — so the missing half is moved in and the
+    /// stale `new/` half is removed, and the message stays a single entry.
+    ///
+    /// Idempotent: on a message that is only in `cur/` it does nothing, which
+    /// is why the delivery layer can call it whenever it is unsure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of a rename or sync that failed.
+    pub fn reclaim_cur(&self, id: &str) -> io::Result<()> {
+        let new = self.root.join("new");
+        let cur = self.root.join("cur");
+        let mut moved = false;
+        for extension in ["json", "eml"] {
+            let source = new.join(format!("{id}.{extension}"));
+            let target = cur.join(format!("{id}.{extension}"));
+            if source.exists() {
+                // The target may exist already (the message half arrived) or
+                // not (only its metadata did); a `cur/` file is the newer one
+                // in either case, so the `new/` copy is dropped rather than
+                // renamed over it.
+                if target.exists() {
+                    std::fs::remove_file(&source)?;
+                } else {
+                    std::fs::rename(&source, &target)?;
+                }
+                moved = true;
+            }
+        }
+        if moved {
+            self.sync_dir(FsyncOp::Claim, &cur)?;
+            self.sync_dir(FsyncOp::Claim, &new)?;
+        }
         Ok(())
     }
 
@@ -562,6 +638,22 @@ impl Spool {
     ///
     /// Returns the I/O error when a directory cannot be read.
     pub fn recover(&self) -> io::Result<RecoveryReport> {
+        self.recover_with_claimed(false)
+    }
+
+    /// [`Spool::recover`] with the delivery layer's half of the crash story.
+    ///
+    /// `reclaim_claimed` also moves messages a crashed delivery left in
+    /// `cur/` back to `new/` (the sweep that runs after the per-directory
+    /// pass below). It is a separate entry point
+    /// because the spool does not know what "being delivered" means: a
+    /// receiver that only spools must not resurrect entries a consumer is
+    /// working on, and a delivery pass must. The delivery layer calls this one.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Spool::recover`].
+    pub fn recover_with_claimed(&self, reclaim_claimed: bool) -> io::Result<RecoveryReport> {
         let mut report = RecoveryReport::default();
         let tmp = self.root.join("tmp");
         for entry in std::fs::read_dir(&tmp)? {
@@ -585,6 +677,11 @@ impl Spool {
             report.record_failure(&tmp, "fsync", &err);
         }
 
+        // A delivery that died between its claim and its `remove` left the
+        // entry in `cur/` with nothing working on it. Anything in an older
+        // process that is still open is a live consumer and is left alone;
+        // everything else goes back to `new/`, where the next pass picks it up
+        // — the message is re-delivered (at-least-once), never lost.
         for state in [QueueState::New, QueueState::Cur] {
             let dir = self.root.join(state.dir());
             let mut messages = BTreeMap::new();
@@ -605,6 +702,17 @@ impl Spool {
                 }
             }
             for (id, json) in &metadata {
+                if id.ends_with(".state") {
+                    // The delivery layer's record (`<id>.state.json`). It is
+                    // not a queue entry and it has no matching `.eml`, so the
+                    // orphan rule below must not read it as one: dropping it
+                    // would reset every recipient's place in the retry ladder
+                    // and re-deliver a message whose recipients had already
+                    // settled. The file stem keeps the second dot, which is
+                    // exactly why this test is on the stem and not on the
+                    // extension.
+                    continue;
+                }
                 if !messages.contains_key(id) {
                     // The envelope without a message: the rename order makes
                     // this the only reachable orphan.
@@ -653,6 +761,13 @@ impl Spool {
                 report.record_failure(&dir, "fsync", &err);
             }
         }
+        // The delivery layer's half of the crash story, and it runs *after*
+        // the per-directory pass: the envelope of an entry put back here is
+        // then checked by the `new/` pass that runs after it, so a reclaimed
+        // message is delivered only if its envelope still matches its octets.
+        if reclaim_claimed {
+            sweep_cur(&self.root, &mut report)?;
+        }
         if !report.failed.is_empty() {
             tracing::warn!(
                 failed = report.failed.len(),
@@ -668,6 +783,9 @@ impl Spool {
 pub struct RecoveryReport {
     /// Temporary files discarded.
     pub tmp_removed: usize,
+    /// Messages a crashed delivery left in `cur/` that were put back in
+    /// `new/`.
+    pub reclaimed: usize,
     /// Metadata files without a message discarded.
     pub orphan_metadata: usize,
     /// Entries that passed the length and checksum check.
@@ -1217,6 +1335,82 @@ fn verify_integrity(message: &Path, envelope: &Envelope) -> Result<(), String> {
     Ok(())
 }
 
+/// Moves every message a crashed delivery left in `cur/` back to `new/`.
+///
+/// A message in `cur/` that nothing is working on is one a consumer claimed
+/// and died on. Recovery is what makes that recoverable instead of lost: the
+/// entry goes back to the queue, whose next pass delivers it again (the
+/// at-least-once side of the window [`crate::deliver`] describes).
+///
+/// A file another, older process still holds open belongs to a consumer that
+/// is still working on it, so it stays where it is. So does one whose numbers
+/// do not match its envelope (that check is the per-directory pass's, and
+/// this runs after it).
+///
+/// The delivery layer's own record (`<id>.state.json`) is not a queue entry
+/// and is not touched here; it is the file the *orphan* rule must learn to
+/// skip, which it does by name (see `recover_with_claimed`).
+fn sweep_cur(root: &Path, report: &mut RecoveryReport) -> io::Result<()> {
+    let cur = root.join("cur");
+    let new = root.join("new");
+    let mut messages: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for entry in std::fs::read_dir(&cur)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("eml") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        messages.insert(stem.to_owned(), path);
+    }
+    for (id, eml) in &messages {
+        if is_open_somewhere(eml) {
+            tracing::debug!(
+                id,
+                "recovery left a message a consumer still holds open in cur/"
+            );
+            continue;
+        }
+        let json = cur.join(format!("{id}.json"));
+        if !json.exists() {
+            // A message without its envelope is not a queue entry: it goes
+            // aside rather than back into `new/`, where no consumer could
+            // read it.
+            if quarantine(root, eml, id) {
+                report.corrupt += 1;
+            } else {
+                report.record_failure(eml, "quarantine", &"rename into corrupt/ failed");
+            }
+            continue;
+        }
+        let mut moved = false;
+        for (source, target) in [
+            (json, new.join(format!("{id}.json"))),
+            (eml.clone(), new.join(format!("{id}.eml"))),
+        ] {
+            match std::fs::rename(&source, &target) {
+                Ok(()) => moved = true,
+                Err(err) => {
+                    tracing::warn!(id, %err, "recovery could not move a claimed message back to new/");
+                    report.record_failure(&source, "reclaim", &err);
+                }
+            }
+        }
+        if moved {
+            report.reclaimed += 1;
+        }
+    }
+    if report.reclaimed > 0 {
+        for dir in [&new, &cur] {
+            if let Err(err) = fsync_dir(dir) {
+                report.record_failure(dir, "fsync", &err);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Moves a message out of the delivery path. Returns whether it landed: a
 /// rename that failed (a full disk, `corrupt/` gone) must not look clean.
 fn quarantine(root: &Path, message: &Path, id: &str) -> bool {
@@ -1256,6 +1450,8 @@ mod tests {
             smtputf8: false,
             sha256: String::new(),
             size: 0,
+            forwarded_from: None,
+            forward_hops: 0,
         }
     }
 
@@ -1877,12 +2073,17 @@ mod tests {
             .filter(|event| event.kind == FsyncKind::Dir)
             .map(|event| (event.op, event.dir.as_deref()))
             .collect();
+        // A claim is a move *between* two directories, so it syncs both: the
+        // receives, then the source. The order is the durability half of the
+        // claim contract (the message is in `cur/` on the medium before it
+        // leaves `new/` there), so it is asserted rather than counted.
         assert_eq!(
             dirs,
             vec![
                 (FsyncOp::Commit, Some("new")),
-                (FsyncOp::Claim, Some("new")),
                 (FsyncOp::Claim, Some("cur")),
+                (FsyncOp::Claim, Some("cur")),
+                (FsyncOp::Claim, Some("new")),
                 (FsyncOp::Remove, Some("cur")),
             ],
             "each operation's directory syncs carry their own label"
