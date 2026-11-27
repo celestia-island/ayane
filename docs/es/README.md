@@ -1,6 +1,6 @@
 ---
 title: "Ayane"
-description: "El servicio de correo que opera Celestia — plano de control, webmail y capa de protección sobre una pila Postfix/Dovecot probada."
+description: "El servicio de correo que opera Celestia — su propio motor SMTP, una ruta de lectura maildir y un plano de control."
 ---
 
 <div align="center">
@@ -10,25 +10,25 @@ description: "El servicio de correo que opera Celestia — plano de control, web
 <h1 align="center">Ayane</h1>
 
 <div align="center">
-  <strong>El servicio de correo que opera Celestia — plano de control, webmail y capa de protección sobre una pila Postfix/Dovecot probada</strong>
+  <strong>El servicio de correo que opera Celestia — su propio motor SMTP, una ruta de lectura maildir y un plano de control</strong>
 </div>
 
 <br />
 
-> **Estado: en producción.** El plano de control, el webmail renderizado, la capa de
-> protección y el inicio de sesión con Celestia ID funcionan en el entorno de producción
-> (`mail.acgsyzx.me`); el motor de correo (Postfix / Dovecot / rspamd / ClamAV) está
-> desplegado con DKIM, SPF y DMARC. El SMTP entrante en el puerto 25 está probado y funciona,
-> y rspamd rechaza el spam en la entrada; el correo saliente hacia los grandes proveedores
-> tiene límite de velocidad allí (el PTR está activo y Postfix reintenta).
+> **Estado: en producción.** El plano de control, el webmail renderizado y el inicio de
+> sesión con Celestia ID funcionan en el entorno de producción (`mail.acgsyzx.me`). El motor
+> de correo es código propio de este repositorio: `crates/smtpd` habla SMTP de entrada y de
+> envío, verifica SPF/DKIM/ARC/DMARC, entrega en maildirs y envía el correo de otros dominios
+> por MX con firma DKIM. El webmail lee esos mismos maildirs directamente: ya no hay servidor
+> IMAP en la pila ni Dovecot que configurar.
 
 ## Por qué existe
 
 El correo autoalojado es un problema resuelto en la capa del *motor* y sin resolver en la
 capa de la *organización*: buzones compartidos, catch-all con política de permitidos y
 denegados, cuarentena, renderizado seguro, un asistente de DNS que un operador pueda seguir
-de verdad y una superficie para agentes. Ayane construye esa capa y deja el SMTP, el IMAP y
-el almacenamiento en manos de demonios que llevan décadas en producción.
+de verdad y una superficie para agentes. Ayane construye esa capa y habla SMTP y el formato
+maildir por sí mismo, en vez de configurar el demonio de otro.
 
 ## El nombre
 
@@ -51,55 +51,44 @@ gafas de montura roja.
 flowchart LR
   subgraph Internet
     Peer[Remote MTA]
-    Relay[Relay / ingress host]
   end
-  subgraph Engine[Engine — separate processes, no copyleft in this crate]
-    PF[Postfix<br/>MTA · submission]
-    DC[Dovecot + Pigeonhole<br/>IMAP · LMTP · Sieve]
-    RS[rspamd<br/>SPF · DKIM · DMARC · ARC · spam]
-    AV[ClamAV<br/>antivirus]
-    VK[Valkey<br/>rspamd state]
-    PG[(PostgreSQL<br/>control-plane authority)]
-    PF --> DC
-    PF --> RS
-    RS --> AV
-    RS --> VK
-    PF --> PG
-    DC --> PG
-  end
-  subgraph Ayane[ayane — this repository]
+  subgraph Ayane[ayane — one process when AYANE_MAIL_ENABLED=1]
+    LSN[smtpd listeners<br/>inbound · submission]
+    VER[verify<br/>SPF · DKIM · ARC · DMARC]
+    Q[(spool<br/>crash-safe queue)]
+    DEL[delivery<br/>retry · bounce · forward]
+    OUT[outbound<br/>MX · STARTTLS · DKIM sign]
+    MD[(maildirs<br/>new · cur · tmp)]
     API[control plane<br/>domains · mailboxes · policy · audit]
-    WEB[webmail API<br/>safe rendering · image proxy]
-    MCP[MCP surface]
-    WIZ[deployment & DNS wizard]
+    WEB[webmail RPC<br/>mail.list · mail.read · mail.send]
   end
-  Peer --> PF
-  PF --> Relay
-  API -->|renders config · reloads| Engine
-  WEB -->|IMAP · submission| Engine
-  MCP --> API
-  WIZ --> API
+  Peer --> LSN
+  LSN --> VER
+  VER --> Q
+  Q --> DEL
+  DEL --> MD
+  DEL --> OUT
+  OUT --> Peer
+  WEB -->|reads and renames| MD
+  WEB -->|stages a send| Q
+  API -->|writes the routing snapshot| DEL
 ```
 
 ## Motores y licencias
 
-Ayane no contiene código de protocolo. La pila en ejecución se compone de procesos
-independientes, cada uno bajo una licencia que se puede operar y redistribuir sin tocar la
-licencia de este repositorio:
+El motor de correo es código propio de este repositorio (SySL 1.0). Todo lo copyleft queda
+fuera del crate:
 
 | Componente | Función | Licencia | Frontera |
 |---|---|---|---|
-| Postfix | MTA, submission (587) | IPL-1.0 / EPL-2.0 | proceso aparte |
-| Dovecot + Pigeonhole | IMAP, LMTP, Sieve, ACL | LGPL-2.1 | proceso aparte |
-| rspamd | spam, DKIM/SPF/DMARC/ARC, milter | Apache-2.0 | proceso aparte |
-| ClamAV | antivirus (lo dirige rspamd) | GPL-2.0 | proceso aparte |
-| Valkey | estadísticas y límites de velocidad de rspamd | BSD-3-Clause | proceso aparte |
-| PostgreSQL | autoridad del plano de control | PostgreSQL Licence | biblioteca |
+| `ayane-smtpd` | SMTP de entrada/salida, verificación, cola, entrega, maildir | SySL 1.0 | este crate |
+| `ayane-engine` | renderizadores deterministas de las configuraciones retiradas de Postfix/Dovecot | SySL 1.0 | este crate |
+| maildir | el formato de buzón en disco (`new`/`cur`/`tmp` por carpeta) | — | una disposición de archivos |
 
-Deliberadamente **no** se usan: Stalwart (AGPL-3.0), mailcow (GPL-3.0, incluye SOGo en
-AGPL-3.0), Roundcube / SnappyMail (el webmail es nuestro) ni `acme.sh` (GPL-3.0 — el ACME
-se hace en Rust con `instant-acme`, Apache-2.0). La lista de permitidos de `cargo deny` en
-`deny.toml` hace cumplir la parte de dependencias de esta regla.
+Deliberadamente **no** se usan: Stalwart (AGPL-3.0), mailcow (GPL-3.0, incluye SOGo
+AGPL-3.0), Roundcube / SnappyMail (el webmail es nuestro) ni `acme.sh`
+(GPL-3.0 — ACME se hace en Rust con `instant-acme`, Apache-2.0). La lista permitida de
+`cargo deny` en `deny.toml` impone el lado de dependencias de esta regla.
 
 ## Estructura del repositorio
 
@@ -108,7 +97,8 @@ ayane/
   crates/
     proto/    wire types + validation (no I/O)
     mail/     routing, recipient policy, MIME construction (lettre, client only)
-    engine/   deterministic renderers for Postfix / Dovecot / rspamd config
+    engine/   deterministic renderers (the retired Postfix / Dovecot configs)
+    smtpd/    the mail engine: SMTP, verification, queue, delivery, maildir reader
     core/     HTTP surface (`ayane` binary)
   deploy/     compose topology, parameter table, Stage-0 verification checklist
   docs/      user-facing documentation
@@ -138,9 +128,9 @@ valores reales.
 - **Stage 0** — esqueleto del espacio de trabajo, renderizadores de configuración,
   superficie de salud, tabla de parámetros de despliegue y la lista de verificación de los
   motores.
-- **Stage 1** — compose de los motores (Postfix/Dovecot/rspamd/ClamAV/Valkey) y el plano
-  de control: dominios, cuentas, alias, buzones compartidos, política catch-all, auditoría
-  y el bucle de recarga de la configuración renderizada.
+- **Stage 1** — el motor de correo (SMTP entrante, verificación, cola, entrega, saliente)
+  y el plano de control: dominios, cuentas, alias, buzones compartidos, política catch-all,
+  auditoría y el bucle de recarga.
 - **Stage 2** — API e interfaz de webmail sobre hikari: renderizado seguro, proxy de
   imágenes en el servidor, hash de los adjuntos, vista previa en caja de arena.
 - **Stage 3** — más profundidad en la protección: heurísticas de phishing, flujo de

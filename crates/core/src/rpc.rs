@@ -24,7 +24,6 @@
 
 use serde_json::{json, Value};
 
-use ayane_mail::client::{Imap, MarkSeen, Submission};
 use ayane_store::StoredState;
 
 use kirino::auth::identity::external::ExternalIdentityStore;
@@ -266,8 +265,11 @@ fn mailbox_locked() -> AppError {
     )
 }
 
-/// Authenticate, then run a mail method with the session. The session must
-/// be a mailbox session (admin sessions have no IMAP password).
+/// Authenticate, then run a mail method with the session. The session must be
+/// a mailbox session — one that has proven the account's mailbox password, at
+/// login or through the unlock card. The password itself is not consulted
+/// here: the read path opens files, and there is nobody left to present it
+/// to.
 async fn mail_route<F, Fut>(
     app: &AppState,
     sessions: &SessionStore,
@@ -285,9 +287,29 @@ where
     };
     // MUT:mail-locked — a provider-minted session owes the mailbox password;
     // nothing that opens the mailbox may run before it is proven.
+    //
+    // This is the ONLY factor the mail methods check themselves, and it is
+    // the one that matters: `mailbox_locked()` is false only after
+    // `session.unlockMailbox` verified the account's password (`needs_mailbox_
+    // password` starts true for a provider-minted session and is cleared by
+    // that one call). The IMAP era additionally re-proved the password on
+    // every connection, because Dovecot asked; the maildir reader has nobody
+    // to ask, so the proof stands where it was made — at login or at the
+    // unlock card — and not on each request. A session whose password is
+    // changed afterwards keeps reading until its TTL, which is the same rule
+    // every other authenticated surface here already follows.
     if session.mailbox_locked() {
         return RpcOutcome::App(mailbox_locked());
     }
+    // An admin-token session is **not** a mailbox session. It is minted with
+    // the synthetic address `admin@localhost` and no password
+    // (`SessionStore::admin_login`), and `mailbox_locked()` is false for it
+    // because it never owed a mailbox password at all. Without this check it
+    // would pass the gate above and reach a reader rooted at
+    // `admin@localhost`'s maildir — and `admin.audit.run`, which reads the
+    // session's own address, would be reading whatever that resolved to.
+    // The mail methods are the mailbox's, so they are the account's: the
+    // admin surface is `admin.*`.
     if session.password.is_none() {
         return RpcOutcome::App(AppError::new(
             "Session.Required",
@@ -649,45 +671,74 @@ fn required(params: &Value, key: &str) -> Result<String, AppError> {
         .ok_or_else(|| AppError::new("Session.MalformedParams", format!("{key} is required")))
 }
 
-// ── mail methods ──────────────────────────────────────────────────────────
+// ── mail methods ─────────────────────────────────────────────────────────
 
-fn imap_of(app: &AppState) -> Result<Imap, AppError> {
-    app.config
-        .imap
-        .parse()
-        .map(Imap::new)
-        .map_err(|e| AppError::new("Mail.ImapUnavailable", format!("{}: {e}", app.config.imap)))
+/// The mailbox reader every mail method goes through.
+///
+/// The webmail used to be an IMAP client of Dovecot; the engine writes the
+/// maildirs itself now, so the read path is a walk over `mail_root` and there
+/// is no connection, no login and no session password involved. The reader is
+/// a root path and nothing else — its append sequence is the process's, not
+/// the instance's — so building one per request costs nothing.
+fn reader_of(app: &AppState) -> ayane_smtpd::MaildirReader {
+    ayane_smtpd::MaildirReader::new(app.config.mail.mail_root.clone())
 }
 
-fn submission_of(app: &AppState) -> Result<Submission, AppError> {
-    app.config
-        .submission
-        .parse()
-        .map(Submission::new)
-        .map_err(|e| {
-            AppError::new(
-                "Mail.SubmissionUnavailable",
-                format!("{}: {e}", app.config.submission),
-            )
-        })
+/// Run a blocking maildir operation off the reactor.
+///
+/// The reader is ordinary file I/O — `readdir`, `open`, `read`, `rename` —
+/// and a handler that runs it inline would block one of the reactor's worker
+/// threads for as long as the mount takes. On a healthy local disk that is
+/// microseconds; on a stalled NFS mount it is unbounded, and a handful of
+/// such requests is enough to make the whole control plane unresponsive.
+/// `spawn_blocking` moves each one to the blocking pool, which is what it is
+/// for.
+///
+/// It bounds *what a request occupies*, not *how long it waits*: a blocking
+/// task cannot be cancelled, so a genuinely hung mount still pins its pool
+/// thread until the kernel gives up. That is the reactor's protection, not an
+/// I/O timeout — a mount that never answers needs the mount fixed, and the
+/// pool grows rather than blocking the whole runtime while it waits.
+async fn blocking<T, F>(work: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(joined) => Err(AppError::new(
+            "Mail.StorageFailed",
+            format!("the maildir task did not finish: {joined}"),
+        )),
+    }
+}
+
+/// A [`ayane_smtpd::ReaderError`] as the RPC error the webui sees.
+fn reader_error(error: ayane_smtpd::ReaderError) -> AppError {
+    let path = match &error {
+        ayane_smtpd::ReaderError::Missing { .. } => "Mail.NotFound",
+        ayane_smtpd::ReaderError::BadFolder(_)
+        | ayane_smtpd::ReaderError::BadMessageId(_)
+        | ayane_smtpd::ReaderError::BadAddress(_) => "Mail.MalformedParams",
+        ayane_smtpd::ReaderError::Unparsable(_) => "Mail.Unparsable",
+        ayane_smtpd::ReaderError::NameTaken(_, _) => "Mail.Conflict",
+        ayane_smtpd::ReaderError::Io { .. } => "Mail.StorageFailed",
+    };
+    AppError::new(path, error.to_string())
 }
 
 async fn mail_list(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
-    let mailbox = params
-        .get("mailbox")
-        .and_then(Value::as_str)
-        .unwrap_or("INBOX")
-        .to_owned();
+    let mailbox = mailbox_of(&params, ayane_smtpd::INBOX_FOLDER);
     let limit = params
         .get("limit")
         .and_then(Value::as_u64)
         .unwrap_or(50)
         .clamp(1, 200) as usize;
-    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
-    let listing = imap_of(&app)?
-        .list(identity.as_str(), password.as_str(), &mailbox, limit)
-        .await
-        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
+    let identity = read_identity(&app, &session, identity_of(&params))?;
+    let reader = reader_of(&app);
+    let folder = mailbox.clone();
+    let listing =
+        blocking(move || reader.list(&identity, &folder, limit).map_err(reader_error)).await?;
     Ok(json!({
         "mailbox": mailbox,
         "total": listing.total,
@@ -697,36 +748,50 @@ async fn mail_list(app: AppState, session: Session, params: Value) -> Result<Val
 }
 
 async fn mail_read(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
-    let uid = params
-        .get("uid")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| AppError::new("Mail.MalformedParams", "uid is required"))?
-        as u32;
-    let mailbox = params
-        .get("mailbox")
-        .and_then(Value::as_str)
-        .unwrap_or("INBOX")
-        .to_owned();
-    let mark_seen = if params.get("markSeen").and_then(Value::as_bool) == Some(false) {
-        MarkSeen::No
-    } else {
-        MarkSeen::Yes
-    };
-    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
-    let raw = imap_of(&app)?
-        .fetch_raw(
-            identity.as_str(),
-            password.as_str(),
-            &mailbox,
-            uid,
-            mark_seen,
-        )
-        .await
-        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
-    let parsed = ayane_mail::mime::parse(&raw)
-        .ok_or_else(|| AppError::new("Mail.Unparsable", "the message could not be parsed"))?;
-    let links = ayane_mail::phishing::analyze(parsed.text.as_deref(), parsed.html.as_deref());
-    Ok(json!({ "uid": uid, "mailbox": mailbox, "message": parsed, "links": links }))
+    let id = message_id_of(&params)?;
+    let mailbox = mailbox_of(&params, ayane_smtpd::INBOX_FOLDER);
+    let mark_seen = params.get("markSeen").and_then(Value::as_bool) != Some(false);
+    let identity = read_identity(&app, &session, identity_of(&params))?;
+    let reader = reader_of(&app);
+    // Opening and marking read are one blocking unit: the second is a rename
+    // of the file the first just found, so separating them would let another
+    // process move it in between and turn "mark read" into a `NotFound`.
+    let folder = mailbox.clone();
+    let (id, flags, message) = blocking(move || {
+        let opened = reader.read(&identity, &folder, &id).map_err(reader_error)?;
+        // Marking read is part of what `mail.read` was asked to do, so a
+        // failure to rename is reported rather than swallowed: answering with
+        // the old name and `seen: false` would tell the reader their message
+        // was marked when the file still says otherwise.
+        if mark_seen && !opened.flags.seen {
+            let renamed = reader
+                .set_flags(
+                    &identity,
+                    &folder,
+                    &opened.id,
+                    ayane_smtpd::FlagChange {
+                        seen: Some(true),
+                        ..ayane_smtpd::FlagChange::default()
+                    },
+                )
+                .map_err(reader_error)?;
+            Ok((renamed.to, renamed.flags, opened.message))
+        } else {
+            Ok((opened.id, opened.flags, opened.message))
+        }
+    })
+    .await?;
+    let links = ayane_mail::phishing::analyze(message.text.as_deref(), message.html.as_deref());
+    Ok(json!({
+        "uid": id,
+        "mailbox": mailbox,
+        "flags": {
+            "seen": flags.seen,
+            "flagged": flags.flagged,
+        },
+        "message": message,
+        "links": links,
+    }))
 }
 
 async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
@@ -743,7 +808,6 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
         .to_owned();
     let to = ayane_proto::Address::parse(&to)
         .map_err(|e| AppError::new("Mail.BadRecipient", e.to_string()))?;
-    let password = session.password.as_deref().expect("checked at route");
 
     // Send identity: the session's own address, or a shared mailbox this
     // account belongs to (the From picker's 公共信箱 entries).
@@ -760,12 +824,201 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
     // The header carries whatever the user chose; `MAIL FROM` carries the
     // address that exists, so SPF, DKIM alignment and bounces stay with the
     // mailbox (lettre would otherwise derive the envelope from the From
-    // header).
+    // header). A shared mailbox's From is the only case where the two differ
+    // in *identity* rather than in spelling, and there the account is still
+    // the party that authenticated.
     let envelope_from = session.address.clone();
+    let attachments = attachments_of(&params)?;
 
-    // Attachments arrive base64-encoded; the size cap keeps one request
-    // from carrying an unreasonable payload (the engine queue handles the
-    // real limits).
+    let message = if attachments.is_empty()
+        && params.get("format").and_then(Value::as_str) != Some("markdown")
+    {
+        ayane_mail::compose::build_plain_message_as(
+            &from_address,
+            &from_name,
+            &envelope_from,
+            &to,
+            &subject,
+            &body,
+        )
+        .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
+    } else {
+        let markdown = params.get("format").and_then(Value::as_str) == Some("markdown");
+        ayane_mail::compose::build_composed_message_as(
+            &from_address,
+            &from_name,
+            &envelope_from,
+            &to,
+            &subject,
+            &body,
+            &attachments,
+            markdown,
+        )
+        .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
+    };
+    // The sender rules run before anything is written, exactly where the
+    // submission listener runs them for an SMTP client: a deny-listed sender
+    // is refused at the door, not queued and then silently discarded by the
+    // router. A webmail send must not be a hole in the rules the operator
+    // wrote. Only the deny list is consulted — that is the rule that judges a
+    // *sender*, which is what this process can decide on its own; whether the
+    // recipient is hosted belongs to the delivery layer, which knows what
+    // leaves over MX.
+    // Both addresses are judged. `envelope_from` is what SPF, DKIM alignment
+    // and bounces ride on; `from_address` is what the recipient *reads*, and
+    // it can be a shared mailbox the sender is a member of. A rule written
+    // against the address the operator denied has to stop that address
+    // appearing on the wire — judging only the envelope would leave the
+    // header free to say what the rule forbids.
+    let denied = |address: &ayane_proto::Address| {
+        stored
+            .desired
+            .policy
+            .denylist
+            .iter()
+            .any(|rule| rule.matches(address))
+    };
+    if denied(&envelope_from) || denied(&from_address) {
+        return Err(AppError::new(
+            "Mail.Rejected",
+            "the policy refuses this sender",
+        ));
+    }
+    let raw = ayane_mail::compose::render(&message);
+    // The message enters the engine's own queue the way a message from any
+    // other client does — one `Received:` field, one envelope — and the
+    // delivery consumer decides what is local and what leaves over MX. The
+    // webmail is a submission client of this process, not of a Postfix
+    // listener somebody has to keep running beside it.
+    // Queuing and the two maildir writes are one blocking unit: they are
+    // filesystem work (a spool `fsync` and two renames), and the reactor must
+    // not wait on them.
+    let draft = params
+        .get("draftUid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned);
+    let sent_identity = from_address.clone();
+    let recipient = to.clone();
+    let (session, app2) = (session.clone(), app.clone());
+    blocking(move || {
+        submit_locally(&app2, &session, &from_address, &recipient, &raw)?;
+        let reader = reader_of(&app2);
+        // The Sent copy belongs in the mailbox the message was sent *as* —
+        // a shared mailbox the sender is a member of files its own mail.
+        // Best effort: a failure must not fail a send that is already
+        // queued, so the answer stays `queued: true` and the failure is
+        // logged, because "sent with no copy in Sent" is a thing an operator
+        // has to be able to find.
+        if let Err(error) = reader.append(
+            &sent_identity,
+            ayane_smtpd::SENT_FOLDER,
+            &raw,
+            ayane_smtpd::Flags {
+                seen: true,
+                ..ayane_smtpd::Flags::default()
+            },
+        ) {
+            tracing::warn!(%error, "the Sent copy could not be written");
+        }
+        // Sending a DRAFT retires the draft copy (best effort, like the Sent
+        // copy — a failed cleanup must not fail an already-queued send). The
+        // draft lives in whatever maildir `mail.saveDraft` wrote it to: the
+        // identity the composer was on, not always the session's own.
+        if let Some(draft) = draft {
+            match read_identity(&app2, &session, identity_of(&params)) {
+                Ok(identity) => {
+                    if let Err(error) = reader.purge(&identity, ayane_smtpd::DRAFTS, &draft) {
+                        tracing::warn!(%error, draft, "the sent draft could not be retired");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error.path, draft, "the draft's identity could not be resolved");
+                }
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(json!({ "queued": true, "to": to.as_str() }))
+}
+
+/// Stage a composed message in the engine's spool as one the submission
+/// surface authenticated.
+///
+/// The envelope is the shape the delivery consumer
+/// ([`crate::engine`]'s delivery loop) expects: a reverse-path of the account,
+/// the recipients the headers name, and one trace field recording that this
+/// process composed the message for an authenticated session. Nothing is
+/// written into a maildir here — the consumer is the only writer, so a send
+/// and a delivery cannot disagree about a mailbox's layout.
+fn submit_locally(
+    app: &AppState,
+    session: &Session,
+    from: &ayane_proto::Address,
+    to: &ayane_proto::Address,
+    raw: &[u8],
+) -> Result<(), AppError> {
+    let mail = &app.config.mail;
+    let spool = ayane_smtpd::Spool::open(&mail.spool_root)
+        .map_err(|e| AppError::new("Mail.StorageFailed", e.to_string()))?;
+    let id = spool.next_id();
+    // The engine's own clock, not a calendar library: `received_at` is RFC
+    // 3339 and the `Received:` below is RFC 5322, both rendered from one
+    // reading of the same clock.
+    let now_epoch = ayane_smtpd::server::received_now_epoch();
+    let received_at = ayane_smtpd::server::format_rfc3339(now_epoch);
+    let mut envelope = ayane_smtpd::Envelope::placeholder(&id, &mail.hostname);
+    envelope.received_at.clone_from(&received_at);
+    envelope.mail_from = from.as_str().to_owned();
+    envelope.mail_from_wire = format!("<{}>", from.as_str());
+    // No `helo` and no `remote_ip`: this message did not arrive over a
+    // connection, so there is no peer name to record and no host to name.
+    // The placeholder seeded `helo` with our own name and would record
+    // `127.0.0.1` as a peer that never connected; both are cleared here.
+    envelope.helo = String::new();
+    envelope.remote_ip = String::new();
+    envelope.authenticated = Some(session.address.as_str().to_owned());
+    envelope.recipients = vec![to.as_str().to_owned()];
+    // RFC 5321 §4.4 allows a trace field for a submission; the `with`
+    // protocol token is `ESMTPA` only when SMTP authenticated, which is not
+    // what happened here. `ayane` with the session's own address says what
+    // did: a local submission from an authenticated session.
+    envelope.received = format!(
+        "from {} by {} (ayane submission) id {}; {}",
+        session.address.as_str(),
+        mail.hostname,
+        id,
+        received_at
+    );
+    // This message was not verified: it was composed here, by a session this
+    // process authenticated, and no SPF/DKIM/DMARC check applies to a
+    // locally-originated message whose sender is the account itself.
+    // Claiming `spf=pass … dkim=pass … dmarc=pass` here would be a forged
+    // verdict — a statement about checks nobody ran — so the summary says
+    // exactly what happened.
+    envelope.auth_summary = format!(
+        "authenticated=submission identity={} (locally composed; no inbound verification ran)",
+        session.address.as_str()
+    );
+    let mut staged = spool
+        .stage(&id, envelope)
+        .map_err(|e| AppError::new("Mail.StorageFailed", e.to_string()))?;
+    staged
+        .write(raw)
+        .map_err(|e| AppError::new("Mail.StorageFailed", e.to_string()))?;
+    let received = format!("Received: {}\r\n", staged.envelope().received);
+    staged
+        .commit_with_prepend(received.as_bytes())
+        .map_err(|e| AppError::new("Mail.StorageFailed", e.to_string()))?;
+    Ok(())
+}
+
+/// The composer's attachments, base64-decoded, with the size caps one
+/// request may carry (the engine queue enforces the real limits).
+fn attachments_of(
+    params: &Value,
+) -> Result<Vec<ayane_mail::compose::OutgoingAttachment>, AppError> {
     use base64::Engine as _;
     let mut attachments = Vec::new();
     let mut total_attachment_bytes = 0usize;
@@ -810,74 +1063,12 @@ async fn mail_send(app: AppState, session: Session, params: Value) -> Result<Val
             });
         }
     }
-
-    let message = if attachments.is_empty()
-        && params.get("format").and_then(Value::as_str) != Some("markdown")
-    {
-        ayane_mail::compose::build_plain_message_as(
-            &from_address,
-            &from_name,
-            &envelope_from,
-            &to,
-            &subject,
-            &body,
-        )
-        .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
-    } else {
-        let markdown = params.get("format").and_then(Value::as_str) == Some("markdown");
-        ayane_mail::compose::build_composed_message_as(
-            &from_address,
-            &from_name,
-            &envelope_from,
-            &to,
-            &subject,
-            &body,
-            &attachments,
-            markdown,
-        )
-        .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?
-    };
-    // SASL authenticates as the LOGIN account (its password proves it);
-    // the chosen identity only becomes the envelope sender and the From
-    // header. Authenticating as the shared address would need the machine
-    // credential, which Postfix SASL does not know about.
-    submission_of(&app)?
-        .send(session.address.as_str(), password, message.clone())
-        .await
-        .map_err(|e| AppError::new("Mail.SubmissionFailed", e.to_string()))?;
-    // Best-effort Sent copy; a failure to append must not fail the send.
-    if let Ok(imap) = imap_of(&app) {
-        let _ = imap
-            .append_to_mailbox(
-                session.address.as_str(),
-                password,
-                "Sent",
-                Some("\\Seen"),
-                &ayane_mail::compose::render(&message),
-            )
-            .await;
-    }
-    // Sending a DRAFT retires the draft copy (best effort, like the Sent
-    // copy — a failed cleanup must not fail an already-queued send).
-    if let Some(draft_uid) = params.get("draftUid").and_then(Value::as_u64) {
-        if let Ok(imap) = imap_of(&app) {
-            let _ = imap
-                .purge_message(
-                    session.address.as_str(),
-                    password,
-                    "Drafts",
-                    draft_uid as u32,
-                )
-                .await;
-        }
-    }
-    Ok(json!({ "queued": true, "to": to.as_str() }))
+    Ok(attachments)
 }
 
 /// Save the composer's current state as a DRAFT: build the message with
-/// draft semantics (the recipient may be half-typed) and APPEND it to the
-/// Drafts mailbox, which is autocreated like every folder the webmail
-/// touches.
+/// draft semantics (the recipient may be half-typed) and append it to the
+/// Drafts folder, which is autocreated like every folder the webmail touches.
 async fn mail_save_draft(
     app: AppState,
     session: Session,
@@ -898,22 +1089,43 @@ async fn mail_save_draft(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let (identity, password, display) =
-        resolve_read_identity(&app, &session, identity_of(&params))?;
+    let (identity, display) = read_identity_with_display(&app, &session, identity_of(&params))?;
     let message =
         ayane_mail::compose::build_draft_message(&identity, &display, &to, &subject, &body)
             .map_err(|e| AppError::new("Mail.ComposerRejected", e.to_string()))?;
-    let imap = imap_of(&app)?;
-    imap.append_to_mailbox(
-        identity.as_str(),
-        password.as_str(),
-        "Drafts",
-        None,
-        &ayane_mail::compose::render(&message),
-    )
-    .await
-    .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
-    Ok(json!({ "saved": true }))
+    let reader = reader_of(&app);
+    // Saving a draft the composer was opened on replaces it: the old copy is
+    // removed and the new one appended. Without this, "save" on a continued
+    // draft leaves two, and the composer's own `draftUid` still names the
+    // first — so sending would retire the stale one and leave the newer copy
+    // behind. The removal runs first and its failure is not fatal (an append
+    // that then succeeds is still the user's draft saved; a duplicate is the
+    // failure mode worth a log line, not a lost save).
+    let previous = params
+        .get("draftUid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned);
+    let raw = ayane_mail::compose::render(&message);
+    let id = blocking(move || {
+        if let Some(previous) = previous {
+            if let Err(error) = reader.purge(&identity, ayane_smtpd::DRAFTS, &previous) {
+                tracing::warn!(%error, draft = previous, "the previous draft could not be retired");
+            }
+        }
+        // A draft is unseen until the user opens it (Dovecot's rule for a
+        // flagless append), and it carries no `S`.
+        reader
+            .append(
+                &identity,
+                ayane_smtpd::DRAFTS,
+                &raw,
+                ayane_smtpd::Flags::default(),
+            )
+            .map_err(reader_error)
+    })
+    .await?;
+    Ok(json!({ "saved": true, "uid": id }))
 }
 
 /// The 已加星标 roster: flagged messages across the user's real folders,
@@ -928,78 +1140,117 @@ async fn mail_list_starred(
         .and_then(Value::as_u64)
         .unwrap_or(50)
         .clamp(1, 200) as usize;
-    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
-    let rows = imap_of(&app)?
-        .list_flagged(
-            identity.as_str(),
-            password.as_str(),
-            &["INBOX", "Sent", "Drafts"],
-            limit,
-        )
-        .await
-        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
-    let total = rows.len() as u32;
-    Ok(json!({ "mailbox": "Starred", "total": total, "messages": rows }))
+    let identity = read_identity(&app, &session, identity_of(&params))?;
+    let reader = reader_of(&app);
+    let listing = blocking(move || {
+        reader
+            .list_flagged(&identity, &ayane_smtpd::STARRED_FOLDERS, limit)
+            .map_err(reader_error)
+    })
+    .await?;
+    // Same keys `mail.list` answers with, so the webui's one row shape fits
+    // both: `unread` is the starred rows nobody has opened yet, which is what
+    // the badge would show if the view had one.
+    let unread =
+        u32::try_from(listing.messages.iter().filter(|row| !row.seen).count()).unwrap_or(u32::MAX);
+    Ok(json!({
+        "mailbox": "Starred",
+        "total": listing.total,
+        "unread": unread,
+        "messages": listing.messages,
+    }))
 }
 
-/// Toggle the `\Flagged` (star) flag on one message.
+/// Toggle the `F` (star) flag on one message.
 async fn mail_star(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
-    let uid = uid_of(&params)?;
-    let mailbox = mailbox_of(&params, "INBOX");
+    let id = message_id_of(&params)?;
+    let mailbox = mailbox_of(&params, ayane_smtpd::INBOX_FOLDER);
     let starred = params.get("starred").and_then(Value::as_bool) != Some(false);
-    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
-    let op = if starred {
-        "+FLAGS.SILENT (\\Flagged)"
-    } else {
-        "-FLAGS.SILENT (\\Flagged)"
-    };
-    imap_of(&app)?
-        .store_flag(identity.as_str(), password.as_str(), &mailbox, uid, op)
-        .await
-        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
-    Ok(json!({ "ok": true, "starred": starred }))
+    let identity = read_identity(&app, &session, identity_of(&params))?;
+    let reader = reader_of(&app);
+    let renamed = blocking(move || {
+        reader
+            .set_flags(
+                &identity,
+                &mailbox,
+                &id,
+                ayane_smtpd::FlagChange {
+                    flagged: Some(starred),
+                    ..ayane_smtpd::FlagChange::default()
+                },
+            )
+            .map_err(reader_error)
+    })
+    .await?;
+    // Starring renames the file (the `F` goes into its suffix), so the answer
+    // carries the name it has afterwards: the caller's next action on this
+    // row has to name the file that exists. Setting the flag that is already
+    // set renames nothing, and then the two are the same string — which is
+    // also a correct answer, so no assertion compares them.
+    Ok(json!({ "ok": true, "starred": starred, "uid": renamed.to }))
 }
 
-/// Delete one message: MOVE it to the auto-created Trash mailbox. Refused
-/// for messages already in Trash — permanent deletion there is `mail.purge`
+/// Delete one message: move it to the auto-created Trash folder. Refused for
+/// messages already in Trash — permanent deletion there is `mail.purge`
 /// behind a confirm.
 async fn mail_trash(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
-    let uid = uid_of(&params)?;
-    let mailbox = mailbox_of(&params, "INBOX");
-    if mailbox == "Trash" {
+    let id = message_id_of(&params)?;
+    let mailbox = mailbox_of(&params, ayane_smtpd::INBOX_FOLDER);
+    if mailbox.eq_ignore_ascii_case(ayane_smtpd::TRASH_FOLDER) {
         return Err(AppError::new(
             "Mail.MalformedParams",
             "already in Trash: use mail.purge",
         ));
     }
-    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
-    imap_of(&app)?
-        .move_to_mailbox(identity.as_str(), password.as_str(), &mailbox, uid, "Trash")
-        .await
-        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
-    Ok(json!({ "ok": true }))
+    let identity = read_identity(&app, &session, identity_of(&params))?;
+    let reader = reader_of(&app);
+    let moved = blocking(move || {
+        reader
+            .move_to(&identity, &mailbox, &id, ayane_smtpd::TRASH_FOLDER)
+            .map_err(reader_error)
+    })
+    .await?;
+    Ok(json!({ "ok": true, "uid": moved.to, "mailbox": ayane_smtpd::TRASH_FOLDER }))
 }
 
-/// Permanently delete one message from Trash (STORE \Deleted + EXPUNGE —
-/// only this message carries the flag).
+/// Permanently delete one message from the folder the caller names.
+///
+/// `mail.trash` is the two-step delete's first half and refuses to run on a
+/// message already in Trash; this is the second half, and it deletes from
+/// whatever folder it is given. The webui only ever calls it from the Trash
+/// view (behind a confirm), but the handler does not assume that: a caller
+/// that names INBOX gets an INBOX message destroyed, which is what it asked
+/// for. The folder is required (never defaulted) so that a call cannot reach
+/// a folder it did not name.
 async fn mail_purge(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
-    let uid = uid_of(&params)?;
-    let mailbox = mailbox_of(&params, "Trash");
-    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
-    imap_of(&app)?
-        .purge_message(identity.as_str(), password.as_str(), &mailbox, uid)
-        .await
-        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
+    let id = message_id_of(&params)?;
+    // The folder is required, not defaulted: a `mail.purge {uid}` with the
+    // mailbox left out used to unlink whatever that id named, in whichever
+    // folder it named — a permanent delete one forgotten field away from the
+    // INBOX. An empty value is the webui's "not resolved yet", so it is
+    // refused rather than filled in.
+    let mailbox = params
+        .get("mailbox")
+        .and_then(Value::as_str)
+        .filter(|mailbox| !mailbox.trim().is_empty())
+        .ok_or_else(|| AppError::new("Mail.MalformedParams", "mailbox is required"))?
+        .to_owned();
+    let identity = read_identity(&app, &session, identity_of(&params))?;
+    let reader = reader_of(&app);
+    blocking(move || reader.purge(&identity, &mailbox, &id).map_err(reader_error)).await?;
     Ok(json!({ "ok": true }))
 }
 
-/// The `uid` param (a required positive integer) as u32.
-fn uid_of(params: &Value) -> Result<u32, AppError> {
+/// The `uid` param: a message id, which in a maildir is the file name.
+///
+/// The field keeps its old name because the webui sends it; its value used to
+/// be an IMAP UID number and is now the file name (`<unique>:2,<flags>`).
+fn message_id_of(params: &Value) -> Result<String, AppError> {
     params
         .get("uid")
-        .and_then(Value::as_u64)
-        .filter(|v| *v > 0 && *v <= u32::MAX as u64)
-        .map(|v| v as u32)
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
         .ok_or_else(|| AppError::new("Mail.MalformedParams", "uid is required"))
 }
 
@@ -1073,24 +1324,44 @@ async fn mail_from_addresses(
     }))
 }
 
-/// Resolve the mailbox identity a mail operation runs against: the
-/// session's own address by default, or a shared mailbox the account is a
-/// member of (reading it logs into IMAP with the server-minted machine
-/// credential — the member never sees it).
+/// Resolve the mailbox identity a mail operation runs against: the session's
+/// own address by default, or a shared mailbox the account is a member of
+/// (公共信箱).
 ///
-/// Returns the address to open, the IMAP password to use and a display name.
+/// Membership in `state.shared` **is** the grant. The reader opens the
+/// shared address's maildir directly, so there is no second credential to
+/// present: the machine password the IMAP era minted for this lookup had no
+/// other consumer and is gone with it. [`read_identity`] is the same answer
+/// for the callers that do not need the display name.
+fn read_identity(
+    app: &AppState,
+    session: &Session,
+    requested: Option<&str>,
+) -> Result<ayane_proto::Address, AppError> {
+    resolve_read_identity(app, session, requested).map(|(address, _display)| address)
+}
+
+/// [`read_identity`] with the display name the composer shows in a draft's
+/// `From` field.
+fn read_identity_with_display(
+    app: &AppState,
+    session: &Session,
+    requested: Option<&str>,
+) -> Result<(ayane_proto::Address, String), AppError> {
+    resolve_read_identity(app, session, requested)
+}
+
 fn resolve_read_identity(
     app: &AppState,
     session: &Session,
     requested: Option<&str>,
-) -> Result<(ayane_proto::Address, String, String), AppError> {
+) -> Result<(ayane_proto::Address, String), AppError> {
     let own = session.address.clone();
-    let password = session.password.clone().unwrap_or_default();
     let Some(requested) = requested else {
-        return Ok((own, password, session.display_name.clone()));
+        return Ok((own, session.display_name.clone()));
     };
     if requested == own.as_str() {
-        return Ok((own, password, session.display_name.clone()));
+        return Ok((own, session.display_name.clone()));
     }
     let stored = app
         .store
@@ -1117,12 +1388,8 @@ fn resolve_read_identity(
             "that shared mailbox does not belong to this account",
         ));
     }
-    let shared_password = app
-        .store
-        .shared_imap_password(parsed.as_str())
-        .map_err(|e| AppError::new("Admin.StoreFailed", e.to_string()))?;
     let display = parsed.local().to_owned();
-    Ok((parsed, shared_password, display))
+    Ok((parsed, display))
 }
 
 /// Validate a requested send identity: the session's own address, a shared
@@ -1489,7 +1756,13 @@ fn policy_put(app: &AppState, params: Value) -> Result<Value, AppError> {
 /// One flagged message from an audit pass.
 #[derive(serde::Serialize)]
 struct AuditHit {
-    uid: u32,
+    /// The message id (the maildir file name) of a hit.
+    ///
+    /// The audit table does not render it today; it is here so a reply that
+    /// names a hit names the message it is about, which is what a follow-up
+    /// action would need.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uid: Option<String>,
     subject: Option<String>,
     from: Option<String>,
     /// The keyword that matched (keyword leg).
@@ -1540,67 +1813,61 @@ async fn audit_run(
     if session.mailbox_locked() {
         return Err(mailbox_locked());
     }
-    let password = session.password.as_deref().ok_or_else(|| {
-        AppError::new(
-            "Session.Required",
-            "the admin session has no mail credentials",
-        )
-    })?;
-
-    let listing = imap_of(app)?
-        .list(session.address.as_str(), password, "INBOX", limit)
-        .await
-        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
-
-    let mut hits: Vec<AuditHit> = Vec::new();
-    for row in &listing.messages {
-        let Ok(raw) = imap_of(app)?
-            .fetch_raw(
-                session.address.as_str(),
-                password,
-                "INBOX",
-                row.uid,
-                ayane_mail::client::MarkSeen::No,
+    // The whole scan is one blocking unit: the listing, then one open per
+    // row. Splitting it would cost a pool round-trip per message and still
+    // leave the parse on the reactor.
+    let reader = reader_of(app);
+    let address = session.address.clone();
+    let (mut hits, scanned): (Vec<AuditHit>, usize) = blocking(move || {
+        let listing = reader
+            .list(&address, ayane_smtpd::INBOX_FOLDER, limit)
+            .map_err(reader_error)?;
+        let mut hits: Vec<AuditHit> = Vec::new();
+        for row in &listing.messages {
+            // The audit is a reader: it never marks a message seen.
+            let Ok(opened) = reader.read(&address, ayane_smtpd::INBOX_FOLDER, &row.id) else {
+                continue;
+            };
+            let parsed = opened.message;
+            let haystack = format!(
+                "{}\n{}\n{}",
+                parsed.subject.as_deref().unwrap_or(""),
+                parsed.text.as_deref().unwrap_or(""),
+                parsed.html.as_deref().unwrap_or(""),
             )
-            .await
-        else {
-            continue;
-        };
-        let Some(parsed) = ayane_mail::mime::parse(&raw) else {
-            continue;
-        };
-        let haystack = format!(
-            "{}\n{}\n{}",
-            parsed.subject.as_deref().unwrap_or(""),
-            parsed.text.as_deref().unwrap_or(""),
-            parsed.html.as_deref().unwrap_or(""),
-        )
-        .to_ascii_lowercase();
-        if let Some(keyword) = keywords
-            .iter()
-            .find(|k| !k.is_empty() && haystack.contains(k.as_str()))
-        {
-            hits.push(AuditHit {
-                uid: row.uid,
-                subject: parsed.subject.clone(),
-                from: parsed.from.clone(),
-                keyword: Some(keyword.clone()),
-                snippet: parsed
-                    .text
-                    .as_deref()
-                    .unwrap_or("")
-                    .chars()
-                    .take(800)
-                    .collect(),
-                ai_verdict: None,
-            });
+            .to_ascii_lowercase();
+            if let Some(keyword) = keywords
+                .iter()
+                .find(|k| !k.is_empty() && haystack.contains(k.as_str()))
+            {
+                hits.push(AuditHit {
+                    uid: Some(opened.id),
+                    subject: parsed.subject.clone(),
+                    from: parsed.from.clone(),
+                    keyword: Some(keyword.clone()),
+                    snippet: parsed
+                        .text
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(800)
+                        .collect(),
+                    ai_verdict: None,
+                });
+            }
         }
-    }
+        // What the scan actually read: the page it asked for, not the
+        // folder's size. "Scanned 20 messages" has to mean 20 messages were
+        // opened and parsed — reporting the folder total would claim work
+        // that did not happen, and `limit` is exactly the bound that says so.
+        let opened = listing.messages.len();
+        Ok((hits, opened))
+    })
+    .await?;
 
     // The AI leg: arona classifies each keyword hit (cheaper than scanning
     // everything, and the keyword leg already names the suspects).
     let ai = &stored.desired.audit.ai;
-    let scanned = hits.len();
     if ai.enabled && !hits.is_empty() && !ai.endpoint.trim().is_empty() {
         let client = reqwest::Client::new();
         for hit in &mut hits {
@@ -1635,7 +1902,7 @@ async fn audit_run(
         }
     }
 
-    Ok(json!({ "scanned": listing.messages.len(), "flagged": scanned, "hits": hits }))
+    Ok(json!({ "scanned": scanned, "flagged": hits.len(), "hits": hits }))
 }
 
 // ── MCP surface configuration ─────────────────────────────────────────────
@@ -1684,31 +1951,32 @@ fn mcp_put(app: &AppState, params: Value) -> Result<Value, AppError> {
     })
 }
 
+/// Set or clear the `S` (seen) flag on one message.
+///
+/// `seen: false` reads as "mark unread" — the webui's menu sends the *new*
+/// state and a missing key means "mark read", which is what the old
+/// `Mail.MarkSeen` handler did and what every row menu still assumes.
 async fn mail_mark_seen(app: AppState, session: Session, params: Value) -> Result<Value, AppError> {
-    let uid = params
-        .get("uid")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| AppError::new("Mail.MalformedParams", "uid is required"))?
-        as u32;
-    let mailbox = params
-        .get("mailbox")
-        .and_then(Value::as_str)
-        .unwrap_or("INBOX")
-        .to_owned();
+    let id = message_id_of(&params)?;
+    let mailbox = mailbox_of(&params, ayane_smtpd::INBOX_FOLDER);
     let unseen = params.get("seen").and_then(Value::as_bool) == Some(false);
-    let (identity, password, _) = resolve_read_identity(&app, &session, identity_of(&params))?;
-    // Reuse fetch_raw with peek semantics; flag changes ride STORE via the
-    // same session shape (a dedicated store call keeps this honest).
-    let imap = imap_of(&app)?;
-    let op = if unseen {
-        "-FLAGS.SILENT (\\Seen)"
-    } else {
-        "+FLAGS.SILENT (\\Seen)"
-    };
-    imap.store_flag(identity.as_str(), password.as_str(), &mailbox, uid, op)
-        .await
-        .map_err(|e| AppError::new("Mail.ImapFailed", e.to_string()))?;
-    Ok(json!({ "ok": true }))
+    let identity = read_identity(&app, &session, identity_of(&params))?;
+    let reader = reader_of(&app);
+    let renamed = blocking(move || {
+        reader
+            .set_flags(
+                &identity,
+                &mailbox,
+                &id,
+                ayane_smtpd::FlagChange {
+                    seen: Some(!unseen),
+                    ..ayane_smtpd::FlagChange::default()
+                },
+            )
+            .map_err(reader_error)
+    })
+    .await?;
+    Ok(json!({ "ok": true, "seen": !unseen, "uid": renamed.to }))
 }
 
 // ── admin methods (mirroring the REST surface) ────────────────────────────

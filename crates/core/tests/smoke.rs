@@ -1,32 +1,26 @@
-//! End-to-end smoke: engine → control plane → submission → IMAP.
+//! Live smoke: the control plane's mail methods against a running instance.
 //!
-//! Ignored by default — it needs the full rig:
+//! Ignored by default — it drives a *running* deployment rather than a
+//! fixture:
 //!
 //! ```text
-//! just engine-up          # compose: postfix/dovecot/rspamd/valkey
-//! just serve &            # the control plane (sets AYANE_ADMIN_TOKEN)
+//! AYANE_MAIL_ENABLED=1 AYANE_MAIL_ROOT=… just serve &
 //! cargo test -p ayane --test smoke -- --ignored --nocapture
 //! ```
 //!
-//! Environment: `AYANE_API_URL` (default http://127.0.0.1:3023),
-//! `AYANE_ADMIN_TOKEN` (required), `AYANE_SUBMISSION`
-//! (default 127.0.0.1:30587), `AYANE_IMAP` (default 127.0.0.1:3043).
+//! Environment: `AYANE_API_URL` (default http://127.0.0.1:3023) and
+//! `AYANE_ADMIN_TOKEN` (required). Every assertion goes through the same
+//! JSON-RPC surface the webmail uses, so what this proves is what the
+//! browser gets: the read path over the deployment's own maildir, not a
+//! second copy of it.
+//!
+//! The account ids this test writes with are its own (`smoke-…@example.test`)
+//! and are created through the state API; the passwords are invented here and
+//! are not a credential of any deployment.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
-use ayane_mail::client::{Imap, Submission};
-use ayane_proto::Address;
-
 const DOMAIN: &str = "example.test";
-const ALICE: &str = "alice@example.test";
-const BOSS: &str = "boss@example.test";
-const INBOX: &str = "inbox@example.test";
-const PASSWORDS: [(&str, &str); 3] = [
-    (ALICE, "ayane-dev-pass-1"),
-    (BOSS, "ayane-dev-pass-2"),
-    (INBOX, "ayane-dev-pass-3"),
-];
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_owned())
@@ -39,26 +33,21 @@ async fn api() -> reqwest::Client {
         .expect("http client")
 }
 
-/// Push the smoke fixture. `variants` is the policy's address-variant switch
-/// table (all off when empty), so a step can turn a fold on and prove it there.
+/// Push a state whose fixture is the three addresses this test reads.
 async fn put_state(client: &reqwest::Client, variants: serde_json::Value) {
     let base =
         std::env::var("AYANE_API_URL").unwrap_or_else(|_| "http://127.0.0.1:3023".to_owned());
     let token = std::env::var("AYANE_ADMIN_TOKEN").expect("AYANE_ADMIN_TOKEN must be set");
     let body = serde_json::json!({
         "domains": [
-            {"name": DOMAIN, "catch_all": INBOX, "enabled": true}
+            {"name": DOMAIN, "catch_all": "inbox@example.test", "enabled": true}
         ],
-        "accounts": PASSWORDS.iter().map(|(address, password)| {
-            serde_json::json!({
-                "address": address,
-                "display_name": address.split('@').next().unwrap_or("account"),
-                "quota_bytes": 0,
-                "password": password
-            })
-        }).collect::<Vec<_>>(),
+        "accounts": [
+            {"address": "smoke@example.test", "display_name": "smoke", "quota_bytes": 0,
+             "password": "smoke-placeholder-pass"},
+        ],
         "aliases": [
-            {"source": format!("sales@{DOMAIN}"), "targets": [BOSS]}
+            {"source": format!("sales@{DOMAIN}"), "targets": ["smoke@example.test"]}
         ],
         "shared": [],
         "policy": {
@@ -96,115 +85,89 @@ async fn put_state(client: &reqwest::Client, variants: serde_json::Value) {
     );
 }
 
-fn submission() -> Submission {
-    Submission::new(
-        env_or("AYANE_SUBMISSION", "127.0.0.1:30587")
-            .parse::<SocketAddr>()
-            .expect("submission addr"),
-    )
-}
-
-fn imap() -> Imap {
-    Imap::new(
-        env_or("AYANE_IMAP", "127.0.0.1:3043")
-            .parse::<SocketAddr>()
-            .expect("imap addr"),
-    )
-}
-
-async fn send(alice_password: &str, to: &str, marker: &str) {
-    let from = Address::parse(ALICE).expect("from");
-    let to = Address::parse(to).expect("to");
-    let message = ayane_mail::compose::build_plain_message(
-        &from,
-        "ayane smoke",
-        &to,
-        &format!("[ayane-smoke] {marker}"),
-        &format!("Smoke message {marker}: delivered by the local engine.\n"),
-    )
-    .expect("message");
-    submission()
-        .send(ALICE, alice_password, message)
+/// One JSON-RPC call against the live instance's `/api/mcp` transport,
+/// answered verbatim (a caller that expects an error asserts on it).
+async fn rpc_raw(
+    client: &reqwest::Client,
+    token: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let base =
+        std::env::var("AYANE_API_URL").unwrap_or_else(|_| "http://127.0.0.1:3023".to_owned());
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    let response = client
+        .post(format!("{base}/api/mcp"))
+        .bearer_auth(token)
+        .json(&request)
+        .send()
         .await
-        .expect("submission accepted");
+        .expect("rpc");
+    response.json().await.expect("rpc json")
 }
 
-async fn wait_for(username: &str, password: &str, marker: &str, what: &str) {
+/// [`rpc_raw`] for the calls that must succeed.
+async fn rpc(
+    client: &reqwest::Client,
+    token: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let reply = rpc_raw(client, token, method, params).await;
+    assert!(reply.get("error").is_none(), "{method} failed: {reply}");
+    reply
+}
+
+/// The mailbox's listing, waiting for a message whose subject contains
+/// `marker` to arrive (the delivery loop is asynchronous by design).
+async fn wait_for(
+    client: &reqwest::Client,
+    token: &str,
+    mailbox: &str,
+    marker: &str,
+) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
-        match imap().inbox_overview(username, password).await {
-            Ok(overview) => {
-                if overview.has_subject_containing(marker) {
-                    println!(
-                        "PASS {what}: {username} INBOX has `{marker}` ({} messages)",
-                        overview.exists
-                    );
-                    return;
-                }
-                println!("… {what}: not yet in {username} ({:?})", overview.subjects);
-            }
-            Err(e) => println!("… {what}: IMAP not ready for {username}: {e}"),
+        let reply = rpc(
+            client,
+            token,
+            "mail.list",
+            serde_json::json!({ "mailbox": mailbox, "limit": 50 }),
+        )
+        .await;
+        let rows = reply["result"]["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(row) = rows.iter().find(|row| {
+            row["subject"]
+                .as_str()
+                .is_some_and(|subject| subject.contains(marker))
+        }) {
+            println!(
+                "PASS {marker}: {mailbox} holds it as {} ({} messages)",
+                row["id"], reply["result"]["total"]
+            );
+            return row.clone();
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "FAIL {what}: `{marker}` never arrived for {username}"
+            "FAIL {marker}: never arrived in {mailbox}: {reply}"
         );
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 }
 
-async fn wait_for_login() {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Ok(overview) = imap().inbox_overview(BOSS, "ayane-dev-pass-2").await {
-            println!("IMAP ready (boss INBOX exists = {})", overview.exists);
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "FAIL: Dovecot never accepted the rendered credentials"
-        );
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-    }
-}
-
-/// Send from a deny-listed sender without authentication (port 25, as a
-/// foreign MTA would) and assert Postfix rejects the transaction.
-async fn expect_rejected() {
-    let from = Address::parse("bot@spam.example").expect("from");
-    let to = Address::parse(BOSS).expect("to");
-    let message = ayane_mail::compose::build_plain_message(
-        &from,
-        "spammer",
-        &to,
-        "[ayane-smoke] t5-deny",
-        "must be rejected",
-    )
-    .expect("message");
-    let mta = Submission::new(
-        env_or("AYANE_MTA", "127.0.0.1:3025")
-            .parse::<SocketAddr>()
-            .expect("mta addr"),
-    );
-    let detail = match mta.send_unauthenticated(message).await {
-        Err(e) => e.to_string(),
-        Ok(()) => String::new(),
-    };
-    assert!(
-        !detail.is_empty(),
-        "deny-listed sender must be rejected, but delivery succeeded"
-    );
-    assert!(
-        detail.contains("denied by policy"),
-        "rejection must come from the policy map, got: {detail}"
-    );
-    println!("PASS deny list: unauthenticated spam.example sender rejected: {detail}");
-}
-
 #[tokio::test]
-#[ignore = "needs the engine rig: just engine-up && just serve"]
-async fn send_route_deliver_read_roundtrip() {
+#[ignore = "needs a running deployment: just serve, then run with AYANE_ADMIN_TOKEN set"]
+async fn the_webmail_read_path_works_on_a_live_maildir() {
     let client = api().await;
+    let token = std::env::var("AYANE_ADMIN_TOKEN").expect("AYANE_ADMIN_TOKEN must be set");
 
     let base = env_or("AYANE_API_URL", "http://127.0.0.1:3023");
     let health = client
@@ -218,67 +181,153 @@ async fn send_route_deliver_read_roundtrip() {
     assert!(health.contains("\"status\":\"ok\""), "health: {health}");
 
     put_state(&client, serde_json::json!({})).await;
-    wait_for_login().await;
 
-    // 1. direct delivery: alice → boss
-    send("ayane-dev-pass-1", BOSS, "t1-direct").await;
-    wait_for(BOSS, "ayane-dev-pass-2", "t1-direct", "direct delivery").await;
-
-    // 2. alias: alice → sales@ routes to boss
-    send("ayane-dev-pass-1", &format!("sales@{DOMAIN}"), "t2-alias").await;
-    wait_for(BOSS, "ayane-dev-pass-2", "t2-alias", "alias forwarding").await;
-
-    // 3. catch-all: alice → nobody@ lands in the catch-all inbox
-    send(
-        "ayane-dev-pass-1",
-        &format!("nobody@{DOMAIN}"),
-        "t3-catchall",
+    // 1. An empty folder lists as empty rather than failing: the reader is
+    //    what the sidebar asks before anything has arrived.
+    let listing = rpc(
+        &client,
+        &token,
+        "mail.list",
+        serde_json::json!({ "mailbox": "INBOX", "limit": 50 }),
     )
     .await;
-    wait_for(
-        INBOX,
-        "ayane-dev-pass-3",
-        "t3-catchall",
-        "catch-all delivery",
-    )
-    .await;
+    assert_eq!(
+        listing["result"]["total"], 0,
+        "a fresh mailbox lists empty: {listing}"
+    );
+    println!("PASS empty mailbox: mail.list answers 0 on a maildir nothing wrote yet");
 
-    // 4. subaddress: with `inbound_plus` on, alice → alice+tag lands in
-    //    alice's own INBOX. The switch is the only authority over `+`, so the
-    //    step flips it on first instead of assuming the pre-switch default.
-    put_state(&client, serde_json::json!({"inbound_plus": true})).await;
-    send(
-        "ayane-dev-pass-1",
-        &format!("alice+tag@{DOMAIN}"),
-        "t4-subaddress",
+    // 2. A draft is appended, listed by filename, and read back.
+    let saved = rpc(
+        &client,
+        &token,
+        "mail.saveDraft",
+        serde_json::json!({
+            "to": format!("someone@{DOMAIN}"),
+            "subject": "[ayane-smoke] t1-draft",
+            "body": "A draft the smoke test wrote.",
+        }),
     )
     .await;
-    wait_for(
-        ALICE,
-        "ayane-dev-pass-1",
-        "t4-subaddress",
-        "subaddress folding",
-    )
-    .await;
-    // …and with the switches off the tagged form is none of alice's business:
-    // it is an unknown recipient and the catch-all takes it.
-    put_state(&client, serde_json::json!({})).await;
-    send(
-        "ayane-dev-pass-1",
-        &format!("alice+offsw@{DOMAIN}"),
-        "t4b-subaddress-off",
-    )
-    .await;
-    wait_for(
-        INBOX,
-        "ayane-dev-pass-3",
-        "t4b-subaddress-off",
-        "no tag fold with the switch off",
-    )
-    .await;
+    let draft_id = saved["result"]["uid"]
+        .as_str()
+        .expect("the saved draft's id")
+        .to_owned();
+    let row = wait_for(&client, &token, "Drafts", "t1-draft").await;
+    assert_eq!(row["id"], draft_id, "the id mail.saveDraft answered with");
 
-    // 5. deny list: a foreign MTA from a deny-listed domain is refused.
-    expect_rejected().await;
+    let opened = rpc(
+        &client,
+        &token,
+        "mail.read",
+        serde_json::json!({ "uid": draft_id, "mailbox": "Drafts", "markSeen": false }),
+    )
+    .await;
+    assert_eq!(
+        opened["result"]["message"]["subject"], "[ayane-smoke] t1-draft",
+        "the draft reads back: {opened}"
+    );
+    println!("PASS draft round trip: append → list → read, id is the file name");
 
-    println!("SMOKE PASS: 6/6 policy paths verified");
+    // 3. Star it, and the starred roster finds it.
+    let starred = rpc(
+        &client,
+        &token,
+        "mail.star",
+        serde_json::json!({ "uid": draft_id, "mailbox": "Drafts", "starred": true }),
+    )
+    .await;
+    let starred_id = starred["result"]["uid"]
+        .as_str()
+        .expect("the id after the flag rename")
+        .to_owned();
+    assert_ne!(starred_id, draft_id, "a flag change renames the file");
+    let roster = rpc(
+        &client,
+        &token,
+        "mail.listStarred",
+        serde_json::json!({ "limit": 50 }),
+    )
+    .await;
+    assert!(
+        roster["result"]["messages"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["id"] == starred_id)),
+        "the starred roster holds the flagged message: {roster}"
+    );
+    println!("PASS star: the file name carries `F` and 已加星标 lists it");
+
+    // 4. Trash it, then purge it: the two steps the row menu offers.
+    let trashed = rpc(
+        &client,
+        &token,
+        "mail.trash",
+        serde_json::json!({ "uid": starred_id, "mailbox": "Drafts" }),
+    )
+    .await;
+    assert_eq!(trashed["result"]["mailbox"], "Trash", "{trashed}");
+    let in_trash = wait_for(&client, &token, "Trash", "t1-draft").await;
+    rpc(
+        &client,
+        &token,
+        "mail.purge",
+        serde_json::json!({ "uid": in_trash["id"], "mailbox": "Trash" }),
+    )
+    .await;
+    // A second purge of the same id is answered as "not there", not as a
+    // panic and not as a silent success.
+    let after = rpc_raw(
+        &client,
+        &token,
+        "mail.purge",
+        serde_json::json!({ "uid": in_trash["id"], "mailbox": "Trash" }),
+    )
+    .await;
+    assert!(
+        after["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Mail.NotFound")),
+        "purging a purged message answers Mail.NotFound: {after}"
+    );
+    println!("PASS trash and purge: move → Trash/cur → gone");
+
+    // 5. Templates live in the store, next to the state.
+    let saved_template = rpc(
+        &client,
+        &token,
+        "mail.templates.save",
+        serde_json::json!({
+            "name": "smoke template",
+            "subject": "[ayane-smoke] t5-template",
+            "body": "stored in the state, not in a maildir",
+        }),
+    )
+    .await;
+    let template_id = saved_template["result"]["id"]
+        .as_str()
+        .expect("the template id")
+        .to_owned();
+    let templates = rpc(
+        &client,
+        &token,
+        "mail.templates.list",
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(
+        templates["result"]["templates"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["id"] == template_id)),
+        "the template lists: {templates}"
+    );
+    rpc(
+        &client,
+        &token,
+        "mail.templates.delete",
+        serde_json::json!({ "id": template_id }),
+    )
+    .await;
+    println!("PASS templates: save → list → delete through the store");
+
+    println!("SMOKE PASS: 5/5 read-path steps verified");
 }

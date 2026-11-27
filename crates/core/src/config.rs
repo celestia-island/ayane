@@ -39,15 +39,6 @@ pub const DEFAULT_SPOOL_DIR: &str = "spool";
 /// Where delivered mail lands, as a sibling of the spool.
 pub const DEFAULT_MAIL_ROOT: &str = "mail";
 
-/// Default IMAP endpoint (prod publishes Dovecot's plaintext listener on the
-/// host loopback only — the read path is a client of the engine).
-pub const DEFAULT_IMAP: &str = "127.0.0.1:143";
-
-/// Default submission endpoint (dev). The prod rig exposes a dedicated
-/// loopback-only plaintext submission listener (10587) for the control
-/// plane; the public 587/465 enforce TLS for human clients.
-pub const DEFAULT_SUBMISSION: &str = "127.0.0.1:587";
-
 /// One SMTP listener the mail service binds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailListener {
@@ -201,10 +192,6 @@ pub struct Config {
     pub admin_token: Option<String>,
     /// Compose file of the engine containers (for reloads).
     pub compose_file: PathBuf,
-    /// IMAP endpoint the read path talks to.
-    pub imap: String,
-    /// Submission endpoint the send path talks to.
-    pub submission: String,
     /// TLS certificate chain (PEM) the cert check reads: the leaf's
     /// validity drives the 域名与证书 page. Absent disables the check.
     pub cert_file: Option<PathBuf>,
@@ -235,9 +222,6 @@ impl Config {
         let compose_file = PathBuf::from(
             std::env::var("AYANE_COMPOSE_FILE").unwrap_or_else(|_| DEFAULT_COMPOSE_FILE.to_owned()),
         );
-        let imap = std::env::var("AYANE_IMAP").unwrap_or_else(|_| DEFAULT_IMAP.to_owned());
-        let submission =
-            std::env::var("AYANE_SUBMISSION").unwrap_or_else(|_| DEFAULT_SUBMISSION.to_owned());
         let cert_file = std::env::var("AYANE_CERT_FILE").ok().map(PathBuf::from);
         let mail = mail_from_env(&state_dir)?;
         Ok(Self {
@@ -246,8 +230,6 @@ impl Config {
             state_dir,
             admin_token,
             compose_file,
-            imap,
-            submission,
             cert_file,
             mail,
         })

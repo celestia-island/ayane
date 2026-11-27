@@ -51,7 +51,7 @@ const bodyMode = ref<"markdown" | "plain">("markdown");
 const busy = ref(false);
 const savingDraft = ref(false);
 /** The draft being edited (send retires it; a plain send passes nothing). */
-const draftUid = ref<number | null>(null);
+const draftUid = ref<string | null>(null);
 
 const identities = ref<Identity[]>([]);
 const templates = ref<Template[]>([]);
@@ -168,8 +168,10 @@ onMounted(async () => {
   void loadIdentities();
   void loadTemplates();
 
-  const draftParam = Number(route.query.draft);
-  if (!route.query.draft || !Number.isInteger(draftParam) || draftParam <= 0) return;
+  // The draft id is the maildir file name, not a number: it is carried
+  // verbatim and only its emptiness is judged.
+  const draftParam = String(route.query.draft ?? "").trim();
+  if (!draftParam) return;
   // Continue a draft: the composer fields come back from the parsed draft
   // (X-Ayane-Draft-To carries the recipient exactly as it was typed).
   try {
@@ -234,12 +236,18 @@ function fileToBase64(file: File): Promise<string> {
 async function saveDraft(): Promise<void> {
   savingDraft.value = true;
   try {
-    await rpc.call("mail.saveDraft", {
+    // Re-saving a draft the composer was opened on replaces it: the id rides
+    // along so the server retires the previous copy instead of appending a
+    // second one, and the answer's id becomes the one the next save (and a
+    // later send) names.
+    const answer = await rpc.call<{ uid?: string }>("mail.saveDraft", {
       to: to.value,
       subject: subject.value,
       body: body.value,
+      ...(draftUid.value ? { draftUid: draftUid.value } : {}),
       ...identityParams(),
     });
+    if (answer?.uid) draftUid.value = answer.uid;
     toastSuccess(t("compose.draftSaved"));
   } catch (e) {
     toastError(e);

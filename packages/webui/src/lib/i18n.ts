@@ -2223,10 +2223,14 @@ export function localizeError(rawMessage: string): string {
     "Mail.MalformedParams": "err.malformed",
     "Mail.BadRecipient": "err.mailFailed",
     "Mail.ComposerRejected": "err.mailFailed",
-    "Mail.ImapFailed": "err.mailFailed",
-    "Mail.ImapUnavailable": "err.mailFailed",
-    "Mail.SubmissionFailed": "err.mailFailed",
-    "Mail.SubmissionUnavailable": "err.mailFailed",
+    // The read path talks to the maildirs directly, so these are the answers
+    // it can give. (The IMAP- and submission-era paths this map used to carry
+    // — `Mail.ImapFailed`, `Mail.ImapUnavailable`, `Mail.SubmissionFailed`,
+    // `Mail.SubmissionUnavailable` — are gone with their transports.)
+    "Mail.NotFound": "err.mailFailed",
+    "Mail.Conflict": "err.mailFailed",
+    "Mail.StorageFailed": "err.mailFailed",
+    "Mail.Rejected": "err.mailFailed",
     "Mail.Unparsable": "err.mailFailed",
     "Admin.StoreFailed": "err.adminFailed",
     "Admin.StateRejected": "err.adminFailed",

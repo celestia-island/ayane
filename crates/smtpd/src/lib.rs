@@ -174,6 +174,7 @@ pub mod authn;
 pub mod command;
 pub mod deliver;
 pub mod mailbox;
+pub mod maildir_reader;
 pub mod metrics;
 pub mod outbound;
 pub mod policy;
@@ -192,6 +193,11 @@ pub use deliver::{
     RemoteReport, RemoteRequest, RemoteTransport, DEFAULTS,
 };
 pub use mailbox::{Mailbox, MailboxError, POSTMASTER};
+pub use maildir_reader::{
+    digest as message_digest, FlagChange, Flags, FolderListing, ListingRow, MaildirReader,
+    MessageId, OpenedMessage, ReaderError, Renamed, DRAFTS, INBOX as INBOX_FOLDER,
+    SENT as SENT_FOLDER, STARRED_FOLDERS, TRASH as TRASH_FOLDER,
+};
 pub use metrics::{
     Counter, DomainTraffic, Metrics, MetricsDelivery, PeerTraffic, TrafficSnapshot, TrafficTotals,
 };

@@ -5,7 +5,7 @@
 <h1 align="center">Ayane</h1>
 
 <div align="center">
-  <strong>The mail service Celestia runs — control plane, webmail and protection over a proven Postfix/Dovecot stack</strong>
+  <strong>The mail service Celestia runs — its own SMTP engine, a maildir read path and a control plane</strong>
 </div>
 
 <br />
@@ -24,20 +24,21 @@
 
 </div>
 
-> **Status: live.** The control plane, rendered webmail, protection layer and
-> the Celestia ID sign-in run on the production rig (`mail.acgsyzx.me`); the
-> mail engine (Postfix / Dovecot / rspamd / ClamAV) is deployed with DKIM, SPF
-> and DMARC. Inbound SMTP/25 is tested and working and rspamd rejects spam at
-> the gate; outbound to the big providers is rate-limited there (PTR is live,
-> Postfix retries).
+> **Status: live.** The control plane, rendered webmail and the Celestia ID
+> sign-in run on the production rig (`mail.acgsyzx.me`). The mail engine is
+> this repository's own: `crates/smtpd` speaks SMTP inbound and submission,
+> verifies SPF/DKIM/ARC/DMARC, delivers into maildirs with its own retry
+> horizon, and sends off-host mail over MX with DKIM signing. The webmail reads
+> those same maildirs directly — there is no IMAP server in the stack any
+> more, and no Dovecot to configure.
 
 ## Why this exists
 
 Self-hosted mail is a solved problem at the *engine* layer and an unsolved one at
 the *organisation* layer: shared mailboxes, catch-all with allow/deny policy,
 quarantine, safe rendering, a DNS wizard an operator can actually follow, and an
-agent-facing surface. Ayane builds that layer and leaves SMTP/IMAP/storage to
-daemons that have been in production for decades.
+agent-facing surface. Ayane builds that layer, and speaks SMTP and the maildir
+format itself rather than configuring somebody else's daemon.
 
 Named after **Ayane Okusora** (奥空 アヤネ) of Blue Archive: secretary and
 communications officer of the Abydos Countermeasures Committee, a principled
@@ -57,50 +58,39 @@ glasses.
 flowchart LR
   subgraph Internet
     Peer[Remote MTA]
-    Relay[Relay / ingress host]
   end
-  subgraph Engine[Engine — separate processes, no copyleft in this crate]
-    PF[Postfix<br/>MTA · submission]
-    DC[Dovecot + Pigeonhole<br/>IMAP · LMTP · Sieve]
-    RS[rspamd<br/>SPF · DKIM · DMARC · ARC · spam]
-    AV[ClamAV<br/>antivirus]
-    VK[Valkey<br/>rspamd state]
-    PG[(PostgreSQL<br/>control-plane authority)]
-    PF --> DC
-    PF --> RS
-    RS --> AV
-    RS --> VK
-    PF --> PG
-    DC --> PG
-  end
-  subgraph Ayane[ayane — this repository]
+  subgraph Ayane[ayane — one process when AYANE_MAIL_ENABLED=1]
+    LSN[smtpd listeners<br/>inbound · submission]
+    VER[verify<br/>SPF · DKIM · ARC · DMARC]
+    Q[(spool<br/>crash-safe queue)]
+    DEL[delivery<br/>retry · bounce · forward]
+    OUT[outbound<br/>MX · STARTTLS · DKIM sign]
+    MD[(maildirs<br/>new · cur · tmp)]
     API[control plane<br/>domains · mailboxes · policy · audit]
-    WEB[webmail API<br/>safe rendering · image proxy]
-    MCP[MCP surface]
-    WIZ[deployment & DNS wizard]
+    WEB[webmail RPC<br/>mail.list · mail.read · mail.send]
   end
-  Peer --> PF
-  PF --> Relay
-  API -->|renders config · reloads| Engine
-  WEB -->|IMAP · submission| Engine
-  MCP --> API
-  WIZ --> API
+  Peer --> LSN
+  LSN --> VER
+  VER --> Q
+  Q --> DEL
+  DEL --> MD
+  DEL --> OUT
+  OUT --> Peer
+  WEB -->|reads and renames| MD
+  WEB -->|stages a send| Q
+  API -->|writes the routing snapshot| DEL
 ```
 
 ## Engine and licences
 
-Ayane owns no protocol code. The runtime stack is composed of independent
-processes, each under a licence that can be operated and redistributed without
-touching this repository's licence:
+The mail engine is this repository's own code, under this repository's licence
+(SySL 1.0). What it keeps out of the crate is anything copyleft:
 
 | Component | Role | Licence | Boundary |
 |---|---|---|---|
-| Postfix | MTA, submission (587) | IPL-1.0 / EPL-2.0 | separate process |
-| Dovecot + Pigeonhole | IMAP, LMTP, Sieve, ACL | LGPL-2.1 | separate process |
-| rspamd | spam, DKIM/SPF/DMARC/ARC, milter | Apache-2.0 | separate process |
-| ClamAV | antivirus (driven by rspamd) | GPL-2.0 | separate process |
-| Valkey | rspamd statistics / rate limits | BSD-3-Clause | separate process |
-| PostgreSQL | control-plane authority | PostgreSQL Licence | library |
+| `ayane-smtpd` | SMTP in/out, verification, queue, delivery, maildir | SySL 1.0 | this crate |
+| `ayane-engine` | deterministic renderers for the retired Postfix/Dovecot configs | SySL 1.0 | this crate |
+| maildir | the mailbox format on disk (`new`/`cur`/`tmp` per folder) | — | a file layout |
 
 Deliberately **not** used: Stalwart (AGPL-3.0), mailcow (GPL-3.0, bundles SOGo
 AGPL-3.0), Roundcube / SnappyMail (we ship our own webmail), `acme.sh`
@@ -114,7 +104,8 @@ ayane/
   crates/
     proto/    wire types + validation (no I/O)
     mail/     routing, recipient policy, MIME construction (lettre, client only)
-    engine/   deterministic renderers for Postfix / Dovecot / rspamd config
+    engine/   deterministic renderers (the retired Postfix / Dovecot configs)
+    smtpd/    the mail engine: SMTP, verification, queue, delivery, maildir reader
     core/     HTTP surface (`ayane` binary)
   deploy/     compose topology, parameter table, Stage-0 verification checklist
   docs/      user-facing documentation
@@ -143,9 +134,9 @@ never commit real values.
 
 - **Stage 0** — workspace skeleton, config renderers, health surface, deployment
   parameter table and the engine verification checklist.
-- **Stage 1** — engine compose (Postfix/Dovecot/rspamd/ClamAV/Valkey) plus the
-  control plane: domains, accounts, aliases, shared mailboxes, catch-all policy,
-  audit, rendered-config reload loop.
+- **Stage 1** — the mail engine (inbound SMTP, verification, queue, delivery,
+  outbound) plus the control plane: domains, accounts, aliases, shared
+  mailboxes, catch-all policy, audit, reload loop.
 - **Stage 2** — webmail API and UI on hikari: safe rendering, server-side image
   proxy, attachment hashing, sandboxed preview.
 - **Stage 3** — protection depth: phishing heuristics, quarantine workflow, DNS

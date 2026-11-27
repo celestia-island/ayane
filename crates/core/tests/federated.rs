@@ -154,8 +154,6 @@ fn fixture_with(tag: &str, google: bool) -> Fixture {
         state_dir: root.join("state"),
         admin_token: Some(ADMIN.to_owned()),
         compose_file: root.join("docker-compose.yml"),
-        imap: "127.0.0.1:1".to_owned(),
-        submission: "127.0.0.1:1".to_owned(),
         cert_file: None,
         // The mail section is off in every control-plane test: the default
         // `MailConfig` is what an installation that has not enabled it gets,
@@ -657,10 +655,13 @@ async fn a_linked_identity_hands_off_into_a_locked_session() {
         mail["error"]["message"],
         "Session.MailboxLocked: the mailbox is locked: enter the mailbox password"
     );
+    // The lock is what is under test, and it answers before the parameters
+    // are read — so the id here only has to be *shaped* like one the webui
+    // sends (a maildir file name), not to name a real message.
     let star = call(
         &fx.surface,
         "mail.star",
-        json!({ "token": token, "uid": 1 }),
+        json!({ "token": token, "uid": "1700000000.M1P2Q3.host:2,", "mailbox": "INBOX" }),
     )
     .await;
     assert!(star["error"]["message"]
@@ -687,7 +688,7 @@ async fn a_linked_identity_hands_off_into_a_locked_session() {
         .unwrap_or("")
         .starts_with("Session.MailboxLocked:"));
 
-    // The right one unlocks: mail now reaches the (absent) IMAP leg.
+    // The right one unlocks: mail now reaches the reader.
     let unlocked = call(
         &fx.surface,
         "session.unlockMailbox",
@@ -699,15 +700,13 @@ async fn a_linked_identity_hands_off_into_a_locked_session() {
     let who = call(&fx.surface, "session.whoami", json!({ "token": token })).await;
     assert_eq!(who["result"]["admin"], true);
     assert_eq!(who["result"]["needs_mailbox_password"], false);
+    // The read path is a walk over the deployment's maildirs, so an
+    // account whose maildir nothing has written yet lists as empty — the
+    // unlock is what the answer proves was honoured.
     let mail = call(&fx.surface, "mail.list", json!({ "token": token })).await;
-    assert!(
-        mail["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("Mail.ImapFailed:"),
-        "{}",
-        mail
-    );
+    assert!(mail.get("error").is_none(), "{mail}");
+    assert_eq!(mail["result"]["total"], 0, "{mail}");
+    assert_eq!(mail["result"]["unread"], 0, "{mail}");
     // Nothing left to unlock.
     let again = call(
         &fx.surface,
