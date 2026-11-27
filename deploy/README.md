@@ -5,6 +5,34 @@
 
 > 当前状态：Stage 0 骨架。下面的参数表与检查清单是**目标形态**，compose 落地后逐条打勾。
 
+## 0. 产物：静态 musl，且带自写引擎
+
+部署跑的是 `just release` / `python3 deploy/build-musl.py` 产出的**静态 musl 二进制**，
+不是宿主 `cargo build` 的 GNU 产物。
+
+2026-11-27 的切换回滚根因就在这一层：`/opt/ayane/ayane-bin` 要求 `GLIBC_2.39`（宿主 2.35），
+且整份二进制里 `AYANE_MAIL_ENABLED` 零命中——它既不是这台机器能跑的，也不是这个仓的当前 master。
+两者都从文件名上看不出来，所以车道本身会验：
+
+| 检查 | 判据 | 不通过时 |
+|---|---|---|
+| 静态链接 | `ldd <bin>` 输出 `statically linked` / `not a dynamic executable` | 退出 1 |
+| 含自写引擎 | 二进制里出现 `AYANE_MAIL_ENABLED` | 退出 1 |
+| 出自本次构建 | `<bin> --version` 的 banner 里出现 `x86_64-unknown-linux-musl` | 退出 1 |
+
+```bash
+# 构建 + 验证（打印 sha256，写同名 .sha256 副本）
+python3 deploy/build-musl.py
+# 构建 + 验证 + 原子安装到部署路径
+python3 deploy/build-musl.py --install-to /opt/ayane/ayane-bin
+```
+
+静态化的语义代价：musl 的 DNS 解析不走 NSS，也**不读系统证书库**——本仓的 TLS 走
+`rustls` + `webpki-roots`（证书根内嵌在二进制里），所以两者都不需要宿主提供，这正是选它的原因。
+`AYANE_MAIL_DKIM_KEY_*` 这类凭据仍由单元的环境（`EnvironmentFile`）提供，与静态化无关。
+
+`--version` 是切换时的第一条命令：它不读环境、不开 store、不绑端口，直接回答「这是哪个目标的哪个版本」。
+
 ## 1. 参数表
 
 所有参数经环境变量 / `.env`（0600）注入，真实值不进仓库。示例一律占位符。
@@ -55,6 +83,21 @@
 启动顺序因此是：起控制面（邮件段同时绑定）→ 建域/建账号 → `admin.apply`（写 `desired-state.json`
 与各渲染表）→ 收信。**投递消费按 `AYANE_MAIL_STATE` 路由**：首次 apply 之前它读不到快照，会把这一轮
 记为跳过（日志 `the state snapshot cannot be used`），队列里的信件不会丢，apply 之后自动投递。
+
+**首次部署带 `AYANE_MAIL_OUTBOUND=1` 不会再卡住**：DKIM 签名器从 `desired-state.json` 读每个域的
+selector，而这份快照由 `admin.apply` 写、`apply` 需要一个跑起来的进程。所以快照**不存在或不可解析**
+时 `signers()` 记一条 `warn!`、给出空签名集、服务照常起（监听器绑上、投递照跑），域外邮件**不签名照投**
+——与「某域配了 selector 但环境里没有它的密钥」是同一条既有规则。代价是：签名器只在**启动**时装配，
+apply 之后要**重启一次**才会开始签名（日志里那条 warn 就是触发点）。
+
+**DKIM selector 有 RPC 写入通道**：`admin.domain.dkim.put {domain, selector}`（admin 会话）。
+写回 `state.domains[i].dkim`，走与 `admin.state.put` 同一把锁与同一份校验（selector 作为 DNS 左半
+被判，非法值带域名被拒；`selector: ""` = 这个域不签名）。私钥**不进 state**：仍由
+`AYANE_MAIL_DKIM_KEY_{domain}`（点写成 `_`）从进程环境读取。写完要重启进程，见上一条。
+
+**25 端口不广告 AUTH**：`inbound` 角色的 EHLO 能力表里从来没有 AUTH；而 AUTH 在**任何非 TLS 连接**
+上一律不出现在 EHLO 里（与「submission 无 TLS 不广告 AUTH」同一条规则）。非 TLS 上真发 `AUTH …` 仍答
+`538 Encryption required`——广告里没有，端口上也不需要靠它挡。
 
 分进程形态仍然可用：`ayane-smtpd --serve` / `--deliver` 读同一份 `desired-state.json` 与同一个 spool。
 **该形态没有计数器**：`admin.net.traffic` 显示为空（「没有对端」与「没有计数表」是同一张空表），

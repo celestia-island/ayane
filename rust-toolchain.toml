@@ -1,3 +1,7 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
+# The deployment target: the release lane (`just release`, `deploy/build-musl.py`)
+# builds a fully static binary so the artifact does not care what glibc the host
+# has — the 2026-11-27 cutover failed on exactly that (GLIBC 2.39 vs 2.35).
+targets = ["x86_64-unknown-linux-musl"]

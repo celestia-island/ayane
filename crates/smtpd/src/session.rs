@@ -588,7 +588,22 @@ impl Session {
         if self.extensions.starttls && !self.tls_active {
             lines.push("STARTTLS".to_owned());
         }
-        if !self.extensions.auth.is_empty() && self.tls_active {
+        // `AUTH` is advertised exactly when a login on this connection could
+        // **succeed**: the listener offers a mechanism and the channel is
+        // encrypted. The second half is not cosmetic — [`Session::auth`]
+        // refuses a clear-channel attempt with `538`, so without it a port 25
+        // listener whose role offered AUTH would answer EHLO with `AUTH PLAIN
+        // LOGIN` and then refuse every login it advertised. A client that reads
+        // the list and sends credentials to a name no one can log in to is the
+        // worst of both: the mirror image of the submission rule (no TLS, no
+        // AUTH), and the one an unauthenticated relay probe looks for.
+        let auth_now = !self.extensions.auth.is_empty()
+            && self
+                .extensions
+                .auth
+                .iter()
+                .any(|mechanism| self.auth_mechanism_usable(*mechanism));
+        if auth_now {
             let list = self
                 .extensions
                 .auth
@@ -600,6 +615,14 @@ impl Session {
         }
         lines.push("ENHANCEDSTATUSCODES".to_owned());
         Reply::from_capabilities(lines)
+    }
+
+    /// Whether one advertised mechanism can actually be used on this
+    /// connection: Every mechanism in this crate is a password mechanism, and
+    /// no password is accepted on a clear channel (MAP §四 rule 9, the rule
+    /// [`Session::auth`] enforces with `538`).
+    fn auth_mechanism_usable(&self, _mechanism: AuthMechanism) -> bool {
+        self.tls_active
     }
 
     fn mail(

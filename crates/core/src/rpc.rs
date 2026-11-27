@@ -19,7 +19,7 @@
 //! change the account's linked sign-ins, since those are ways into the
 //! account exactly as administration is a way to change it. And every
 //! handler that edits a slice of the snapshot does so under the store's
-//! lock ([`update_state`]): an unlocked read-edit-write writes back a
+//! lock ([`update_state`](self)): an unlocked read-edit-write writes back a
 //! moment that has already passed.
 
 use serde_json::{json, Value};
@@ -234,6 +234,14 @@ pub async fn dispatch(
         },
         "admin.policy.put" => match require_admin(app, sessions, ctx, &params) {
             Ok(()) => wrap_result(policy_put(app, params.clone())),
+            Err(e) => RpcOutcome::App(e),
+        },
+        // The one domain field nothing else could write: `signers_from_env`
+        // signs a domain whose state carries `dkim.selector`, and until this
+        // method existed the only way to put one there was to hand-edit the
+        // state JSON — which is not a channel a deployment's operator has.
+        "admin.domain.dkim.put" => match require_admin(app, sessions, ctx, &params) {
+            Ok(()) => wrap_result(domain_dkim_put(app, &params)),
             Err(e) => RpcOutcome::App(e),
         },
         other => RpcOutcome::Protocol(ProtocolError {
@@ -1748,6 +1756,75 @@ fn policy_put(app: &AppState, params: Value) -> Result<Value, AppError> {
             .validate()
             .map_err(|e| AppError::new("Admin.StateRejected", e.to_string()))?;
         Ok(json!({ "saved": true, "note": "apply to reload the engine" }))
+    })
+}
+
+// ── domain DKIM selection ─────────────────────────────────────────────────
+
+/// `admin.domain.dkim.put {domain, selector}` — sets (or, with an empty
+/// selector, clears) the DKIM selector one hosted domain signs with.
+///
+/// # Why this is an RPC and not a field of `admin.state.put`
+///
+/// `signers_from_env` signs a domain whose **state** carries a selector —
+/// `<selector>._domainkey.<domain>` is the name the receiver queries — and the
+/// key itself never travels with the state (it is read from the process
+/// environment by sanitised domain name). Until this method existed nothing in
+/// the service wrote that field: the panel's only route was its raw JSON
+/// editor, which is how a live instance's selector came to be hand-edited.
+///
+/// The edit is one locked read-modify-write ([`update_state`]), so a concurrent
+/// account edit is not lost to it, and the selector is put through the same
+/// label law the whole snapshot is validated by, so a value that could never be
+/// published as a DNS name is refused **here**, with the domain named — not on
+/// the next `admin.apply`, where the message would have to be reversed to
+/// find the field.
+///
+/// A selector reaches the signer set on the **next process start** (the keys
+/// are loaded once at startup; see `engine::signers`), so the answer says so.
+fn domain_dkim_put(app: &AppState, params: &Value) -> Result<Value, AppError> {
+    let domain = required(params, "domain")?.trim().to_ascii_lowercase();
+    // An empty selector is the "sign nothing for this domain" write: a domain
+    // that used a selector and no longer does has to be able to say so, and the
+    // alternative (delete the whole domain) drops its mailboxes with it.
+    let selector = str_param(params, "selector")
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let cleared = selector.is_empty();
+    update_state(app, &mut |stored| {
+        let Some(index) = stored
+            .desired
+            .domains
+            .iter()
+            .position(|candidate| candidate.name.eq_ignore_ascii_case(&domain))
+        else {
+            return Err(AppError::new(
+                "Admin.UnknownDomain",
+                format!("{domain} is not a hosted domain"),
+            ));
+        };
+        stored.desired.domains[index].dkim = if cleared {
+            None
+        } else {
+            Some(ayane_proto::DkimSigningConfig::selector_only(
+                selector.clone(),
+            ))
+        };
+        // The same validation every other write of a slice runs: the selector
+        // law lives in `DesiredState::validate`, and duplicating it here would
+        // be two spellings of one rule.
+        stored
+            .desired
+            .validate()
+            .map_err(|e| AppError::new("Admin.MalformedSelector", e.to_string()))?;
+        Ok(json!({
+            "saved": true,
+            "domain": domain,
+            "selector": if cleared { Value::Null } else { json!(selector) },
+            "requires_restart": true,
+            "note": "signers are loaded at start: restart the service, then apply",
+        }))
     })
 }
 

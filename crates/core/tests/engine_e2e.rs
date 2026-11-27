@@ -1581,3 +1581,362 @@ async fn a_folder_name_that_would_leave_the_maildir_is_refused() {
     assert!(!fixture.fixture.mail.join("escape").exists());
     fixture.shutdown();
 }
+
+// ── the assembly screen: three deployment timings, one full chain ─────────
+//
+// The 2026-11-27 cutover did not fail on a piece: it failed on the *order* the
+// pieces were assembled in. The engine's DKIM step read a snapshot that only
+// `admin.apply` writes, and `apply` needs the process that step runs inside —
+// a first deployment with `AYANE_MAIL_OUTBOUND=1` could not start at all. The
+// tests below walk the **whole** chain (`Config::from_env` → `engine::start` →
+// `admin.state.put` → `admin.apply` → reload) under the three timings a host
+// actually has, and pin for each one whether it must **serve** or is allowed to
+// be degraded:
+//
+// | timing | state on disk at start | must |
+// |---|---|---|
+// | first deployment | none | serve, no signers, listeners bound |
+// | restart, state present | written by a previous run | serve, signers from it |
+// | restart mid-cutover | half-written by an interrupted apply | serve, no signers |
+//
+// "serve" is the assertion that matters: a degraded instance is one whose
+// listeners never bound, and a bound listener is what a peer's connection
+// observes. Each row therefore connects to the SMTP port and speaks `EHLO`.
+
+/// The admin token these rows log in with. Not a credential: this test's own.
+const ASSEMBLY_ADMIN: &str = "assembly-screen-admin-token";
+
+/// A configuration read through `Config::from_env` — the same entry the process
+/// uses, so the row covers the env → `MailConfig` step a deployment can get
+/// wrong on its own.
+fn env_config() -> ayane::config::Config {
+    ayane::config::Config::from_env().expect("the environment parses")
+}
+
+/// The RPC surface a row drives `admin.*` through. Same construction as
+/// `main.rs`: one store, one driver, the engine's control handles.
+fn assembly_surface(
+    config: &ayane::config::Config,
+    store: Arc<RedbStateStore>,
+    engine: &ayane::engine::RunningEngine,
+) -> ayane::transport::RpcSurface {
+    let driver: Arc<dyn EngineDriver> = Arc::new(NativeDriver::new(engine.control().clone()));
+    let state = ayane::state::AppState {
+        store: store as Arc<dyn StateStore>,
+        driver,
+        config: Arc::new(config.clone()),
+        auth: Arc::new(ayane::auth::AuthState::local()),
+        mail_health: None,
+    };
+    ayane::transport::RpcSurface {
+        app: state,
+        sessions: Arc::new(ayane::session::SessionStore::new()),
+    }
+}
+
+/// Logs in as admin and returns the token.
+async fn admin_token_of(surface: &ayane::transport::RpcSurface) -> String {
+    let reply = call_rpc(
+        surface,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session.adminLogin",
+            "params": { "token": ASSEMBLY_ADMIN },
+        }),
+    )
+    .await;
+    reply["result"]["token"]
+        .as_str()
+        .expect("admin token")
+        .to_owned()
+}
+
+/// What a peer sees when it connects: the greeting, and the `EHLO` capability
+/// list. Both are the SMTP service answering, which is what "the mail side is
+/// serving" means from outside the process.
+async fn smtp_answers(address: std::net::SocketAddr) -> (u16, String) {
+    let mut client = Client::connect(address);
+    let ehlo = client.expect("EHLO screen.test", 250);
+    client.send("QUIT\r\n");
+    let code = client.reply().0;
+    (code, ehlo)
+}
+
+/// The snapshot an apply writes, for the rows that need one before start.
+fn snapshot_for(selector: Option<&str>) -> ayane_proto::DesiredState {
+    ayane_proto::DesiredState {
+        domains: vec![ayane_proto::MailDomain {
+            name: "example.test".to_owned(),
+            catch_all: None,
+            enabled: true,
+            dkim: selector.map(ayane_proto::DkimSigningConfig::selector_only),
+        }],
+        accounts: vec![ayane_proto::Account {
+            id: uuid::Uuid::new_v4(),
+            address: ayane_proto::Address::parse("inbox@example.test").expect("addr"),
+            display_name: "Inbox".to_owned(),
+            quota_bytes: 0,
+            admin: false,
+        }],
+        ..Default::default()
+    }
+}
+
+/// The throwaway RSA-2048 pair `crates/smtpd/tests/outbound.rs` signs with
+/// (registered in `_ledger/tool-exemptions.md`); it authenticates nothing.
+const SCREEN_KEY: &str = include_str!("../../smtpd/tests/fixtures/dkim-private.pem");
+
+/// **Timing 1 — first deployment.** Nothing has been applied, the state
+/// directory is empty, and the unit starts with outbound enabled and a DKIM
+/// key template configured. Before the fix this row hung at start (the process
+/// exited under `REQUIRE_START=1`, or answered degraded); now it must serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timing_one_a_first_deployment_with_outbound_serves_before_any_apply() {
+    let fixture = Fixture::new("timing-first");
+    // The fixture seeds the store (an operator has to have an account to log
+    // in with); what has *not* happened is the apply that writes the snapshot.
+    let address = free_port().await;
+    let state_dir = fixture.root.join("state");
+    let spool = state_dir.join("spool");
+    let mail_root = state_dir.join("mail");
+    let key_variable = "AYANE_SCREEN_DKIM_KEY_example_test";
+
+    let mail = with_mail_env(
+        &[
+            ("AYANE_LISTEN", "127.0.0.1:0"),
+            ("AYANE_STATE_DIR", state_dir.to_str().expect("utf8")),
+            ("AYANE_ADMIN_TOKEN", ASSEMBLY_ADMIN),
+            ("AYANE_MAIL_ENABLED", "1"),
+            ("AYANE_MAIL_HOSTNAME", "mx.example.test"),
+            (
+                "AYANE_MAIL_LISTENERS",
+                &format!("inbound@127.0.0.1:{}", address.port()),
+            ),
+            ("AYANE_MAIL_SPOOL_ROOT", spool.to_str().expect("utf8")),
+            ("AYANE_MAIL_ROOT", mail_root.to_str().expect("utf8")),
+            (
+                "AYANE_MAIL_STATE",
+                state_dir.join("desired-state.json").to_str().expect("utf8"),
+            ),
+            ("AYANE_MAIL_OUTBOUND", "1"),
+            ("AYANE_MAIL_DKIM_KEY_ENV", "AYANE_SCREEN_DKIM_KEY_{domain}"),
+            ("AYANE_MAIL_REQUIRE_START", "1"),
+            ("AYANE_MAIL_DELIVERY_INTERVAL_SECONDS", "1"),
+        ],
+        env_config,
+    );
+    assert!(
+        !mail.mail.state_path.exists(),
+        "timing 1: nothing has applied yet"
+    );
+
+    let store: Arc<dyn StateStore> = fixture.store.clone();
+    let engine = ayane::engine::start(&mail, store)
+        .await
+        // `REQUIRE_START=1` above: before the fix this is the `Err` the process
+        // exited on, which is the same failure one layer down.
+        .expect("timing 1: the first start of an outbound instance succeeds");
+    assert_eq!(
+        engine.degraded(),
+        None,
+        "timing 1: serving, not degraded: {:?}",
+        engine.degraded()
+    );
+    let (code, ehlo) = smtp_answers(address).await;
+    assert_eq!(code, 221, "timing 1: the session completed: {ehlo}");
+
+    // And the rest of the chain now runs in the order a deployment runs it:
+    // set the selector over its own RPC, apply, and the snapshot exists.
+    let surface = assembly_surface(&mail, fixture.store.clone(), &engine);
+    let token = admin_token_of(&surface).await;
+    let reply = call_rpc(
+        &surface,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "admin.domain.dkim.put",
+            "params": { "token": token, "domain": "example.test", "selector": "ayane" },
+        }),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "timing 1 dkim.put: {reply}");
+    let reply = call_rpc(
+        &surface,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "admin.apply",
+            "params": { "token": token },
+        }),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "timing 1 apply: {reply}");
+    assert!(
+        mail.mail.state_path.exists(),
+        "timing 1: apply wrote the snapshot the signers read"
+    );
+    // The snapshot carries the selector this instance wrote, so the next
+    // start signs — which is the one step a first deployment cannot have.
+    let snapshot = std::fs::read(&mail.mail.state_path).expect("snapshot");
+    let parsed: ayane_proto::DesiredState = serde_json::from_slice(&snapshot).expect("json");
+    assert_eq!(
+        parsed.domains[0].dkim().map(|dkim| dkim.selector.as_str()),
+        Some("ayane"),
+        "timing 1: the selector the RPC set is in the applied snapshot"
+    );
+    // Set and restored under the section's own lock: an unprotected `set_var`
+    // here races every other test in this binary.
+    let signed = with_mail_env(&[(key_variable, SCREEN_KEY)], || {
+        ayane_smtpd::outbound::signers_from_env(&parsed, "AYANE_SCREEN_DKIM_KEY_{domain}")
+            .expect("the applied snapshot and the key produce signers")
+    });
+    assert_eq!(
+        signed.keys().collect::<Vec<_>>(),
+        vec![&"example.test".to_owned()],
+        "timing 1: the restart after this one signs"
+    );
+
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+/// **Timing 2 — a restart with the state already there.** The snapshot from a
+/// previous run is on disk with a selector and the key is in the environment:
+/// the engine must serve **and** sign, which is the positive control for the
+/// two timings that do not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timing_two_a_restart_over_an_applied_state_serves_and_signs() {
+    let fixture = Fixture::new("timing-restart");
+    let address = free_port().await;
+    let state_dir = fixture.root.join("state");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::write(
+        state_dir.join("desired-state.json"),
+        serde_json::to_vec(&snapshot_for(Some("ayane"))).expect("snapshot"),
+    )
+    .expect("write snapshot");
+    let variable = "AYANE_SCREEN_DKIM_KEY_example_test";
+    // The key is set **inside** the section that holds `MAIL_ENV`: a
+    // `set_var` outside it races this crate's other environment users, and the
+    // symptom is a signer set that is empty for reasons the test did not cause.
+    let (config, signed) = with_mail_env(
+        &[
+            ("AYANE_LISTEN", "127.0.0.1:0"),
+            ("AYANE_STATE_DIR", state_dir.to_str().expect("utf8")),
+            ("AYANE_ADMIN_TOKEN", ASSEMBLY_ADMIN),
+            ("AYANE_MAIL_ENABLED", "1"),
+            ("AYANE_MAIL_HOSTNAME", "mx.example.test"),
+            (
+                "AYANE_MAIL_LISTENERS",
+                &format!("inbound@127.0.0.1:{}", address.port()),
+            ),
+            ("AYANE_MAIL_OUTBOUND", "1"),
+            ("AYANE_MAIL_DKIM_KEY_ENV", "AYANE_SCREEN_DKIM_KEY_{domain}"),
+            ("AYANE_MAIL_REQUIRE_START", "1"),
+            ("AYANE_MAIL_DELIVERY_INTERVAL_SECONDS", "1"),
+            ("AYANE_SCREEN_DKIM_KEY_example_test", SCREEN_KEY),
+        ],
+        || {
+            let config = env_config();
+            // Signing is inside the transport, so the observable here is the
+            // signer set the startup step builds from the same inputs — read
+            // through the public function it calls, with the snapshot and the
+            // environment this process would read, while the section holds.
+            let parsed: ayane_proto::DesiredState =
+                serde_json::from_slice(&std::fs::read(&config.mail.state_path).expect("snapshot"))
+                    .expect("json");
+            let signed = ayane_smtpd::outbound::signers_from_env(
+                &parsed,
+                config.mail.dkim_key_env.as_deref().expect("template"),
+            )
+            .expect("signers");
+            (config, signed)
+        },
+    );
+    let store: Arc<dyn StateStore> = fixture.store.clone();
+    let engine = ayane::engine::start(&config, store)
+        .await
+        .expect("timing 2: a restart needs nothing new");
+    assert_eq!(engine.degraded(), None, "{:?}", engine.degraded());
+    let (code, ehlo) = smtp_answers(address).await;
+    assert_eq!(code, 221, "timing 2: the session completed: {ehlo}");
+
+    assert_eq!(
+        signed.keys().collect::<Vec<_>>(),
+        vec![&"example.test".to_owned()],
+        "timing 2: the restart signs with the selector the state carries"
+    );
+    assert!(
+        std::env::var(variable).is_err(),
+        "the section restored the environment"
+    );
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+/// **Timing 3 — a restart in the middle of a cutover.** The previous process
+/// died while writing the snapshot (or an operator was mid-edit), so the file
+/// is half there: a prefix of valid JSON and no closing brace. The engine must
+/// still serve — with no signers — because a mail service that will not bind
+/// its port turns a DKIM problem into a mail outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timing_three_a_restart_over_a_half_written_state_still_serves() {
+    let fixture = Fixture::new("timing-midway");
+    let address = free_port().await;
+    let state_dir = fixture.root.join("state");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    let whole = serde_json::to_vec(&snapshot_for(Some("ayane"))).expect("snapshot");
+    std::fs::write(
+        state_dir.join("desired-state.json"),
+        &whole[..whole.len() / 2],
+    )
+    .expect("write half");
+
+    let config = with_mail_env(
+        &[
+            ("AYANE_LISTEN", "127.0.0.1:0"),
+            ("AYANE_STATE_DIR", state_dir.to_str().expect("utf8")),
+            ("AYANE_ADMIN_TOKEN", ASSEMBLY_ADMIN),
+            ("AYANE_MAIL_ENABLED", "1"),
+            ("AYANE_MAIL_HOSTNAME", "mx.example.test"),
+            (
+                "AYANE_MAIL_LISTENERS",
+                &format!("inbound@127.0.0.1:{}", address.port()),
+            ),
+            ("AYANE_MAIL_OUTBOUND", "1"),
+            ("AYANE_MAIL_DKIM_KEY_ENV", "AYANE_SCREEN_DKIM_KEY_{domain}"),
+            ("AYANE_MAIL_REQUIRE_START", "1"),
+            ("AYANE_MAIL_DELIVERY_INTERVAL_SECONDS", "1"),
+        ],
+        env_config,
+    );
+    let store: Arc<dyn StateStore> = fixture.store.clone();
+    let engine = ayane::engine::start(&config, store)
+        .await
+        .expect("timing 3: a half-written snapshot is not a startup failure");
+    assert_eq!(engine.degraded(), None, "{:?}", engine.degraded());
+    let (code, ehlo) = smtp_answers(address).await;
+    assert_eq!(code, 221, "timing 3: the session completed: {ehlo}");
+
+    // The delivery consumer's own rule for the same file: it holds, it does not
+    // stop. A message queued now survives until the next apply writes a whole
+    // snapshot — which is why the listener binding matters more than signing.
+    assert!(
+        ayane::engine::load_state(&config.mail.state_path).is_err(),
+        "timing 3: the consumer sees an unusable snapshot and holds"
+    );
+    // And the operator's repair path is the panel's: one apply fixes both the
+    // file and the routing the consumer waits for.
+    let surface = assembly_surface(&config, fixture.store.clone(), &engine);
+    let token = admin_token_of(&surface).await;
+    let reply = call_rpc(
+        &surface,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "admin.apply",
+            "params": { "token": token },
+        }),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "timing 3 apply: {reply}");
+    assert!(
+        ayane::engine::load_state(&config.mail.state_path).is_ok(),
+        "timing 3: the apply leaves a whole snapshot behind"
+    );
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}

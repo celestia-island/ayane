@@ -545,7 +545,7 @@ impl MaildirReader {
     /// webmail asks every sidebar folder, and 收件箱 of a fresh account is a
     /// maildir its first delivery has not created yet.
     ///
-    /// Past [`MAX_LISTING_CANDIDATES`] the folder is paged by revision rather
+    /// Past `MAX_LISTING_CANDIDATES` the folder is paged by revision rather
     /// than by `Date` (see the type's docs): the one case where this function
     /// knowingly answers something other than the ordering above.
     ///
@@ -601,7 +601,7 @@ impl MaildirReader {
         //
         // The cost of being right is one bounded head read per message. A
         // maildir at rest holds a few thousand, so that is the price of a
-        // correct page; past [`MAX_LISTING_CANDIDATES`] the roster stops
+        // correct page; past `MAX_LISTING_CANDIDATES` the roster stops
         // reading heads and pages on the mtime instead. That is a deliberate
         // *degradation*, and it is stated as one: a folder that large is one
         // an operator should be archiving, and answering it from arrival
