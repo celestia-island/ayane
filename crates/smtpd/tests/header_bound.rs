@@ -1708,14 +1708,13 @@ async fn the_line_bound_is_the_same_rule_on_both_transports() {
 /// transaction timer and answers `421` — a timeout where the client had already
 /// given the server everything it was going to send.
 ///
-/// # Why the two widths are apart
+/// # Why the widths are sampled around the bound
 ///
-/// `DATA` sees one octet more of the last line than `BDAT` does: the terminator
-/// is `CRLF.CRLF`, so the `CR` that ends the body is part of a body line that
-/// did not end in a newline. `MAX_BODY_LINE` is therefore the widest tail both
-/// transports accept, and `MAX_BODY_LINE + 1` is where they part — the row in
-/// `the_line_bound_is_the_same_rule_on_both_transports` that says so instead of
-/// hiding it.
+/// The line rule is one function (`body_line_fault`), so the transports
+/// **agree** at every width — these three points sample under / at / over the
+/// bound to pin the strict inequality and the exact transition, not to expose
+/// a fork. (An earlier revision of this test claimed a fork at `MAX_BODY_LINE
+/// + 1`; that claim predates the unified rule and was measured wrong.)
 #[tokio::test(flavor = "multi_thread")]
 async fn data_stopped_by_the_client_answers_instead_of_timing_out() {
     use ayane_smtpd::server::MAX_BODY_LINE;
