@@ -10,8 +10,9 @@
 //! ```text
 //! ayane-smtpd --role inbound --listen 127.0.0.1:3025 --spool state/spool \
 //!             --state state/desired-state.json --hostname mx.example.com
-//! ayane-smtpd --deliver --spool /var/mail/vhosts --state state/desired-state.json \
-//!             --hostname mx.example.com [--retry-max-age-seconds N] [--quota BYTES]
+//! ayane-smtpd --deliver --spool state/spool --mail-root /var/mail/vhosts \
+//!             --state state/desired-state.json --hostname mx.example.com \
+//!             [--retry-max-age-seconds N] [--quota BYTES]
 //! ```
 
 #![warn(missing_docs)]
@@ -58,6 +59,8 @@ struct ServeOptions {
 #[derive(Debug)]
 struct DeliverOptions {
     spool: PathBuf,
+    /// Where the mailboxes live (`/var/mail/vhosts`). Never the spool.
+    mail_root: PathBuf,
     state: PathBuf,
     hostname: String,
     retry_max_age: Duration,
@@ -72,8 +75,8 @@ fn usage() -> &'static str {
         [--tls-cert FILE --tls-key FILE] [--max-size BYTES] \
         [--max-header-bytes BYTES] [--per-ip LIMIT] \
         [--submission-authenticates]\n\
-     \x20 or: ayane-smtpd --deliver --spool DIR --state FILE --hostname NAME \
-        [--retry-max-age-seconds N] [--retry-max-attempts N] \
+     \x20 or: ayane-smtpd --deliver --spool DIR --mail-root DIR --state FILE \
+        --hostname NAME [--retry-max-age-seconds N] [--retry-max-attempts N] \
         [--quota BYTES] [--interval-seconds N]"
 }
 
@@ -87,6 +90,7 @@ fn parse_options() -> Result<Options, String> {
     let mut role = None;
     let mut listen = None;
     let mut spool = None;
+    let mut mail_root = None;
     let mut state = None;
     let mut hostname = None;
     let mut cert = None;
@@ -114,6 +118,7 @@ fn parse_options() -> Result<Options, String> {
                 );
             }
             "--spool" => spool = Some(PathBuf::from(value()?)),
+            "--mail-root" => mail_root = Some(PathBuf::from(value()?)),
             "--state" => state = Some(PathBuf::from(value()?)),
             "--hostname" => hostname = Some(value()?),
             "--tls-cert" => cert = Some(PathBuf::from(value()?)),
@@ -176,6 +181,8 @@ fn parse_options() -> Result<Options, String> {
         }
         return Ok(Options::Deliver(DeliverOptions {
             spool,
+            mail_root: mail_root
+                .ok_or("--mail-root is required with --deliver (it is never the spool)")?,
             state,
             hostname,
             retry_max_age,
@@ -333,22 +340,54 @@ async fn deliver_forever(options: DeliverOptions) -> Result<(), Box<dyn std::err
         max_attempts: options.retry_max_attempts,
         ..ayane_smtpd::retry::RetryPolicy::default()
     };
+    let spool = Spool::open(&options.spool)?;
     let deliverer = ayane_smtpd::deliver::Deliverer::new(
-        Spool::open(&options.spool)?,
+        spool,
+        options.mail_root.clone(),
         options.hostname.clone(),
     )
     .with_retry(retry)
     .with_quota(options.quota);
+    // The two roots are the one mistake this process cannot survive: writing
+    // mail into the spool's own directory names is a failure that looks like
+    // success. It is checked before the first pass, and a bad pair is fatal —
+    // this is not a configuration value that can be ignored.
+    deliverer.check_roots()?;
     tracing::info!(
         spool = %options.spool.display(),
+        mail_root = %options.mail_root.display(),
         max_age_seconds = options.retry_max_age.as_secs(),
         max_attempts = options.retry_max_attempts,
         "delivery consumer started"
     );
+    let mut last_warning: Option<String> = None;
     loop {
-        let state: ayane_proto::DesiredState =
-            serde_json::from_slice(&std::fs::read(&options.state)?)?;
-        state.validate()?;
+        // A snapshot that cannot be loaded, parsed or validated is a *skipped
+        // pass*, never a stopped consumer. The receiver may already have
+        // accepted mail for this instance (a `250` is a promise the spool
+        // keeps), and a consumer that exits on a bad annotation file would
+        // leave that mail sitting in `cur/` with nobody to deliver it. So the
+        // loop logs the reason once, keeps the process alive, and tries again
+        // on the next tick — the same treatment an unreadable spool gets.
+        let state = match load_state(&options.state) {
+            Ok(state) => {
+                if last_warning.take().is_some() {
+                    tracing::info!("the state snapshot is usable again; delivery resumed");
+                }
+                state
+            }
+            Err(reason) => {
+                if last_warning.as_deref() != Some(reason.as_str()) {
+                    tracing::error!(
+                        %reason,
+                        "the state snapshot cannot be used: holding delivery until it is fixed"
+                    );
+                }
+                last_warning = Some(reason);
+                tokio::time::sleep(options.interval).await;
+                continue;
+            }
+        };
         let passes = deliverer.run(&state)?;
         let due = next_due(&passes);
         let reports = passes.len();
@@ -363,6 +402,29 @@ async fn deliver_forever(options: DeliverOptions) -> Result<(), Box<dyn std::err
             .clamp(1, cap);
         tokio::time::sleep(Duration::from_secs(sleep)).await;
     }
+}
+
+/// Reads, parses and validates the state snapshot, or says why it cannot be
+/// used.
+///
+/// The three failures are one answer to the consumer — "do not deliver this
+/// pass" — because each of them makes the routing snapshot unusable in a
+/// different way and none of them is the consumer's to fix: a missing file is
+/// an apply that has not run yet, a parse error is a half-written file, and a
+/// rejected state is one the operator has to change.
+fn load_state(path: &std::path::Path) -> Result<ayane_proto::DesiredState, String> {
+    let bytes = std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let state: ayane_proto::DesiredState =
+        serde_json::from_slice(&bytes).map_err(|err| format!("{}: {err}", path.display()))?;
+    state
+        .validate()
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    // Ambiguous objects are warnings, not failures: `route` has a fixed order
+    // for them and the operator should see which objects they are.
+    for warning in state.warnings() {
+        tracing::warn!(state = %path.display(), %warning, "state snapshot warning");
+    }
+    Ok(state)
 }
 
 /// The earliest instant the last pass said something would be due.
@@ -383,4 +445,98 @@ fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_state(name: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ayane-smtpd-bin-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("desired-state.json");
+        std::fs::write(&path, contents).expect("write");
+        path
+    }
+
+    #[test]
+    fn a_usable_snapshot_loads() {
+        let path = temp_state(
+            "good",
+            r#"{"domains":[],"accounts":[],"aliases":[],"shared":[],
+                "policy":{"default_action":"reject","allowlist":[],"denylist":[]}}"#,
+        );
+        let state = load_state(&path).expect("a healthy snapshot");
+        assert!(state.warnings().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    #[test]
+    fn an_unusable_snapshot_is_reported_not_fatal() {
+        // `S1-d`: the three ways a snapshot can be unusable are the three
+        // reasons the consumer holds delivery instead of exiting. The receiver
+        // may already hold mail for this instance (a 250 is a promise), so a
+        // consumer that stopped here would strand it.
+        let missing = temp_state("missing", "");
+        let parent = missing.parent().expect("dir").to_path_buf();
+        std::fs::remove_file(&missing).expect("remove");
+        assert!(
+            load_state(&missing).is_err(),
+            "a missing file is not a state"
+        );
+
+        let broken = temp_state("broken", "{\"domains\": [");
+        assert!(
+            load_state(&broken).is_err(),
+            "a half-written file is not a state"
+        );
+
+        // A state `validate` refuses: an account in a domain nobody hosts.
+        let unhosted = temp_state(
+            "unhosted",
+            r#"{"domains":[],"accounts":[{"id":"00000000-0000-0000-0000-000000000000",
+                "address":"a@nowhere.example","display_name":"A","quota_bytes":0}],
+                "aliases":[],"shared":[],
+                "policy":{"default_action":"reject","allowlist":[],"denylist":[]}}"#,
+        );
+        let reason = load_state(&unhosted).expect_err("an unhosted account is refused");
+        assert!(reason.contains("nowhere.example"), "{reason}");
+        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(unhosted.parent().expect("dir"));
+        let _ = std::fs::remove_dir_all(broken.parent().expect("dir"));
+    }
+
+    #[test]
+    fn an_ambiguous_but_usable_snapshot_loads_with_its_warnings() {
+        // 裁决 1: an address that is both a shared mailbox and an alias source
+        // is no longer fatal — it loads, and `route`'s fixed order decides.
+        let path = temp_state(
+            "ambiguous",
+            r#"{"domains":[{"name":"example.com","catch_all":null,"enabled":true}],
+                "accounts":[],"shared":[{"address":"team@example.com","members":[],
+                "id":"00000000-0000-0000-0000-000000000000"}],
+                "aliases":[{"source":"team@example.com","targets":["x@other.example"]}],
+                "policy":{"default_action":"reject","allowlist":[],"denylist":[]}}"#,
+        );
+        // An empty-member shared mailbox is still refused; give it a member.
+        let text = std::fs::read_to_string(&path).expect("read");
+        std::fs::write(
+            &path,
+            text.replace(
+                "\"members\":[]",
+                "\"members\":[\"00000000-0000-0000-0000-000000000001\"]",
+            ),
+        )
+        .expect("write");
+        let state = load_state(&path).expect("an ambiguous address is a warning");
+        assert_eq!(state.warnings().len(), 1, "{:?}", state.warnings());
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
 }

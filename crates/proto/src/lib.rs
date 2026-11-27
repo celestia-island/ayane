@@ -428,13 +428,17 @@ pub enum StateError {
     /// A shared mailbox has no members.
     #[error("shared mailbox `{0}` has no members")]
     EmptySharedMailbox(String),
-    /// A shared mailbox is the alias source or the catch-all of a domain: an
-    /// alias keeps no local copy and a catch-all has to name a mailbox, so
-    /// neither can be a shared mailbox — `route` would otherwise have to
-    /// answer two contradictory things for one address (forward the mail away
-    /// / deliver it here), and one of the two would be silently chosen by the
-    /// order of a match arm.
-    #[error("shared mailbox `{0}` may not also be an alias source or a catch-all")]
+    /// A shared mailbox is the alias source or the catch-all of a domain.
+    ///
+    /// This is **not** a validation failure: an address that is both is
+    /// ambiguous (an alias keeps no local copy, a shared mailbox is delivered
+    /// locally, a catch-all names a mailbox), but refusing the state would
+    /// block a deployment that already holds one — the address is real, and
+    /// the operator's data is not this layer's to refuse. It is reported by
+    /// [`DesiredState::warnings`], and `ayane_mail::route` resolves it in a
+    /// fixed, documented order (a shared mailbox wins over an alias, an alias
+    /// over the catch-all) so the same state always delivers the same way.
+    #[error("shared mailbox `{0}` is also an alias source or a catch-all")]
     SharedMailboxConflict(String),
     /// A hosted domain name is not a valid DNS name.
     #[error("hosted domain is malformed: {0}")]
@@ -502,13 +506,13 @@ impl DesiredState {
                 return Err(StateError::DuplicateAddress(domain.name.clone()));
             }
         }
-        // One address, one answer. `route` returns a single `Route` per
-        // recipient, so an address that is both a shared mailbox (local —
-        // deliver it here) and an alias source (forward it away) would be
-        // resolved by whichever match arm happened to come first. This runs
-        // before the duplicate-address scan, so such a state is refused for
-        // the contradiction it *is* rather than for the duplicate it also
-        // trips.
+        // An address one object claims twice. `route` answers one `Route` per
+        // recipient, so an address that is both a shared mailbox (local) and
+        // an alias source (forwarded away), or a catch-all, has to be resolved
+        // somewhere. It is resolved in `ayane_mail::route` (shared > alias >
+        // catch-all, fixed and tested) and reported here — refusing the state
+        // would block a deployment that already holds one, and the operator's
+        // data is not this layer's to refuse.
         for shared in &self.shared {
             let also_forwarded = self
                 .aliases
@@ -520,14 +524,19 @@ impl DesiredState {
                     .as_ref()
                     .is_some_and(|catch_all| *catch_all == shared.address)
             });
-            if also_forwarded || also_catch_all {
-                return Err(StateError::SharedMailboxConflict(
-                    shared.address.to_string(),
-                ));
-            }
+            // Reported by `warnings`, never refused (see the variant).
+            let _ = (also_forwarded, also_catch_all);
         }
         for address in self.addresses() {
             if !seen.insert(address.to_string()) {
+                // A shared mailbox claimed twice is the one duplicate that is
+                // a warning rather than a refusal: it is exactly the shape of
+                // `SharedMailboxConflict`, and `route` has a fixed answer for
+                // it (the shared mailbox wins). Everything else can be claimed
+                // by only one object.
+                if self.is_shared_only_duplicate(address) {
+                    continue;
+                }
                 return Err(StateError::DuplicateAddress(address.to_string()));
             }
         }
@@ -564,6 +573,55 @@ impl DesiredState {
             }
         }
         Ok(())
+    }
+
+    /// Whether `address` is claimed more than once solely because a shared
+    /// mailbox is also an alias source or a catch-all — the ambiguity
+    /// [`DesiredState::warnings`] reports instead of refusing.
+    fn is_shared_only_duplicate(&self, address: &Address) -> bool {
+        let shared = self.shared.iter().any(|entry| entry.address == *address);
+        let conflicting = self.aliases.iter().any(|alias| alias.source == *address)
+            || self.domains.iter().any(|domain| {
+                domain
+                    .catch_all
+                    .as_ref()
+                    .is_some_and(|catch_all| catch_all == address)
+            });
+        let account = self.accounts.iter().any(|entry| entry.address == *address);
+        shared && conflicting && !account
+    }
+
+    /// Everything wrong with this state that does **not** stop it from
+    /// working: conditions the operator should know about, which the renderers
+    /// and the delivery path already resolve in a fixed way.
+    ///
+    /// It exists because [`DesiredState::validate`] has to stay the gate that
+    /// refuses states that cannot be rendered or served, while a deployment
+    /// that already holds an ambiguous object must keep working. A warning is
+    /// therefore always something the rest of the stack has a documented
+    /// answer for — currently one: a shared mailbox that is also an alias
+    /// source or a catch-all (`ayane_mail::route` picks the shared mailbox).
+    #[must_use]
+    pub fn warnings(&self) -> Vec<StateError> {
+        let mut out = Vec::new();
+        for shared in &self.shared {
+            let also_forwarded = self
+                .aliases
+                .iter()
+                .any(|alias| alias.source == shared.address);
+            let also_catch_all = self.domains.iter().any(|domain| {
+                domain
+                    .catch_all
+                    .as_ref()
+                    .is_some_and(|catch_all| *catch_all == shared.address)
+            });
+            if also_forwarded || also_catch_all {
+                out.push(StateError::SharedMailboxConflict(
+                    shared.address.to_string(),
+                ));
+            }
+        }
+        out
     }
 
     fn addresses(&self) -> impl Iterator<Item = &Address> {
@@ -719,28 +777,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_shared_mailbox_that_is_also_an_alias_source() {
-        // `route` answers one `Route` per recipient: an alias source forwards
-        // and a shared mailbox is local, and letting one address be both
-        // would leave the delivery consumer to pick an arm order, silently.
+    fn a_shared_mailbox_that_is_also_an_alias_source_is_a_warning_not_a_refusal() {
+        // The address is ambiguous (local delivery versus a forward), but the
+        // stack has an answer for it: `route` picks the shared mailbox. A
+        // deployment that already holds one must keep loading, so `validate`
+        // accepts the state and `warnings` names it.
         let mut state = fixture();
         state.aliases[0].source = address("team@example.com");
-        assert!(matches!(
-            state.validate(),
-            Err(StateError::SharedMailboxConflict(_))
-        ));
+        state.validate().expect("an ambiguous address is not fatal");
+        let warnings = state.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            matches!(&warnings[0], StateError::SharedMailboxConflict(a) if a == "team@example.com"),
+            "{warnings:?}"
+        );
     }
 
     #[test]
-    fn rejects_a_shared_mailbox_that_is_also_a_catch_all() {
+    fn a_shared_mailbox_that_is_also_a_catch_all_is_a_warning_not_a_refusal() {
         let mut state = fixture();
         state.domains[0].catch_all = Some(address("team@example.com"));
         state.accounts[0].address = address("other@example.com");
         state.aliases.clear();
+        state.validate().expect("an ambiguous address is not fatal");
         assert!(matches!(
-            state.validate(),
-            Err(StateError::SharedMailboxConflict(_))
+            state.warnings().as_slice(),
+            [StateError::SharedMailboxConflict(_)]
         ));
+    }
+
+    #[test]
+    fn a_healthy_state_has_no_warnings() {
+        assert!(fixture().warnings().is_empty());
     }
 
     // ── Gmail-style address variants ──────────────────────────────────────

@@ -24,10 +24,13 @@ fn addr(raw: &str) -> Address {
     Address::parse(raw).expect("fixture address")
 }
 
-/// The mail root the consumer writes into: the harness' temp directory, whose
-/// children are the `<domain>/<local>/Maildir` trees.
+/// The consumer over the harness' spool, writing into its own mail tree.
+///
+/// The two roots are separate because a deployment's are: the spool owns
+/// `tmp/`, `new/`, `cur/` and `corrupt/`, and every maildir owns three of
+/// those names of its own.
 fn deliverer(harness: &Harness) -> Deliverer {
-    Deliverer::new(harness.spool.clone(), "mx.test")
+    Deliverer::new(harness.spool.clone(), harness.mail_root(), "mx.test")
 }
 
 #[tokio::test(flavor = "multi_thread")]

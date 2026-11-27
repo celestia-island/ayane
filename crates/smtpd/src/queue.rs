@@ -1335,6 +1335,55 @@ fn verify_integrity(message: &Path, envelope: &Envelope) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a claimed message still belongs to a live consumer.
+///
+/// Three questions, in the order that each answers a case the previous one
+/// cannot:
+///
+/// 1. **Is any process holding the file open?** A consumer reads its message
+///    while it delivers it, so an open descriptor is proof that somebody is
+///    working on it — and it is the only signal that survives a pid being
+///    reused for an unrelated process.
+/// 2. **Is the pid in the queue id still running?** Every id carries the
+///    writer's pid; a dead one is a consumer that crashed, whatever the age.
+/// 3. **Is the file younger than the residue window?** A live pid can still
+///    be someone else's (a reused number), so a young file is given the
+///    benefit of the doubt until [`TMP_RESIDUE_AGE`] has passed.
+///
+/// `true` means "leave it alone": the same three rules
+/// [`tmp_leftover`] applies to a half-written message, because both sweeps
+/// delete or move something a live process may still own.
+fn held_by_a_consumer(eml: &Path) -> bool {
+    if is_open_somewhere(eml) {
+        return true;
+    }
+    if let Some(pid) = eml
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(id_pid)
+    {
+        if pid == std::process::id() || process_alive(pid) {
+            return !residue_expired(eml);
+        }
+    }
+    false
+}
+
+impl Spool {
+    /// Whether the claimed message `id` still belongs to a live consumer.
+    ///
+    /// This is the `held_by_a_consumer` decision, exposed so a test can ask
+    /// it directly: the two ways a message can be *nobody's* — a dead pid and
+    /// an old file — are not separable through the sweep's outcome alone (an
+    /// entry whose pid is dead is swept whether or not it is old, and an old
+    /// entry is swept whether or not its pid is dead), so the outcome pins
+    /// the *sweep* and this pins the *rule*.
+    #[must_use]
+    pub fn is_held(&self, id: &str) -> bool {
+        held_by_a_consumer(&self.root.join("cur").join(format!("{id}.eml")))
+    }
+}
+
 /// Moves every message a crashed delivery left in `cur/` back to `new/`.
 ///
 /// A message in `cur/` that nothing is working on is one a consumer claimed
@@ -1342,10 +1391,15 @@ fn verify_integrity(message: &Path, envelope: &Envelope) -> Result<(), String> {
 /// entry goes back to the queue, whose next pass delivers it again (the
 /// at-least-once side of the window [`crate::deliver`] describes).
 ///
-/// A file another, older process still holds open belongs to a consumer that
-/// is still working on it, so it stays where it is. So does one whose numbers
-/// do not match its envelope (that check is the per-directory pass's, and
-/// this runs after it).
+/// Ownership is decided by [`held_by_a_consumer`] — an open descriptor, a
+/// live pid, or a file younger than the residue window — so a second consumer
+/// sweeping while the first one is between its claim and its delivery does
+/// not take the message out from under it.
+///
+/// One whose numbers do not match its envelope never reaches here: that check
+/// is the per-directory pass's, and this runs after it. An entry with a
+/// message and no envelope has already been moved to `corrupt/` by that pass,
+/// so the pair below always exists.
 ///
 /// The delivery layer's own record (`<id>.state.json`) is not a queue entry
 /// and is not touched here; it is the file the *orphan* rule must learn to
@@ -1365,23 +1419,18 @@ fn sweep_cur(root: &Path, report: &mut RecoveryReport) -> io::Result<()> {
         messages.insert(stem.to_owned(), path);
     }
     for (id, eml) in &messages {
-        if is_open_somewhere(eml) {
-            tracing::debug!(
-                id,
-                "recovery left a message a consumer still holds open in cur/"
-            );
+        if held_by_a_consumer(eml) {
+            tracing::debug!(id, "recovery left a message a consumer still owns in cur/");
             continue;
         }
         let json = cur.join(format!("{id}.json"));
         if !json.exists() {
-            // A message without its envelope is not a queue entry: it goes
-            // aside rather than back into `new/`, where no consumer could
-            // read it.
-            if quarantine(root, eml, id) {
-                report.corrupt += 1;
-            } else {
-                report.record_failure(eml, "quarantine", &"rename into corrupt/ failed");
-            }
+            // The per-directory pass above moves a message without its
+            // envelope to `corrupt/`; it only gets here if that move failed,
+            // and moving it back to `new/` would put an entry there that no
+            // consumer can read. Report it and leave it where the operator
+            // can see it.
+            report.record_failure(eml, "reclaim", &"the envelope is missing");
             continue;
         }
         let mut moved = false;
@@ -1433,6 +1482,66 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spool with one committed, claimed message in `cur/`, plus the root
+    /// the caller cleans up.
+    fn claimed_spool(name: &str) -> (PathBuf, Spool, String) {
+        let root = temp_root(name);
+        let spool = Spool::open(&root).expect("spool");
+        let id = spool.next_id();
+        let mut staged = spool.stage(&id, envelope(&id)).expect("stage");
+        staged.write(b"Subject: hi\r\n\r\nbody\r\n").expect("write");
+        staged.commit().expect("commit");
+        spool.claim(&id).expect("claim");
+        (root, spool, id)
+    }
+
+    #[test]
+    fn sweep_cur_takes_back_a_claimed_message_nobody_owns() {
+        // The baseline the ownership rules are measured against: nothing holds
+        // the file open, and the id names this very process, so only the age
+        // rule can decide — and a message older than the residue window is a
+        // consumer that died, so it goes back to `new/`.
+        let (root, spool, id) = claimed_spool("owns-nobody");
+        let path = spool.root().join("cur").join(format!("{id}.eml"));
+        // Age alone is not enough while the id names a live process: this
+        // test's own pid. The pid rule has to *stop* respecting the id before
+        // the age rule can decide — which is what a crashed consumer leaves
+        // (its pid is gone), and here it is spelled out as the predicate.
+        age_to(&path, TMP_RESIDUE_AGE + Duration::from_secs(60));
+        assert!(
+            !spool.is_held(&id),
+            "an old entry whose consumer is gone belongs to nobody"
+        );
+        let report = spool.recover_with_claimed(true).expect("recover");
+        assert_eq!(report.reclaimed, 1, "an orphan in cur/ goes back to new/");
+        assert_eq!(spool.list(QueueState::New).expect("list").len(), 1);
+        assert!(spool.list(QueueState::Cur).expect("list").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sweep_cur_leaves_a_message_a_live_consumer_holds_open() {
+        // `S1-a`: a second consumer must not take a message the first one is
+        // delivering. The open descriptor is the proof — it is the only
+        // signal that survives the pid check, which is why it is asked first.
+        let (root, spool, id) = claimed_spool("owns-open");
+        let path = spool.root().join("cur").join(format!("{id}.eml"));
+        age_to(&path, TMP_RESIDUE_AGE + Duration::from_secs(60));
+        let held = File::open(&path).expect("hold the message open");
+        assert!(
+            spool.is_held(&id),
+            "an open descriptor is proof of a consumer"
+        );
+        let report = spool.recover_with_claimed(true).expect("recover");
+        assert_eq!(report.reclaimed, 0, "the message still has its consumer");
+        assert_eq!(spool.list(QueueState::Cur).expect("list").len(), 1);
+        // …and once the consumer lets go, the next sweep takes it back.
+        drop(held);
+        let report = spool.recover_with_claimed(true).expect("recover");
+        assert_eq!(report.reclaimed, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn envelope(id: &str) -> Envelope {
         Envelope {

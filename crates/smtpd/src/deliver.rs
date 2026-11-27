@@ -325,14 +325,40 @@ pub fn maildir_home(domain: &str, local: &str) -> String {
 /// One instance is shared by every pass over one spool; [`Deliverer::new`] is
 /// the production configuration and the `with_*` builders are the knobs an
 /// operator or a test sets.
+///
+/// **The spool and the mail root are two different directories.** A spool
+/// owns `tmp/`, `new/`, `cur/` and `corrupt/`; every maildir owns `tmp/`,
+/// `new/` and `cur/` of its own. Using one root for both would create the
+/// spool's four directories *as children of `/var/mail/vhosts`* — four names
+/// that collide with a mailbox layout — so the two are separate arguments and
+/// [`Deliverer::new`] refuses a mail root that already looks like one or the
+/// other (see [`Deliverer::check_roots`]).
 #[derive(Clone)]
 pub struct Deliverer {
     spool: Spool,
-    root: PathBuf,
+    mail_root: PathBuf,
     hostname: String,
     retry: RetryPolicy,
     quota: Option<u64>,
     hooks: Arc<Hooks>,
+}
+
+/// The directory names a spool owns, and therefore the names a mail root must
+/// not use for its children.
+pub const SPOOL_DIRECTORIES: [&str; 4] = ["tmp", "new", "cur", "corrupt"];
+
+/// What keeps a deliverer from writing into the wrong tree.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RootError {
+    /// The mail root *is* the spool root: the same collision as a child
+    /// directory, one level up.
+    #[error("the mail root is the spool root (`{0}`): one of them has to move")]
+    SamePath(String),
+    /// The mail root has a `tmp`, `new`, `cur` or `corrupt` child: the spool's
+    /// layout, or a maildir's, is already there, and either would be
+    /// overwritten or read as a mailbox.
+    #[error("`{}` is one of the spool's own directory names: `{}` may not contain it", .1, .0)]
+    ReservedChild(String, String),
 }
 
 /// The clock, the seams and the counters.
@@ -347,7 +373,7 @@ struct Hooks {
 impl std::fmt::Debug for Deliverer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Deliverer")
-            .field("root", &self.root)
+            .field("mail_root", &self.mail_root)
             .field("hostname", &self.hostname)
             .field("retry", &self.retry)
             .field("quota", &self.quota)
@@ -356,24 +382,58 @@ impl std::fmt::Debug for Deliverer {
 }
 
 impl Deliverer {
-    /// A deliverer over `spool`, identifying itself as `hostname` in the
-    /// fields and reports it generates.
+    /// A deliverer that drains `spool` and writes mail into `mail_root`,
+    /// identifying itself as `hostname` in the fields and reports it
+    /// generates.
     ///
-    /// `spool` is the mail root — in production `/var/mail/vhosts`, the
-    /// directory whose children are `<domain>/<local>/Maildir` — because a
-    /// delivery has to land beside the mailboxes it already holds. The spool
-    /// directories are created under it.
+    /// `mail_root` is the deployment's `/var/mail/vhosts` — the directory
+    /// whose children are `<domain>/<local>/Maildir`. `spool` is wherever the
+    /// receiver committed its queue, and it is a different directory: see
+    /// [`Deliverer::check_roots`] for why, and for the assertion that makes
+    /// the mistake impossible to ship.
     #[must_use]
-    pub fn new(spool: Spool, hostname: impl Into<String>) -> Self {
-        let root = spool.root().to_path_buf();
+    pub fn new(spool: Spool, mail_root: impl Into<PathBuf>, hostname: impl Into<String>) -> Self {
         Self {
             spool,
-            root,
+            mail_root: mail_root.into(),
             hostname: hostname.into(),
             retry: RetryPolicy::default(),
             quota: None,
             hooks: Arc::new(Hooks::default()),
         }
+    }
+
+    /// Refuses a mail root that carries the spool's layout.
+    ///
+    /// A spool owns `tmp/`, `new/`, `cur/` and `corrupt/`. If the mail root is
+    /// the spool, or has any of those four names as a child, then one of the
+    /// two layouts is already occupying the other's names: the spool's
+    /// `cur/` would be read as a mailbox, or a maildir's `new/` as the
+    /// queue's. Either way mail is either overwritten or delivered into a
+    /// directory a client can never open — a failure that looks like success,
+    /// which is why this is checked at start-up rather than discovered by a
+    /// missing message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RootError`] for the two collisions described above.
+    pub fn check_roots(&self) -> Result<(), RootError> {
+        let spool_root = std::fs::canonicalize(self.spool.root())
+            .unwrap_or_else(|_| self.spool.root().to_path_buf());
+        let mail_root =
+            std::fs::canonicalize(&self.mail_root).unwrap_or_else(|_| self.mail_root.clone());
+        if spool_root == mail_root {
+            return Err(RootError::SamePath(mail_root.display().to_string()));
+        }
+        for name in SPOOL_DIRECTORIES {
+            if mail_root.join(name).exists() {
+                return Err(RootError::ReservedChild(
+                    mail_root.display().to_string(),
+                    name.to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The spool being drained.
@@ -384,14 +444,16 @@ impl Deliverer {
 
     /// The mail root (`<domain>/<local>/Maildir` lives under it).
     #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
+    pub fn mail_root(&self) -> &Path {
+        &self.mail_root
     }
 
-    /// Where quarantined messages are moved.
+    /// Where quarantined messages are moved: beside the *spool*, never inside
+    /// the mail tree, so held mail can never be read as a mailbox and the
+    /// spool's own sweeps never touch it.
     #[must_use]
     pub fn quarantine(&self) -> PathBuf {
-        self.root.join(QUARANTINE_DIR)
+        self.spool.root().join(QUARANTINE_DIR)
     }
 
     /// The retry ladder and deadline.
@@ -470,7 +532,7 @@ impl Deliverer {
             })
             .collect::<Vec<_>>();
         parts.reverse();
-        let mut path = self.root.clone();
+        let mut path = self.mail_root.clone();
         path.extend(parts);
         path.join("Maildir")
     }
@@ -525,8 +587,30 @@ impl Deliverer {
     ) -> io::Result<DeliveryReport> {
         let message = self.spool.read_message(QueueState::Cur, &queued.id)?;
         let mut record = self.read_record(&queued.id)?;
-        let had_record = !record.recipients.is_empty();
-        let before_pass = record.clone();
+        if !record.recipients.is_empty() && record.settled() {
+            // Every recipient of this record is done. That is either this
+            // message's own record — a crash between the last settlement and
+            // the record's removal — or a previous message's, left on an id
+            // that was handed out again.
+            //
+            // The two cannot be told apart from the record alone, and the
+            // asymmetry decides which way to err. Delivering again on a
+            // *reused* id puts one message into a stranger's mailbox and takes
+            // the other's nowhere; leaving it puts mail in the queue for an
+            // operator to see. Both are visible anomalies, but only the first
+            // is silent damage to a third party, so the entry is held rather
+            // than delivered. The normal path (below) removes the record when
+            // it settles a message, so this is residue either way.
+            tracing::warn!(
+                id = queued.id,
+                "a queue entry carries a settled record: held, not delivered"
+            );
+            return Ok(DeliveryReport {
+                id: queued.id.clone(),
+                recipients: Vec::new(),
+                disposition: Disposition::Held,
+            });
+        }
         if record.recipients.is_empty() {
             // First pass (or a crash before the record was written): every
             // accepted recipient starts pending.
@@ -534,8 +618,10 @@ impl Deliverer {
                 record.entry(recipient.clone());
             }
         }
+
         let sender = sender_address(&queued.envelope);
         let mut reports = Vec::new();
+        let mut changed = false;
         let recipients = &mut record.recipients;
         for entry in recipients.iter_mut() {
             if !entry.state.pending || entry.state.next_attempt_epoch > now_epoch {
@@ -549,25 +635,21 @@ impl Deliverer {
                 entry,
                 now_epoch,
             );
+            // The record is written only when something happened to a
+            // recipient, and "something happened" means an outcome that moved
+            // it: a `Remote` recipient is looked at every pass and left
+            // exactly as it was, so rewriting the same bytes once per
+            // `--interval-seconds` for a wait that lasts days is pure write
+            // amplification on the mail host's busiest directory.
+            changed |= !matches!(outcome, RecipientOutcome::Remote);
             reports.push(RecipientReport {
                 recipient: entry.state.recipient.clone(),
                 outcome,
             });
         }
-        // The pass is idempotent by construction: a waste-write guard here
-        // would make a regression that rewrites the record every pass
-        // (`truncate`, a reset, a fresh ladder) look identical to the healthy
-        // case, because the *file* would only be rewritten with the same
-        // bytes. The record is written every pass that produced a report for
-        // at least one recipient, and a do-nothing pass still writes nothing
-        // because every recipient was skipped.
-        if had_record && record == before_pass && !reports.is_empty() {
-            // The pass changed nothing: every recipient is settled, waiting,
-            // or in a forward's child. Writing the record back would rewrite
-            // an unchanged file on every pass for the lifetime of a remote
-            // wait (`--interval-seconds`, days long). The comparison is on the
-            // record and not on the report, so a `Remote` recipient — looked
-            // at, left alone — still does not cost a write.
+        if !changed {
+            // Nothing moved: every recipient is waiting, settled, or remote,
+            // and the record already says so.
             return Ok(DeliveryReport {
                 id: queued.id.clone(),
                 recipients: reports,
@@ -586,6 +668,14 @@ impl Deliverer {
         let disposition = if pending {
             Disposition::Held
         } else {
+            // The record is the delivery layer's, so it leaves with the
+            // message it describes: a settled record has nothing left to say,
+            // and leaving it behind is what lets a reused id pick up a
+            // previous message's verdict. The record goes first — a crash
+            // between the two leaves a message with no record, which is
+            // delivered from scratch (at-least-once, and its maildir copies
+            // carry `Delivered-To:` for duplicate suppression).
+            self.remove_record(&queued.id)?;
             self.spool.remove(QueueState::Cur, &queued.id)?;
             if forwarded_only {
                 Disposition::Forwarded
@@ -1195,6 +1285,18 @@ impl Deliverer {
         }
     }
 
+    /// Deletes the delivery record of `id`, durably: the unlink is followed
+    /// by a directory sync, so a crash cannot resurrect a record whose message
+    /// is gone.
+    fn remove_record(&self, id: &str) -> io::Result<()> {
+        let dir = self.record_dir();
+        match std::fs::remove_file(self.record_path(id)) {
+            Ok(()) => fsync_dir(&dir),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Writes the delivery record of `id`, durably.
     fn write_record(&self, id: &str, record: &DeliveryRecord) -> io::Result<()> {
         let dir = self.record_dir();
@@ -1271,6 +1373,17 @@ pub struct DeliveryRecord {
 }
 
 impl DeliveryRecord {
+    /// Whether every recipient has reached a terminal state.
+    ///
+    /// A settled record is one whose message is done: the pass that settles
+    /// the last recipient deletes it (see `deliver_claimed`), so one that is
+    /// still on disk with nothing pending belongs to a *different* message
+    /// that happened to use the same queue id.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        !self.recipients.is_empty() && self.recipients.iter().all(|entry| !entry.state.pending)
+    }
+
     /// The entry for `recipient`, created when it is missing.
     fn entry(&mut self, recipient: String) -> &mut RecordedRecipient {
         if let Some(index) = self
@@ -1374,6 +1487,22 @@ fn dsn_received(hostname: &str, now_epoch: u64) -> String {
     )
 }
 
+/// `text` with anything a header line cannot hold folded onto one line.
+///
+/// `\r` and `\n` become spaces, and a NUL is dropped: those are the three
+/// octets that can end a field or a line early. The result is used where a
+/// value (a hostname, an error message) joins a header line, so a message
+/// this crate *generates* can never carry a field nobody wrote.
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\r' | '\n' => ' ',
+            '\0' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
 /// Formats an instant as the RFC 5322-style stamp a `Received:` field carries.
 #[must_use]
 pub fn format_epoch(epoch_secs: u64) -> String {
@@ -1397,7 +1526,14 @@ fn dsn_body(
     reason: &str,
     now_epoch: u64,
 ) -> Vec<u8> {
-    let boundary = format!("ayane-dsn-{parent_id}");
+    // Every argument below lands on a header line, and a CR or LF in any of
+    // them would end that field and start another one — the classic header
+    // injection. The ones that can carry arbitrary text are the hostname and
+    // the failure reason (a path, an error message); they are folded onto one
+    // line here rather than trusted.
+    let hostname = single_line(hostname);
+    let reason = single_line(reason);
+    let boundary = format!("ayane-dsn-{}", single_line(parent_id));
     let date = format_epoch(now_epoch);
     format!(
         "From: Mail Delivery System <postmaster@{hostname}>\r\n\
@@ -1581,8 +1717,11 @@ mod tests {
 
     fn fixture(name: &str) -> Fixture {
         let root = temp_root(name);
-        let spool = Spool::open(&root).expect("spool");
-        let deliverer = Deliverer::new(spool.clone(), "mx.example.com");
+        // Two roots, as a deployment has them: the spool (its own `tmp/`,
+        // `new/`, `cur/`, `corrupt/`) and the mail tree (`<domain>/<local>/
+        // Maildir`, quarantine beside the spool).
+        let spool = Spool::open(root.join("spool")).expect("spool");
+        let deliverer = Deliverer::new(spool.clone(), root.join("mail"), "mx.example.com");
         Fixture {
             root,
             spool,
@@ -1623,7 +1762,7 @@ mod tests {
         let deliverer = &f.deliverer;
         assert_eq!(
             deliverer.maildir_path(&addr("ops@example.com")),
-            deliverer.root().join("example.com/ops/Maildir")
+            deliverer.mail_root().join("example.com/ops/Maildir")
         );
         // The engine's renderer and this module must agree on the first
         // floor; the second one is Dovecot's `mail_location`.
@@ -1635,9 +1774,48 @@ mod tests {
         // in the base mailbox, not in a directory named after the tag.
         assert_eq!(
             deliverer.maildir_path(&addr("ops@example.com")),
-            deliverer.root().join("example.com/ops/Maildir")
+            deliverer.mail_root().join("example.com/ops/Maildir")
         );
         let _ = std::fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_mail_root_that_collides_with_the_spool_is_refused() {
+        // The one mistake this process must not survive: a spool owns `tmp/`,
+        // `new/`, `cur/` and `corrupt/`, and so does every maildir. Writing
+        // mail into a directory that already holds a spool's layout — or the
+        // spool itself — is a failure that looks like success.
+        let root = temp_root("roots");
+        let spool = Spool::open(root.join("spool")).expect("spool");
+        // The healthy pair passes.
+        let good = Deliverer::new(spool.clone(), root.join("mail"), "mx.example.com");
+        good.check_roots().expect("two separate roots");
+        // The spool itself does not.
+        let same = Deliverer::new(spool.clone(), root.join("spool"), "mx.example.com");
+        assert_eq!(
+            same.check_roots(),
+            Err(RootError::SamePath(
+                std::fs::canonicalize(root.join("spool"))
+                    .unwrap_or_else(|_| root.join("spool"))
+                    .display()
+                    .to_string()
+            ))
+        );
+        // Nor does a mail root that already has one of the spool's children.
+        for name in SPOOL_DIRECTORIES {
+            let mail_root = root.join(format!("mail-{name}"));
+            std::fs::create_dir_all(mail_root.join(name)).expect("the colliding child");
+            let deliverer = Deliverer::new(spool.clone(), &mail_root, "mx.example.com");
+            assert_eq!(
+                deliverer.check_roots(),
+                Err(RootError::ReservedChild(
+                    mail_root.display().to_string(),
+                    name.to_owned()
+                )),
+                "a `{name}/` child is the spool's layout, not a mailbox"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2173,13 +2351,10 @@ mod tests {
         // No attempt is charged and no bounce is produced: the entry waits.
         assert_eq!(spool.list(QueueState::Cur).expect("list").len(), 1);
         assert!(spool.list(QueueState::New).expect("list").is_empty());
-        // A pass with nothing due leaves the record alone in both senses: no
-        // recipient is charged an attempt, and an untouched file is not
-        // rewritten every `--interval-seconds` for a wait that can last days.
-        let before = std::fs::metadata(deliverer.record_path(&queued.id))
-            .and_then(|meta| meta.modified())
-            .expect("the record");
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // A pass where nothing moved writes nothing: a `Remote` recipient is
+        // looked at again every `--interval-seconds` for days, and neither the
+        // spool's files nor its directories may grow from that.
+        let before_files = entries(&spool.root().join("cur"));
         let before_record = deliverer.read_record(&queued.id).expect("record");
         let again = deliverer
             .deliver_claimed(&state, &queued, 2_000)
@@ -2189,20 +2364,23 @@ mod tests {
             1,
             "the remote recipient is looked at again and left alone"
         );
+        assert_eq!(again.recipients[0].outcome, RecipientOutcome::Remote);
+        assert_eq!(again.disposition, Disposition::Held);
+        assert_eq!(
+            entries(&spool.root().join("cur")),
+            before_files,
+            "an idle pass must not write anything into the spool"
+        );
         assert_eq!(
             deliverer.read_record(&queued.id).expect("record"),
             before_record,
-            "a pass that changes nothing must leave the record byte-identical"
+            "and nothing in the record"
         );
-        assert_eq!(again.recipients[0].outcome, RecipientOutcome::Remote);
-        assert_eq!(again.disposition, Disposition::Held);
-        let after = std::fs::metadata(deliverer.record_path(&queued.id))
-            .and_then(|meta| meta.modified())
-            .expect("the record");
-        assert_eq!(before, after, "an idle pass must not rewrite the record");
-        let record = deliverer.read_record(&queued.id).expect("record");
-        assert_eq!(record.recipients[0].state.attempts, 0);
-        assert!(record.recipients[0].state.pending);
+        // There is nothing to write: a `Remote` recipient never moved, so no
+        // record was produced for it — and therefore no attempt is charged for
+        // a delivery nobody attempted.
+        assert!(before_record.recipients.is_empty(), "{before_record:?}");
+        assert!(!deliverer.record_path(&queued.id).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2262,8 +2440,8 @@ mod tests {
     #[test]
     fn a_failed_recipient_climbs_the_ladder_and_is_then_bounced() {
         let root = temp_root("retry-ladder");
-        let spool = Spool::open(&root).expect("spool");
-        let deliverer = Deliverer::new(spool.clone(), "mx.example.com");
+        let spool = Spool::open(root.join("spool")).expect("spool");
+        let deliverer = Deliverer::new(spool.clone(), root.join("mail"), "mx.example.com");
         let state = state();
         // A permanent-but-retried failure is simulated with a transient one:
         // the mailbox lives on a read-only directory, so every write is
@@ -2351,10 +2529,11 @@ mod tests {
     fn an_attempt_cap_bounces_before_the_deadline() {
         let root = temp_root("attempt-cap");
         let spool = Spool::open(&root).expect("spool");
-        let deliverer = Deliverer::new(spool.clone(), "mx.example.com").with_retry(RetryPolicy {
-            max_attempts: 2,
-            ..RetryPolicy::default()
-        });
+        let deliverer = Deliverer::new(spool.clone(), root.join("mail"), "mx.example.com")
+            .with_retry(RetryPolicy {
+                max_attempts: 2,
+                ..RetryPolicy::default()
+            });
         let state = state();
         block_directory_syncs(&deliverer);
         let queued = stage(
@@ -2386,8 +2565,8 @@ mod tests {
     #[test]
     fn a_permanent_failure_is_not_retried() {
         let root = temp_root("permanent");
-        let spool = Spool::open(&root).expect("spool");
-        let deliverer = Deliverer::new(spool.clone(), "mx.example.com");
+        let spool = Spool::open(root.join("spool")).expect("spool");
+        let deliverer = Deliverer::new(spool.clone(), root.join("mail"), "mx.example.com");
         let state = state();
         // `new/` is a regular file: `create_dir_all` fails with a permanent
         // error, so the recipient is bounced on the first pass.
@@ -2419,8 +2598,8 @@ mod tests {
         // An account whose maildir the engine has not created yet is the
         // common case right after provisioning: it must be retried.
         let root = temp_root("missing-mailbox");
-        let spool = Spool::open(&root).expect("spool");
-        let deliverer = Deliverer::new(spool.clone(), "mx.example.com");
+        let spool = Spool::open(root.join("spool")).expect("spool");
+        let deliverer = Deliverer::new(spool.clone(), root.join("mail"), "mx.example.com");
         let state = state();
         let queued = stage(
             &spool,
@@ -2436,6 +2615,64 @@ mod tests {
         ));
         // The write creates `tmp/` and `new/` when they are absent: a missing
         // mailbox is a *directory creation*, not a failure.
+        assert_eq!(
+            entries(&deliverer.maildir_path(&addr("ops@example.com")).join("new")).len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_consumer_does_not_take_a_message_the_first_one_is_delivering() {
+        // `S1-a`: two consumers over one spool. A claims and holds the message
+        // open — exactly what a delivery pass does while it reads it — and B's
+        // full pass must not move it back to `new/` or deliver it a second
+        // time. Once A is gone (its descriptor closed, and its entry older
+        // than the residue window, because this process's own pid is the id's
+        // and a live pid is respected while the file is young), B's next pass
+        // picks it up.
+        let f = fixture("two-consumers");
+        let root = f.root.clone();
+        let (spool, deliverer) = (f.spool.clone(), &f.deliverer);
+        let state = state();
+        let queued = stage(
+            &spool,
+            envelope("0309", "alice@partner.example", &["ops@example.com"]),
+            message(),
+        );
+        spool.claim(&queued.id).expect("consumer A claims it");
+        let held = std::fs::File::open(spool.root().join("cur").join(format!("{}.eml", queued.id)))
+            .expect("consumer A holds it open");
+        // B's pass sees the entry in cur/ and must leave it alone.
+        let reports = deliverer.run_at(&state, 1_000).expect("B's pass");
+        assert!(reports.is_empty(), "B must deliver nothing: {reports:?}");
+        assert_eq!(
+            spool.list(QueueState::Cur).expect("list").len(),
+            1,
+            "the message is still A's"
+        );
+        assert!(spool.list(QueueState::New).expect("list").is_empty());
+        assert!(
+            !deliverer
+                .maildir_path(&addr("ops@example.com"))
+                .join("new")
+                .exists(),
+            "B must not have delivered it"
+        );
+        // A dies: the handle goes, and the file ages past the residue window
+        // (this process's pid names it, so only age can prove it abandoned).
+        drop(held);
+        let path = spool.root().join("cur").join(format!("{}.eml", queued.id));
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        file.set_modified(old).expect("age the message");
+        drop(file);
+        let reports = deliverer.run_at(&state, 2_000).expect("B's next pass");
+        assert_eq!(reports.len(), 1, "B picks up what A died on: {reports:?}");
+        assert_eq!(reports[0].disposition, Disposition::Delivered);
         assert_eq!(
             entries(&deliverer.maildir_path(&addr("ops@example.com")).join("new")).len(),
             1
@@ -2480,10 +2717,41 @@ mod tests {
     }
 
     #[test]
+    fn the_report_cannot_be_header_injected_by_its_arguments() {
+        // A hostname or an error message carrying CR or LF would end the field
+        // it is in and start one this crate never wrote.
+        let report = dsn_body(
+            "mx.example.com\r\nBcc: attacker@evil.example",
+            &addr("alice@partner.example"),
+            "ops@example.com",
+            "0311\nX-Injected: yes",
+            1,
+            "maildir: /a\r\nb\nbad",
+            1_000_000,
+        );
+        let text = String::from_utf8(report).expect("utf8");
+        // CR and LF are folded into spaces, so neither injected field can
+        // start a line of its own — which is what makes it a field.
+        for line in text.split("\r\n") {
+            assert!(
+                !line.starts_with("Bcc:") && !line.starts_with("X-Injected:"),
+                "injected field at line start: {line:?}"
+            );
+            assert!(line.len() <= 998, "a header line stays field-readable");
+        }
+        assert!(text.contains("Bcc: attacker@evil.example>\r\n"), "{text}");
+        // The failure reason is on the Diagnostic-Code line and nowhere else.
+        assert!(
+            text.contains("Diagnostic-Code: X-ayane; maildir: /a  b bad\r\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn a_null_sender_is_never_bounced_and_the_drop_is_audited() {
         let root = temp_root("null-sender");
-        let spool = Spool::open(&root).expect("spool");
-        let deliverer = Deliverer::new(spool.clone(), "mx.example.com");
+        let spool = Spool::open(root.join("spool")).expect("spool");
+        let deliverer = Deliverer::new(spool.clone(), root.join("mail"), "mx.example.com");
         let state = state();
         let events = Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::clone(&events);
@@ -2581,6 +2849,108 @@ mod tests {
         assert!(
             text.contains("To: <alice@partner.example>\r\n"),
             "{text:.300}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_queue_id_reused_by_a_new_message_does_not_inherit_the_old_record() {
+        // `S1-c`: ids can be handed out twice (a seeded counter, a restored
+        // spool), and a record left beside an old message would make the new
+        // one look finished before anything was attempted — it would vanish.
+        // The fix is that a settled message takes its record with it, so a
+        // reused id has nothing to inherit.
+        let f = fixture("id-reuse");
+        let root = f.root.clone();
+        let (spool, deliverer) = (f.spool.clone(), &f.deliverer);
+        // A second account, so the reused id names a *different* mailbox.
+        let mut state = state();
+        state.accounts.push(account("second@example.com"));
+        let queued = stage(
+            &spool,
+            envelope("0310", "alice@partner.example", &["ops@example.com"]),
+            message(),
+        );
+        deliverer
+            .deliver_message(&state, &queued, 1_000)
+            .expect("deliver");
+        assert!(
+            !deliverer.record_path(&queued.id).exists(),
+            "a settled message takes its record with it"
+        );
+        // The same id again, for a different message and a different mailbox.
+        let second = stage(
+            &spool,
+            envelope("0310", "alice@partner.example", &["second@example.com"]),
+            b"Subject: second\r\n\r\nbody\r\n",
+        );
+        let report = deliverer
+            .deliver_message(&state, &second, 2_000)
+            .expect("deliver");
+        assert_eq!(report.disposition, Disposition::Delivered);
+        assert_eq!(
+            report.recipients[0].recipient, "second@example.com",
+            "the new message's own recipient"
+        );
+        let delivered = deliverer
+            .maildir_path(&addr("second@example.com"))
+            .join("new");
+        assert_eq!(
+            entries(&delivered).len(),
+            1,
+            "the second message was delivered"
+        );
+        assert_eq!(
+            entries(&deliverer.maildir_path(&addr("ops@example.com")).join("new")).len(),
+            1,
+            "the first message's mailbox still holds exactly its own copy"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_settled_record_makes_the_pass_a_no_op_rather_than_a_delivery() {
+        // The settled branch and the "every recipient is already settled"
+        // skip look identical in a run where both hold. This asks the branch
+        // on its own: a record with one settled recipient *and nothing else*
+        // is exactly the shape the branch must answer, and a pass that ignored
+        // it would fall through to the per-recipient loop and deliver the
+        // message a second time.
+        let f = fixture("settled-noop");
+        let root = f.root.clone();
+        let (spool, deliverer) = (f.spool.clone(), &f.deliverer);
+        let state = state();
+        let queued = stage(
+            &spool,
+            envelope("0312", "alice@partner.example", &["ops@example.com"]),
+            message(),
+        );
+        spool.claim(&queued.id).expect("claim");
+        let mut settled = RecipientState::new("ops@example.com");
+        settled.pending = false;
+        deliverer
+            .write_record(
+                &queued.id,
+                &DeliveryRecord {
+                    recipients: vec![RecordedRecipient { state: settled }],
+                },
+            )
+            .expect("record");
+        let report = deliverer
+            .deliver_claimed(&state, &queued, 1_000)
+            .expect("deliver");
+        assert!(
+            report.recipients.is_empty(),
+            "a settled entry delivers nothing: {:?}",
+            report.recipients
+        );
+        assert_eq!(report.disposition, Disposition::Held);
+        assert!(
+            !deliverer
+                .maildir_path(&addr("ops@example.com"))
+                .join("new")
+                .exists(),
+            "and writes nothing into a mailbox"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2764,14 +3134,19 @@ mod tests {
     }
 
     #[test]
-    fn a_record_of_a_settled_recipient_outlives_the_crash() {
-        // The record is the only place a settled recipient is remembered, so
-        // a pass must neither re-deliver one nor let recovery drop the file
-        // that says so.
+    fn a_settled_record_is_honoured_and_survives_recovery() {
+        // Two different claims live in one record, and the difference is which
+        // pass reads it.
+        //
+        // * The pass that *settles* a message deletes the record with the
+        //   message (see `a_queue_id_reused_by_a_new_message_...`).
+        // * A record that is already settled and is still beside a claimed
+        //   message belongs to that message — a crash after the maildir write
+        //   and before the record went is the ordinary way to get here — so
+        //   the pass honours it and does not deliver that recipient again.
         let f = fixture("settled-record");
         let root = f.root.clone();
-        let spool = f.spool.clone();
-        let deliverer = &f.deliverer;
+        let (spool, deliverer) = (f.spool.clone(), &f.deliverer);
         let state = state();
         let queued = stage(
             &spool,
@@ -2788,6 +3163,7 @@ mod tests {
             }],
         };
         deliverer.write_record(&queued.id, &record).expect("record");
+        // Recovery must not read the record as an orphan envelope.
         spool.recover_with_claimed(true).expect("a recovery pass");
         assert_eq!(
             deliverer.read_record("0302").expect("record"),
@@ -3007,7 +3383,7 @@ mod tests {
     #[test]
     fn a_forward_chain_is_cut_at_the_hop_cap() {
         let root = temp_root("forward-loop");
-        let spool = Spool::open(&root).expect("spool");
+        let spool = Spool::open(root.join("spool")).expect("spool");
         // The aliases point at each other; every hop doubles the entries, so
         // the cap is what stops the queue from filling the disk.
         let a = addr("a@example.com");
@@ -3027,7 +3403,7 @@ mod tests {
             accounts: vec![],
             ..DesiredState::default()
         };
-        let deliverer = Deliverer::new(spool.clone(), "mx.example.com");
+        let deliverer = Deliverer::new(spool.clone(), root.join("mail"), "mx.example.com");
         let events = Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         deliverer.set_audit_sink(Arc::new(move |event| {
@@ -3184,7 +3560,8 @@ mod tests {
     fn the_quota_defers_rather_than_overflowing() {
         let root = temp_root("quota");
         let spool = Spool::open(&root).expect("spool");
-        let deliverer = Deliverer::new(spool.clone(), "mx.example.com").with_quota(Some(10));
+        let deliverer =
+            Deliverer::new(spool.clone(), root.join("mail"), "mx.example.com").with_quota(Some(10));
         let state = state();
         let queued = stage(
             &spool,
