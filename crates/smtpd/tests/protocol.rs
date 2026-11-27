@@ -325,6 +325,57 @@ async fn unknown_auth_on_port_25_is_not_offered() {
     harness.stop();
 }
 
+/// `EHLO` never advertises a login this connection would refuse.
+///
+/// The advertised list is what a client — and a probing stranger — reads as
+/// "this port takes credentials". Two independent halves make a login possible:
+/// the listener's role offers AUTH at all, **and** the channel is encrypted.
+/// Assert both, because each one alone is a passable-looking mutation: dropping
+/// the TLS condition advertises `AUTH PLAIN LOGIN` on port 25 and then answers
+/// every attempt `538` (an invitation to a door that never opens), and dropping
+/// the role condition re-advertises it on the listener whose whole design is to
+/// take no logins.
+#[tokio::test(flavor = "multi_thread")]
+async fn ehlo_advertises_auth_only_where_a_login_could_succeed() {
+    // 1. Port 25: the role takes no logins, so the list is absent.
+    let inbound = Harness::start("auth-advert-in", HarnessOptions::inbound()).await;
+    let mut client = inbound.client();
+    let ehlo = client.ehlo("client.test");
+    assert!(
+        !ehlo.advertises_prefix("AUTH"),
+        "port 25 advertises no AUTH: {ehlo:?}"
+    );
+    harness_stop(&inbound);
+
+    // 2. Submission before STARTTLS: the role offers AUTH, the channel cannot
+    //    use it. `538` is the answer a clear-channel attempt gets, so the
+    //    capability must be absent as well.
+    let submission = Harness::start("auth-advert-sub", HarnessOptions::submission()).await;
+    let mut client = submission.client();
+    let ehlo = client.ehlo("client.test");
+    assert!(
+        ehlo.advertises("STARTTLS"),
+        "the clear channel is upgradeable: {ehlo:?}"
+    );
+    assert!(
+        !ehlo.advertises_prefix("AUTH"),
+        "a clear submission channel advertises no AUTH (every login there is 538): {ehlo:?}"
+    );
+
+    // 3. The same listener after STARTTLS: now the login can succeed, and the
+    //    positive control proves this is a condition and not a blanket removal.
+    let mut client = support::TlsClient::connect(submission.addr);
+    client.ehlo("client.test");
+    client.expect("STARTTLS", 220);
+    client.handshake();
+    let ehlo = client.ehlo("client.test");
+    assert!(
+        ehlo.advertises_prefix("AUTH PLAIN LOGIN"),
+        "after STARTTLS the login is advertised again: {ehlo:?}"
+    );
+    harness_stop(&submission);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn max_messages_per_connection_ends_the_session() {
     let mut options = HarnessOptions::inbound();

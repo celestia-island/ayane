@@ -30,6 +30,21 @@ licenses:
 # One-shot gate.
 gate: fmt lint test licenses
 
+# ── deployment artifact ────────────────────────────────────────────────────
+
+# The binary a host runs: static musl, verified before it is called built.
+#
+# The 2026-11-27 cutover was rolled back because `/opt/ayane/ayane-bin` needed
+# GLIBC 2.39 on a host with glibc 2.35 and did not contain the mail engine:
+# both are properties of *this lane*, so the lane is what got fixed. The recipe
+# is the read-only preview; `PYTHONUNBUFFERED=1` keeps the warnings visible.
+release:
+    python3 deploy/build-musl.py
+
+# Build, verify and copy onto the deployment path (atomic).
+release-install dest:
+    python3 deploy/build-musl.py --install-to {{dest}}
+
 # ── engine rig (dev, single host) ──────────────────────────────────────────
 
 # Run the control plane on 127.0.0.1:3023 (expects AYANE_ADMIN_TOKEN).

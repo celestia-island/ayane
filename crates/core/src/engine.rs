@@ -779,7 +779,9 @@ pub fn deliverer(
             .with_port(mail.smtp_port);
         // The keys are loaded from the environment once, here: a selector is a
         // key, so a selector change is a restart of the consumer rather than a
-        // hot swap (a reload that changes one logs that fact).
+        // hot swap (a reload that changes one logs that fact). A snapshot that
+        // does not exist yet yields no signers rather than no engine — see
+        // [`signers`] for why that is the only ordering a first deployment has.
         if let Some(template) = &mail.dkim_key_env {
             for (_, signer) in signers(mail, template)? {
                 outbound = outbound.with_signer(signer);
@@ -799,16 +801,62 @@ pub fn deliverer(
 }
 
 /// The DKIM signers the state's domains name, read from the environment.
+///
+/// # A state that is not there yet is not a startup failure
+///
+/// The snapshot this reads is written by `admin.apply`, and `apply` is an RPC
+/// — it needs the process up to be called. Reading it as a fatal step at start
+/// therefore made the first deployment of an instance with
+/// `AYANE_MAIL_OUTBOUND=1` impossible: the engine could not start without a
+/// snapshot, and the only writer of the snapshot needs the engine. The
+/// resolution is that **signing is not delivery**: a remote recipient is still
+/// reachable, and DKIM's `p=` is the receiver's policy to enforce, so the same
+/// decision `signers_from_env` already makes per domain ("a domain with a
+/// selector and no key is logged and left unsigned") applies to the snapshot as
+/// a whole. A missing or unparsable snapshot is **one** `warn!`, an empty
+/// signer set, and mail leaves unsigned — exactly what it did before this
+/// instance had a selector.
+///
+/// The catch-up is a restart, not a reload: the keys are loaded once, here, and
+/// only the state file is re-read by the delivery consumer. An instance that
+/// applied after this start signs nothing until it is restarted; the operator's
+/// signal is the `warn!` line, which names the path and the reason.
+///
+/// A snapshot that *is* there and *is* readable but names a key the environment
+/// cannot supply is unchanged behaviour: [`signers_from_env`] warns per domain
+/// and leaves that domain unsigned. A key that is present and will not parse is
+/// still a hard error — that is a deployment that said it signs and shipped a
+/// broken key.
 fn signers(
     mail: &MailConfig,
     template: &str,
 ) -> Result<std::collections::BTreeMap<String, ayane_smtpd::outbound::Signer>, MailError> {
     // The state is read from the same snapshot the delivery loop reads, so a
     // domain that exists in the store is a domain that can sign.
-    let bytes = std::fs::read(&mail.state_path)
-        .map_err(|err| MailError::Outbound(format!("{}: {err}", mail.state_path.display())))?;
-    let state: ayane_proto::DesiredState = serde_json::from_slice(&bytes)
-        .map_err(|err| MailError::Outbound(format!("{}: {err}", mail.state_path.display())))?;
+    let bytes = match std::fs::read(&mail.state_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                path = %mail.state_path.display(),
+                %err,
+                "no routing snapshot to read DKIM selectors from yet (the first `admin.apply` \
+                 writes it): outbound mail leaves unsigned until the next start"
+            );
+            return Ok(std::collections::BTreeMap::new());
+        }
+    };
+    let state: ayane_proto::DesiredState = match serde_json::from_slice(&bytes) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                path = %mail.state_path.display(),
+                %err,
+                "the routing snapshot cannot be parsed, so no DKIM selector can be read from it: \
+                 outbound mail leaves unsigned until the next start"
+            );
+            return Ok(std::collections::BTreeMap::new());
+        }
+    };
     ayane_smtpd::outbound::signers_from_env(&state, template)
         .map_err(|err| MailError::Outbound(err.to_string()))
 }
@@ -1019,6 +1067,172 @@ mod tests {
                 left == right
             );
         }
+    }
+
+    // ── the DKIM selector source (the outbound half of a first deploy) ────
+
+    /// A snapshot with one hosted domain and, when `selector` is given, a DKIM
+    /// selector for it.
+    fn snapshot(selector: Option<&str>) -> ayane_proto::DesiredState {
+        ayane_proto::DesiredState {
+            domains: vec![ayane_proto::MailDomain {
+                name: "example.test".to_owned(),
+                catch_all: None,
+                enabled: true,
+                dkim: selector.map(ayane_proto::DkimSigningConfig::selector_only),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The signing-test key: the same throwaway RSA-2048 pair
+    /// `crates/smtpd/tests/outbound.rs` signs with, registered in
+    /// `_ledger/tool-exemptions.md`. It authenticates nothing here.
+    const FIXTURE_KEY: &str = include_str!("../../smtpd/tests/fixtures/dkim-private.pem");
+
+    /// A `MailConfig` whose snapshot path is this test's own file.
+    fn dkim_mail(root: &std::path::Path) -> MailConfig {
+        MailConfig {
+            state_path: root.join("desired-state.json"),
+            dkim_key_env: Some(DKIM_TEMPLATE.to_owned()),
+            ..MailConfig::default()
+        }
+    }
+
+    /// The variable `signers` reads for `example.test` — spelled the way the
+    /// substitution spells it, so the test cannot disagree with the lookup:
+    /// dots become underscores, and the prefix spells them too.
+    const DKIM_VARIABLE: &str = "AYANE_L946_DKIM_KEY_example_test";
+    const DKIM_TEMPLATE: &str = "AYANE_L946_DKIM_KEY_{domain}";
+
+    /// **The first-deployment deadlock.** With `AYANE_MAIL_OUTBOUND=1` the
+    /// snapshot the signers are read from is written by `admin.apply`, and
+    /// `apply` is an RPC that needs the service up. A `signers()` that treats a
+    /// missing file as fatal therefore makes the first start of such an
+    /// instance impossible — measured on the 2026-11-27 cutover, where the
+    /// mail service never came up and the rollback followed.
+    ///
+    /// The assertion is the whole chain, not just the return value: the engine
+    /// starts **degraded-free** (listeners bound, delivery consumer running),
+    /// and it starts with **no signers** rather than with an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_outbound_engine_starts_before_the_first_apply_writes_a_snapshot() {
+        let root = std::env::temp_dir().join(format!("ayane-l946-first-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("state")).expect("state dir");
+        // The variable is set so that *if* a signer were produced, the fixture
+        // key would be found: the test must fail for the missing snapshot, not
+        // for a missing key. It is set **after** the start, because this test
+        // shares the process with every other one in the crate (`set_var` races
+        // them under `cargo test`'s threads) and the start is the half that
+        // must not depend on it.
+
+        let store: std::sync::Arc<dyn ayane_store::StateStore> = std::sync::Arc::new(
+            ayane_store::RedbStateStore::open(root.join("store.redb")).expect("store"),
+        );
+        let address = {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("probe");
+            probe.local_addr().expect("addr")
+        };
+        let mut mail = dkim_mail(&root.join("state"));
+        mail.enabled = true;
+        mail.hostname = "mx.example.test".to_owned();
+        mail.outbound = true;
+        mail.delivery_interval_seconds = 1;
+        mail.listeners = vec![crate::config::MailListener {
+            role: ayane_smtpd::ListenerRole::Inbound,
+            listen: address,
+            role_name: "inbound".to_owned(),
+            tls_cert: None,
+            tls_key: None,
+        }];
+        let config = Config {
+            listen: "127.0.0.1:0".parse().expect("listen"),
+            log_filter: String::new(),
+            state_dir: root.join("state"),
+            admin_token: None,
+            compose_file: root.join("docker-compose.yml"),
+            cert_file: None,
+            mail: mail.clone(),
+        };
+        // The precondition of the whole test: nothing has been applied.
+        assert!(
+            !mail.state_path.exists(),
+            "the fixture starts before the first apply"
+        );
+
+        let engine = start(&config, store).await.expect("the engine starts");
+        assert_eq!(
+            engine.degraded(),
+            None,
+            "a first deployment with outbound enabled must not be degraded"
+        );
+        // The listener really is bound: a degraded engine that merely *said* it
+        // was fine would still fail this.
+        let socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the inbound listener is bound");
+        drop(socket);
+        engine.shutdown();
+
+        // And once the snapshot exists, the same configuration signs.
+        assert_eq!(
+            ayane_smtpd::outbound::dkim_env_name(DKIM_TEMPLATE, "example.test"),
+            DKIM_VARIABLE,
+            "the fixture's spelling is the lookup's spelling"
+        );
+        std::env::set_var(DKIM_VARIABLE, FIXTURE_KEY);
+        std::fs::write(
+            &mail.state_path,
+            serde_json::to_vec(&snapshot(Some("ayane"))).expect("snapshot"),
+        )
+        .expect("write snapshot");
+        let signed = signers(&mail, &mail.dkim_key_env.clone().expect("template"))
+            .expect("a readable snapshot with a key yields signers");
+        assert_eq!(
+            signed.keys().collect::<Vec<_>>(),
+            vec![&"example.test".to_owned()],
+            "the domain in the snapshot is the domain that signs"
+        );
+        std::env::remove_var(DKIM_VARIABLE);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two non-fatal snapshot faults: a file that is not JSON (a half
+    /// write, a hand edit that did not land) is the same answer as a file that
+    /// is not there. Neither may stop the engine — the delivery consumer's own
+    /// rule for an unusable snapshot ("hold, log, retry") is the same reasoning
+    /// one layer up.
+    #[test]
+    fn an_unreadable_snapshot_yields_no_signers_and_no_error() {
+        let root = std::env::temp_dir().join(format!("ayane-l946-junk-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let mail = dkim_mail(&root);
+        let template = DKIM_TEMPLATE;
+
+        // Absent.
+        let absent = signers(&mail, template).expect("a missing snapshot is not fatal");
+        assert!(absent.is_empty(), "{absent:?}");
+
+        // Present but unparsable.
+        std::fs::write(&mail.state_path, b"{ not json").expect("write");
+        let junk = signers(&mail, template).expect("an unparsable snapshot is not fatal");
+        assert!(junk.is_empty(), "{junk:?}");
+
+        // Present, parsable, selector set, no key in the environment: the
+        // per-domain rule that already existed — warn and stay unsigned.
+        std::fs::write(
+            &mail.state_path,
+            serde_json::to_vec(&snapshot(Some("ayane"))).expect("snapshot"),
+        )
+        .expect("write");
+        std::env::remove_var(DKIM_VARIABLE);
+        let keyless = signers(&mail, template).expect("no key is not fatal either");
+        assert!(keyless.is_empty(), "no key means no signer: {keyless:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

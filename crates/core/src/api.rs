@@ -213,12 +213,6 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
         }
     }
 
-    let ids_by_address: HashMap<String, Uuid> = body
-        .accounts
-        .iter()
-        .map(|account| (account.address.to_string(), Uuid::new_v4()))
-        .collect();
-
     // Absent audit/mcp slices keep their stored values — a state
     // replacement is not an unconfigure.
     let keep = match app.store.load() {
@@ -236,6 +230,38 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
     }
     if mcp.token == crate::rpc::REDACTED_SENTINEL {
         mcp.token = keep_mcp_token;
+    }
+    // The ids are the *accounts'* identity, not an artefact of this write.
+    //
+    // `PutAccount` carries no id (a caller of the form derived from a read
+    // panel cannot mint one), so this used to mint a fresh one per address —
+    // and a shared mailbox, whose members are ids, silently lost its member
+    // list on the next save (measured 3 → 0 on a live instance). Worse, the
+    // same address got a **different** id on every write, so any table keyed
+    // by id (the shared-membership relation, an external identity's account)
+    // pointed at nothing after one save.
+    //
+    // The rule here is *inheritance*, not a skipped check: an account that
+    // already exists keeps the id it has, one that does not gets a new one, and
+    // the rest of the replacement — hashes, validation, member resolution — is
+    // exactly what it was.
+    let existing_accounts: HashMap<&str, Uuid> = keep
+        .accounts
+        .iter()
+        .map(|account| (account.address.as_str(), account.id))
+        .collect();
+    let existing_shared: HashMap<&str, (Uuid, &Vec<Uuid>)> = keep
+        .shared
+        .iter()
+        .map(|shared| (shared.address.as_str(), (shared.id, &shared.members)))
+        .collect();
+    let mut ids_by_address: HashMap<String, Uuid> = HashMap::with_capacity(body.accounts.len());
+    for account in &body.accounts {
+        let id = existing_accounts
+            .get(account.address.as_str())
+            .copied()
+            .unwrap_or_else(Uuid::new_v4);
+        ids_by_address.insert(account.address.to_string(), id);
     }
     let ack = PutStateAck {
         domains: body.domains.len(),
@@ -270,21 +296,49 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
     }
 
     for shared in &body.shared {
+        // The same inheritance as the accounts above, for the shared
+        // mailbox's own id: what is keyed by it (its mailboxes, an open
+        // session's target) must survive a panel save.
+        let kept = existing_shared.get(shared.address.as_str()).copied();
         let mut members = Vec::with_capacity(shared.members.len());
         for member in &shared.members {
-            let id = ids_by_address
-                .get(member.as_str())
-                .ok_or_else(|| ApiError {
-                    error: format!(
-                        "shared mailbox {} references non-account member {member}",
-                        shared.address
-                    ),
-                    status: StatusCode::UNPROCESSABLE_ENTITY,
-                })?;
-            members.push(*id);
+            // A member the caller left out of `accounts` still exists: the
+            // stored account is not deleted by a replacement that does not list
+            // it (see `replace_state`, which keeps every external identity by
+            // address), so dropping the membership would be this write
+            // deciding a different question. Resolve such a member against the
+            // stored account, and only a member that is in neither place is
+            // the reference the error names.
+            let id = match ids_by_address.get(member.as_str()) {
+                Some(id) => *id,
+                None => match existing_accounts.get(member.as_str()).copied() {
+                    Some(id) => id,
+                    None => {
+                        return Err(ApiError {
+                            error: format!(
+                                "shared mailbox {} references non-account member {member}",
+                                shared.address
+                            ),
+                            status: StatusCode::UNPROCESSABLE_ENTITY,
+                        })
+                    }
+                },
+            };
+            members.push(id);
+        }
+        // An empty member list on a write that names no accounts at all is the
+        // panel re-submitting a form it never filled in for members. It is not
+        // a "no members" decision; the decision to empty a shared mailbox is
+        // made on a write that carries accounts (and so carries the caller's
+        // intent for them). `kept` is only consulted when there were members:
+        // a mailbox that had none stays empty.
+        if members.is_empty() && ids_by_address.is_empty() {
+            if let Some((_, stored)) = kept.filter(|(_, stored)| !stored.is_empty()) {
+                members = stored.clone();
+            }
         }
         desired.shared.push(SharedMailbox {
-            id: Uuid::new_v4(),
+            id: kept.map_or_else(Uuid::new_v4, |(id, _)| id),
             address: shared.address.clone(),
             members,
         });
@@ -308,12 +362,13 @@ pub async fn put_state_impl(app: &AppState, body: PutState) -> Result<PutStateAc
 /// Replace the whole snapshot, keeping the external identities of every
 /// account that survives the replacement.
 ///
-/// A link is keyed by address (an account's id is minted afresh here), so
-/// it follows the address. A link whose account the replacement drops is
-/// dropped with it — it must not revive if the address is ever created
-/// again. The keep-and-replace runs as one locked step
-/// ([`StateStore::update`]): a link made while the replacement is being
-/// built is not lost to it.
+/// A link is keyed by address, so it follows the address across a save. (The
+/// account's id is inherited by [`put_state_impl`] too, but the link's key is
+/// the address and this function does not depend on the id surviving.) A link
+/// whose account the replacement drops is dropped with it — it must not revive
+/// if the address is ever created again. The keep-and-replace runs as one
+/// locked step (`StateStore::update`): a link made while the replacement is
+/// being built is not lost to it.
 ///
 /// # Errors
 ///

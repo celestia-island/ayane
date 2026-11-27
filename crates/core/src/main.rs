@@ -23,8 +23,47 @@ use ayane::state::AppState;
 use ayane::transport::RpcSurface;
 use ayane_store::RedbStateStore;
 
+/// What `--version` prints, and the one string a deployment script needs to
+/// answer "which build is on this host?" without starting a process that binds
+/// a port or opens the store.
+///
+/// The **target triple and profile** are part of it on purpose: the cutover
+/// this flag was added for failed because the binary on the host was built for
+/// a newer glibc than the host has and did not contain the mail engine, and
+/// neither fact was visible from the file name. A static musl build says
+/// `x86_64-unknown-linux-musl` here.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("CARGO_PKG_NAME"),
+    " ",
+    // From `build.rs`: the target this binary was **built for**, not the one
+    // it happens to run on.
+    env!("AYANE_BUILD_TARGET"),
+    ")",
+    "\nmail engine: linked (AYANE_MAIL_ENABLED=1 runs it in this process)",
+);
+
+/// Says whether this build is the one the deployment expects and exits.
+///
+/// Handled before anything is read from the environment or opened: `--version`
+/// must answer on a host whose state directory does not exist yet, which is
+/// exactly the host a cutover is being staged on.
+fn print_version_if_asked() -> bool {
+    let asked = std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V");
+    if asked {
+        println!("{VERSION}");
+    }
+    asked
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if print_version_if_asked() {
+        return Ok(());
+    }
     let config = Config::from_env()?;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&config.log_filter))

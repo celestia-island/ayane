@@ -555,6 +555,396 @@ fn rpc_request(method: &str, params: Value, id: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
 }
 
+/// An admin token for this fixture, minted through `session.adminLogin`.
+async fn admin_token(surface: &RpcSurface) -> String {
+    let reply = call(
+        surface,
+        rpc_request("session.adminLogin", json!({ "token": ADMIN }), json!(0)),
+    )
+    .await;
+    reply["result"]["token"]
+        .as_str()
+        .expect("admin token")
+        .to_owned()
+}
+
+// ── ③ the DKIM selector has a write channel ─────────────────────────────
+
+/// The selector a domain signs with had **no** RPC: `signers_from_env` reads
+/// `state.domains[i].dkim.selector`, and the only writer of that field was the
+/// panel's raw JSON editor. This is the channel, and the assertion is the
+/// whole chain it exists for — the selector lands in the state, the stored
+/// state validates, and `signers_from_env` (the function the engine's DKIM
+/// step calls) then produces a signer for that domain.
+///
+/// The key comes from an environment variable, as it does in a deployment: the
+/// state never carries it. The fixture pair is the same throwaway RSA-2048 key
+/// `crates/smtpd/tests/outbound.rs` signs with, registered in
+/// `_ledger/tool-exemptions.md`.
+#[tokio::test]
+async fn setting_a_dkim_selector_over_rpc_is_what_makes_a_domain_sign() {
+    const FIXTURE_KEY: &str = include_str!("../../smtpd/tests/fixtures/dkim-private.pem");
+    const VARIABLE: &str = "AYANE_RPC_L946_DKIM_KEY_example_test";
+    let (surface, _root) = surface("dkimrpc").await;
+    let token = admin_token(&surface).await;
+
+    // Before: the fixture's domain has no selector, so nothing signs.
+    let stored = surface.app.store.load().expect("load");
+    assert!(
+        ayane_smtpd::outbound::signers_from_env(&stored.desired, VARIABLE)
+            .expect("no selector is not an error")
+            .is_empty(),
+        "the precondition: no selector, no signer"
+    );
+
+    // The write.
+    let reply = call(
+        &surface,
+        rpc_request(
+            "admin.domain.dkim.put",
+            json!({ "token": token, "domain": "example.test", "selector": "ayane" }),
+            json!(1),
+        ),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(reply["result"]["saved"], json!(true), "{reply}");
+    assert_eq!(
+        reply["result"]["requires_restart"],
+        json!(true),
+        "the keys are loaded at start, and the answer says so: {reply}"
+    );
+
+    // The state carries it (read back through the panel's own read path)…
+    let state = call(
+        &surface,
+        rpc_request("admin.state.get", json!({ "token": token }), json!(2)),
+    )
+    .await;
+    assert_eq!(
+        state["result"]["domains"][0]["dkim"]["selector"], "ayane",
+        "{state}"
+    );
+
+    // … and the signer set the engine builds from it has the domain.
+    std::env::set_var(VARIABLE, FIXTURE_KEY);
+    let stored = surface.app.store.load().expect("load");
+    let signed = ayane_smtpd::outbound::signers_from_env(&stored.desired, VARIABLE)
+        .expect("a selector and a key produce a signer");
+    assert_eq!(
+        signed.keys().collect::<Vec<_>>(),
+        vec![&"example.test".to_owned()],
+        "the domain the selector was set on is the domain that signs"
+    );
+    // The key stayed in the environment: the state holds the selector only.
+    assert!(
+        stored.desired.domains[0]
+            .dkim()
+            .expect("dkim")
+            .private_key
+            .is_none(),
+        "the snapshot never carries the signing key"
+    );
+    std::env::remove_var(VARIABLE);
+
+    // An empty selector is the "sign nothing here" write, not an error.
+    let reply = call(
+        &surface,
+        rpc_request(
+            "admin.domain.dkim.put",
+            json!({ "token": token, "domain": "example.test", "selector": "" }),
+            json!(3),
+        ),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let stored = surface.app.store.load().expect("load");
+    assert!(
+        stored.desired.domains[0].dkim().is_none(),
+        "cleared: {stored:?}"
+    );
+}
+
+/// The refusals: a selector that could never be published as the left half of
+/// `<selector>._domainkey.<domain>`, a selector sent for a domain this instance
+/// does not host, and an anonymous caller.
+#[tokio::test]
+async fn the_dkim_selector_write_refuses_what_it_cannot_publish() {
+    let (surface, _root) = surface("dkimrpc-refuse").await;
+    let token = admin_token(&surface).await;
+
+    for selector in ["", "has.a.dot", "-leading", "trailing-", &"a".repeat(64)] {
+        let reply = call(
+            &surface,
+            rpc_request(
+                "admin.domain.dkim.put",
+                json!({ "token": token, "domain": "example.test", "selector": selector }),
+                json!(1),
+            ),
+        )
+        .await;
+        // The empty one is the documented clear; the rest are refused by the
+        // snapshot's own selector law, with the domain named.
+        if selector.is_empty() {
+            assert!(reply.get("error").is_none(), "empty clears: {reply}");
+            continue;
+        }
+        assert_eq!(
+            reply["error"]["message"]
+                .as_str()
+                .expect("message")
+                .split(':')
+                .next(),
+            Some("Admin.MalformedSelector"),
+            "{selector:?} must be refused by validation: {reply}"
+        );
+        let stored = surface.app.store.load().expect("load");
+        assert!(
+            stored.desired.domains[0].dkim().is_none(),
+            "a refused write writes nothing: {stored:?}"
+        );
+    }
+
+    let reply = call(
+        &surface,
+        rpc_request(
+            "admin.domain.dkim.put",
+            json!({ "token": token, "domain": "nothosted.test", "selector": "ayane" }),
+            json!(2),
+        ),
+    )
+    .await;
+    assert_eq!(
+        reply["error"]["message"], "Admin.UnknownDomain: nothosted.test is not a hosted domain",
+        "{reply}"
+    );
+
+    let reply = call(
+        &surface,
+        rpc_request(
+            "admin.domain.dkim.put",
+            json!({ "domain": "example.test", "selector": "ayane" }),
+            json!(3),
+        ),
+    )
+    .await;
+    assert_eq!(
+        reply["error"]["message"], "Session.Required: login first",
+        "an anonymous caller writes nothing: {reply}"
+    );
+}
+
+// ── ④ `admin.state.put` inherits ids ────────────────────────────────────
+
+/// A save from the panel must not renumber the accounts.
+///
+/// `PutAccount` carries no id (the webui builds one from the fields it shows),
+/// so the pre-fix replacement minted a fresh id per address **on every write** —
+/// measured 3 → 0 on a live instance, where the shared mailbox's member list
+/// then pointed at ids nothing had. The rule is inheritance: an account that
+/// exists keeps its id, a new one gets one, and the shared mailbox's own id and
+/// its membership survive a save that lists the same addresses.
+///
+/// The mutation this pins: mint a fresh id per address (`Uuid::new_v4()` at
+/// [`ayane::api::put_state_impl`]'s map) and every assertion below goes red.
+#[tokio::test]
+async fn a_state_save_keeps_the_ids_the_accounts_already_have() {
+    let (surface, _root) = surface("stateput-ids").await;
+    let token = admin_token(&surface).await;
+
+    // The fixture seeded one account (`ACCOUNT_ID`) that is a member of one
+    // shared mailbox. Note the fixture's account id is `Uuid::nil()` — the
+    // *default* a caller that does not send one gets, which is exactly the
+    // shape that used to be "replaced" on the round trip.
+    let before = surface.app.store.load().expect("load");
+    let account_before = before.desired.accounts[0].id;
+    let shared_before = before.desired.shared[0].id;
+    assert_eq!(account_before, ACCOUNT_ID, "fixture precondition");
+
+    // The panel's save: the same addresses, no ids (the body has no field for
+    // one), and — as a webui form does — the shared mailbox's member list
+    // spelled as addresses.
+    let body = json!({
+        "token": token,
+        "domains": [{
+            "name": "example.test",
+            "catch_all": null,
+            "enabled": true,
+        }],
+        "accounts": [{
+            "address": "test@example.test",
+            "display_name": "Test (renamed)",
+            "quota_bytes": 0,
+            "admin": false,
+            "password": PASSWORD,
+        }],
+        "aliases": [],
+        "shared": [{
+            "address": "team@example.test",
+            "members": ["test@example.test"],
+        }],
+    });
+    let reply = call(&surface, rpc_request("admin.state.put", body, json!(1))).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+
+    let after = surface.app.store.load().expect("load");
+    assert_eq!(
+        after.desired.accounts[0].id, account_before,
+        "the account keeps its id across a save"
+    );
+    assert_eq!(
+        after.desired.shared[0].id, shared_before,
+        "the shared mailbox keeps its id across a save"
+    );
+    assert_eq!(
+        after.desired.shared[0].members,
+        vec![account_before],
+        "its membership still names the account that exists"
+    );
+    assert_eq!(
+        after.desired.accounts[0].display_name, "Test (renamed)",
+        "the rest of the write is applied"
+    );
+
+    // A second save is idempotent on the ids: this is the round trip the panel
+    // does on every page save, and the pre-fix code minted a new id each time.
+    let reply = call(
+        &surface,
+        rpc_request("admin.state.get", json!({ "token": token }), json!(2)),
+    )
+    .await;
+    let read_back = reply["result"].clone();
+    let mut again = read_back.clone();
+    again["token"] = json!(token);
+    // The read shape carries the password-holding fields, so send the same
+    // body shape as above rather than the read document.
+    let reply = call(
+        &surface,
+        rpc_request(
+            "admin.state.put",
+            json!({
+                "token": token,
+                "domains": [{
+                    "name": "example.test",
+                    "catch_all": null,
+                    "enabled": true,
+                }],
+                "accounts": [{
+                    "address": "test@example.test",
+                    "display_name": "Test (renamed)",
+                    "quota_bytes": 0,
+                    "admin": false,
+                    "password": PASSWORD,
+                }],
+                "aliases": read_back["aliases"].clone(),
+                "shared": [{
+                    "address": "team@example.test",
+                    "members": ["test@example.test"],
+                }],
+            }),
+            json!(3),
+        ),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let settled = surface.app.store.load().expect("load");
+    assert_eq!(
+        settled.desired.accounts[0].id, account_before,
+        "the second save keeps the same id"
+    );
+    assert_eq!(settled.desired.shared[0].id, shared_before);
+
+    // A genuinely new account still gets an id of its own.
+    let reply = call(
+        &surface,
+        rpc_request(
+            "admin.state.put",
+            json!({
+                "token": token,
+                "domains": [{
+                    "name": "example.test",
+                    "catch_all": null,
+                    "enabled": true,
+                }],
+                "accounts": [
+                    {
+                        "address": "test@example.test",
+                        "display_name": "Test",
+                        "quota_bytes": 0,
+                        "admin": false,
+                        "password": PASSWORD,
+                    },
+                    {
+                        "address": "second@example.test",
+                        "display_name": "Second",
+                        "quota_bytes": 0,
+                        "admin": false,
+                        "password": PASSWORD,
+                    },
+                ],
+                "aliases": [],
+                "shared": [{
+                    "address": "team@example.test",
+                    "members": ["test@example.test", "second@example.test"],
+                }],
+            }),
+            json!(4),
+        ),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let grown = surface.app.store.load().expect("load");
+    assert_eq!(grown.desired.accounts[0].id, account_before);
+    let second = grown.desired.accounts[1].id;
+    assert_ne!(second, account_before, "a new account is a new identity");
+    assert_eq!(
+        grown.desired.shared[0].members,
+        vec![account_before, second]
+    );
+
+    // A shared mailbox whose member list is re-submitted but whose accounts
+    // are not: the two-part panel save that used to answer
+    // `references non-account member`. The member is not deleted by the write
+    // (its account survives in the store), so the membership must survive too —
+    // resolved against the stored account rather than refused.
+    let reply = call(
+        &surface,
+        rpc_request(
+            "admin.state.put",
+            json!({
+                "token": token,
+                "domains": [{
+                    "name": "example.test",
+                    "catch_all": null,
+                    "enabled": true,
+                }],
+                "accounts": [],
+                "aliases": [],
+                "shared": [{
+                    "address": "team@example.test",
+                    "members": ["test@example.test"],
+                }],
+            }),
+            json!(9),
+        ),
+    )
+    .await;
+    assert!(
+        reply.get("error").is_none(),
+        "a member the write does not re-list still exists: {reply}"
+    );
+    let held = surface.app.store.load().expect("load");
+    assert_eq!(
+        held.desired.shared[0].id, shared_before,
+        "the shared mailbox keeps its id even when no account is written"
+    );
+    assert!(
+        held.desired.shared[0].members.contains(&account_before),
+        "the membership resolved to the account that is in the store: {:?}",
+        held.desired.shared[0].members
+    );
+}
+
 /// The full application on a loopback socket of its own: the address to
 /// reach it at. (A WebSocket handshake only survives a real server: the
 /// upgrade extractor takes an extension the HTTP connection itself

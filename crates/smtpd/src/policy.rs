@@ -36,6 +36,13 @@ pub enum ListenerRole {
 
 impl ListenerRole {
     /// Whether this listener advertises AUTH at all.
+    ///
+    /// The role half only: whether a mechanism is offered on a given connection
+    /// is `AUTH`-in-`EHLO`, which also requires the channel to be encrypted.
+    /// Both are needed and neither is the whole: this one says a login is
+    /// *meaningful* here, the other says it could *succeed* (see
+    /// `session::Session::ehlo`), and a listener that offers logins on a clear
+    /// channel would advertise a door it refuses to open (`538`).
     #[must_use]
     pub fn offers_auth(self) -> bool {
         !matches!(self, Self::Inbound)
