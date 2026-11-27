@@ -20,7 +20,7 @@
 | `AYANE_CERT_PATH` | `/etc/ayane/tls/fullchain.pem` | `volume` / `upload` 模式的证书路径 |
 | `AYANE_CERT_KEY_PATH` | `/etc/ayane/tls/privkey.pem` | 私钥路径（600） |
 | `AYANE_ACME_EMAIL` | `ops@example.com` | `acme` 模式的账户邮箱 |
-| `AYANE_RELAY_HOST` | `smtp.relay.example:587` | 出站中继；留空则直投（需 PTR + 25 出站） |
+| `AYANE_RELAY_HOST` | `smtp.relay.example:587` | **尚未接线**：设了也不改变行为，邮件面一律按 MX 直投（`AYANE_MAIL_OUTBOUND=1`）；走中继需要 PTR 或一条自己的 25 出口。与 `admin.net.traffic` 的 `outbound[].relay` 字段无关（见 1.3） |
 | `AYANE_RELAY_USER` / `AYANE_RELAY_PASSWORD` | `<user>` / `<password>` | 中继凭据 |
 | `AYANE_BOOTSTRAP_ADMIN` | `admin@example.com` | 空实例首登账号（注册默认关闭，首登即管理员） |
 | `AYANE_QUARANTINE_ADDRESS` | `quarantine@example.com` | 隔离区收件地址 |
@@ -36,7 +36,7 @@
 |---|---|---|
 | `AYANE_MAIL_ENABLED` | `0` | `1` 打开邮件面；打开后 `AYANE_MAIL_LISTENERS` 与 `AYANE_MAIL_HOSTNAME` 为必填 |
 | `AYANE_MAIL_HOSTNAME` | `localhost` | 问候语 / `Received:` / DMARC `authserv-id` 的名；`localhost` 会被拒绝启动 |
-| `AYANE_MAIL_LISTENERS` | 空 | 逗号分隔的 `role@addr[,cert=PATH][key=PATH]`；role = `inbound` / `submission` / `submissions-tls`（后两个需证书） |
+| `AYANE_MAIL_LISTENERS` | 空 | **分号**分隔的 `role@addr[,cert=PATH][,key=PATH]`；role = `inbound` / `submission` / `submissions-tls`（后两个必须带 `cert=` 与 `key=`）。例：`inbound@0.0.0.0:25;submission@0.0.0.0:587,cert=/etc/ayane/tls/fullchain.pem,key=/etc/ayane/tls/privkey.pem`。条目里用 `,`、条目之间用 `;`——`cert=`/`key=` 是条目自己的选项，不是另起一个监听器 |
 | `AYANE_MAIL_SPOOL_ROOT` | `$AYANE_STATE_DIR/spool` | 待投递队列根；**不可**与 `mail_root` 相同或互为子目录 |
 | `AYANE_MAIL_ROOT` | `$AYANE_STATE_DIR/mail` | 落盘 maildir 根（spool 的兄弟目录，块⑤ 保留名教训） |
 | `AYANE_MAIL_STATE` | `$AYANE_STATE_DIR/desired-state.json` | 投递消费与 DKIM 签名读取的路由快照；**由 `admin.apply` 写入**。设成别的路径会在启动期被拒（degraded，cause `state_path`）：消费端读的文件必须就是 apply 写的那个 |
@@ -61,8 +61,22 @@
 所以同进程未开启邮件段时它同样是空的——这是计数的所在，不是故障。
 
 分进程形态的 submission 监听器要真校验凭据，需带 `--password-hashes <apply 渲染的 dovecot passwd>`：
-`ayane-smtpd` 已**没有**「放行所有登录」的开关（`--submission-authenticates` 已删除），不带 hash 文件时
-它照常收信、但拒绝一切登录。
+`ayane-smtpd` 已**没有**「放行所有登录」的开关（`--submission-authenticates` 已删除）。不带 hash 文件时，
+该监听器**收不进任何邮件**：没有可校验的口令，`AUTH` 一律 `535`，未认证的 `RCPT` 按 RFC 4954 §4 回
+`530 5.7.0 Authentication required`——所以它既不转发也不投递，只是占着端口答「先认证」。
+
+### 1.3 `admin.net.traffic` 的 `outbound[].relay` 是**收件域**，不是中继主机
+
+出站传输每次尝试现解析 MX，不保留 host，所以计数器只能按收件域打点；页面「中继」列与右邻「收件域」列
+因此显示同一个字符串。这与 `AYANE_RELAY_HOST` 没有关系（那是上面说的、尚未接线的中继参数）。要按 MX 主机
+统计，需要在出站传输里新增一路按 host 的记录，目前没有做。
+
+### 1.4 `DATA` 末行与 TLS：半关断只有明文能和 `BDAT` 比
+
+一条消息的最后一行**没有结尾**（客户端在行中间停发、并半关写方向）时，`DATA` 现在按已收字节给出确定答复
+（超限 `552 5.2.3`，否则 `250` 或 `554`），与 `BDAT` 的同一批字节同答。但这个形态只存在于**明文**连接：
+`rustls` 没有「客户端半关」的原语，TLS 会话里要么继续发（于是这就是一行普通的内容）要么整条连接结束。
+所以 submission（587 STARTTLS / 465）上不存在这种「末行 + 半关」的歧义，对偶测试也只能跑在 inbound 明文。
 
 ### 1.2 邮件面起不来时
 

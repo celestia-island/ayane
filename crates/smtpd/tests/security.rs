@@ -863,9 +863,12 @@ async fn an_identity_with_a_crlf_is_refused_and_never_reaches_received() {
     client.handshake();
     client.ehlo("client.test");
     let reply = client.command(&format!("AUTH PLAIN {}", base64_plain(injected, "s3cret")));
+    // One answer for every failed login: an identity that is not a mailbox is
+    // not told apart from a wrong password (`535` for both), and it spends the
+    // per-address failure budget like a guess.
     assert_eq!(
-        reply.code, 501,
-        "an identity that is not a mailbox is a syntax error: {reply:?}"
+        reply.code, 535,
+        "an identity that is not a mailbox fails authentication: {reply:?}"
     );
     // The session did not authenticate, so the submission is refused — and no
     // message carries the injected field.
@@ -1055,7 +1058,10 @@ async fn a_non_ascii_identity_with_a_crlf_is_still_refused() {
         "AUTH PLAIN {}",
         base64_plain("用户@例子.测试\r\nBcc: victim@example.net", "s3cret")
     ));
-    assert_eq!(reply.code, 501, "the identity is not a mailbox: {reply:?}");
+    assert_eq!(
+        reply.code, 535,
+        "the identity is not a mailbox, which is a failed login and not a syntax report: {reply:?}"
+    );
     harness.stop();
 }
 
@@ -1141,7 +1147,9 @@ async fn auth_and_mail_from_agree_about_what_a_mailbox_is() {
     // `a@example..com` and `a@example.com.` are not mailboxes, and the path
     // parser said so with a `501` while the identity check — which only knew
     // "one `@`, no quoting" — answered `235`. One server, two answers about
-    // whether the same text is an address.
+    // whether the same text is an address — and the two answers are
+    // deliberately *different kinds* of no: `MAIL FROM` names the syntax error
+    // it found, `AUTH` gives the one answer every failed login gets.
     let harness = Harness::start("auth-shape", HarnessOptions::submission()).await;
     for identity in ["a@-example.com", "a@example..com", "a@example.com."] {
         // The path: a syntax error, and therefore no transaction to log into.
@@ -1152,7 +1160,11 @@ async fn auth_and_mail_from_agree_about_what_a_mailbox_is() {
             path.code, 501,
             "`{identity}` is not a mailbox, so MAIL FROM must refuse it: {path:?}"
         );
-        // The identity: the same answer, and never a credential verdict.
+        // The identity: refused too, but as a **failed login** and never as a
+        // syntax report — telling a prober which shapes are addresses here is
+        // the oracle this test used to pin by accident, one `501` per attempt
+        // outside the failure budget. Both refusals are "no", and only one of
+        // them is a directory.
         let mut client = support::TlsClient::connect(harness.addr);
         client.ehlo("client.test");
         client.expect("STARTTLS", 220);
@@ -1160,8 +1172,8 @@ async fn auth_and_mail_from_agree_about_what_a_mailbox_is() {
         client.ehlo("client.test");
         let reply = client.command(&format!("AUTH PLAIN {}", base64_plain(identity, "s3cret")));
         assert_eq!(
-            reply.code, 501,
-            "`{identity}` must be refused here exactly as MAIL FROM refuses it: {reply:?}"
+            reply.code, 535,
+            "`{identity}` is refused for login too, as a failed authentication: {reply:?}"
         );
     }
     harness.stop();

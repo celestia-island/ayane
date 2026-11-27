@@ -993,3 +993,163 @@ async fn a_submission_listener_authenticates_against_the_store() {
     engine.shutdown();
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
+
+// ── the deployment's own path: `AYANE_MAIL_*` → `Config` → a bound listener ──
+//
+// Every test above builds `MailConfig` as a Rust literal, which is not how a
+// deployment says anything. That gap is what hid a grammar defect through a
+// whole review round: the env form of a TLS listener could not be written down
+// at all (`inbound@:25,cert=…,key=…` parsed as three listeners), so the
+// failure paths and the submission-TLS end-to-end were all green against a
+// configuration no operator could produce. These two tests go through
+// `Config::from_env` with the real variables set, and then start the engine from
+// what it returned.
+
+/// `set_var` is `unsafe` since Rust 2024's environment rules, and it is the only
+/// way to test the path a deployment actually takes. Allowed here for the
+/// reasons this function documents below, and nowhere else in the crate.
+#[allow(unsafe_code)]
+fn set_mail_env(key: &str, value: Option<&str>) {
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}
+
+/// Sets (and restores) the `AYANE_MAIL_*` environment around one test body.
+///
+/// Rust tests share a process and the environment is process-wide, so the
+/// variables are set for the duration of the call and removed afterwards; the
+/// variables this test sets are the ones no other test in this crate reads.
+fn with_mail_env<T>(vars: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
+    let previous: Vec<(String, Option<String>)> = vars
+        .iter()
+        .map(|(key, _)| ((*key).to_owned(), std::env::var(key).ok()))
+        .collect();
+    // The variables are the `AYANE_MAIL_*` names, which no other test in this
+    // crate reads, and they are restored before returning.
+    for (key, value) in vars {
+        set_mail_env(key, Some(value));
+    }
+    let out = body();
+    for (key, value) in previous {
+        set_mail_env(&key, value.as_deref());
+    }
+    out
+}
+
+/// A TLS submission listener, written the way a deployment writes it, parses and
+/// binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_env_form_of_a_tls_listener_parses_and_serves() {
+    let fixture = Fixture::new("env-listeners");
+    let address = free_port().await;
+    let cert = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mx-test-cert.pem");
+    let key = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mx-test-key.pem");
+    // Two listeners: a plain inbound one and the TLS submission one whose
+    // `cert=`/`key=` options contain the `,` that used to split the entry.
+    let listeners = format!(
+        "inbound@127.0.0.1:{};submission@{address},cert={},key={}",
+        free_port().await.port(),
+        cert.display(),
+        key.display()
+    );
+    let state_dir = fixture.root.join("state");
+    let config = with_mail_env(
+        &[
+            ("AYANE_MAIL_ENABLED", "1"),
+            ("AYANE_MAIL_HOSTNAME", "mx.example.test"),
+            ("AYANE_MAIL_LISTENERS", &listeners),
+            ("AYANE_STATE_DIR", &state_dir.to_string_lossy()),
+        ],
+        ayane::config::Config::from_env,
+    )
+    .expect("a deployment's own variables parse");
+    // What the environment produced, not what the test intended: two listeners,
+    // the second with both files, and the state paths where the apply writes.
+    assert_eq!(
+        config.mail.listeners.len(),
+        2,
+        "{:?}",
+        config.mail.listeners
+    );
+    assert_eq!(
+        config.mail.listeners[0].role,
+        ayane_smtpd::ListenerRole::Inbound
+    );
+    let submission = &config.mail.listeners[1];
+    assert_eq!(submission.role, ayane_smtpd::ListenerRole::Submission);
+    assert_eq!(submission.listen, address);
+    assert_eq!(submission.tls_cert.as_ref(), Some(&cert));
+    assert_eq!(submission.tls_key.as_ref(), Some(&key));
+    assert!(config.mail.enabled);
+    assert!(
+        !config.mail.outbound,
+        "nothing leaves the machine unless asked"
+    );
+    assert_eq!(config.mail.state_path, state_dir.join("desired-state.json"));
+
+    // And it serves: the engine starts on exactly this configuration, without
+    // the test touching a `MailConfig` field.
+    let store: Arc<dyn StateStore> = fixture.store.clone();
+    let engine = ayane::engine::start(&config, store)
+        .await
+        .expect("the environment's configuration starts");
+    assert!(
+        engine.degraded().is_none(),
+        "a TLS submission listener from the environment: {:?}",
+        engine.degraded()
+    );
+    let mut client = SubmissionClient::connect(address);
+    let ehlo = client.expect("EHLO client.test", 250);
+    assert!(
+        ehlo.contains("STARTTLS"),
+        "the env-configured TLS listener: {ehlo}"
+    );
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+/// The grammar refuses what it cannot mean, and says which entry.
+#[test]
+fn the_listener_grammar_refuses_what_it_cannot_mean() {
+    let cases = [
+        // A listener with no address.
+        "inbound@",
+        // A role nobody has.
+        "relay@127.0.0.1:25",
+        // An option nobody has.
+        "inbound@127.0.0.1:25,mode=relay",
+        // Two addresses in one entry (the `,` is for options).
+        "inbound@127.0.0.1:2525,127.0.0.1:2600",
+    ];
+    for entry in cases {
+        let parsed = with_mail_env(&[("AYANE_MAIL_LISTENERS", entry)], || {
+            ayane::config::Config::from_env().map(|config| config.mail.listeners)
+        });
+        assert!(
+            parsed.is_err(),
+            "{entry:?} must not parse into listeners: {parsed:?}"
+        );
+        let message = parsed.expect_err("refused").to_string();
+        assert!(
+            message.contains("AYANE_MAIL_LISTENERS") && message.contains(entry),
+            "the refusal names the variable and the entry: {message}"
+        );
+    }
+    // And the shapes that are valid do parse, `cert=`/`key=` included.
+    let ok = with_mail_env(
+        &[
+            (
+                "AYANE_MAIL_LISTENERS",
+                "inbound@127.0.0.1:2525;submission@127.0.0.1:2587,cert=/c,key=/k",
+            ),
+            ("AYANE_MAIL_HOSTNAME", "mx.example.test"),
+        ],
+        || ayane::config::Config::from_env().map(|config| config.mail.listeners),
+    )
+    .expect("two listeners, one with a certificate");
+    assert_eq!(ok.len(), 2);
+    assert_eq!(ok[1].tls_cert, Some(PathBuf::from("/c")));
+    assert_eq!(ok[1].tls_key, Some(PathBuf::from("/k")));
+}

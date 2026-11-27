@@ -1697,74 +1697,90 @@ async fn the_line_bound_is_the_same_rule_on_both_transports() {
 
 /// The same points, with `DATA` **closing its send side** after the message.
 ///
-/// The test above sends the last line with no ending at all and then keeps the
-/// socket open; a real transfer ends either with `.<CRLF>` or with the client
-/// finishing, and the latter is what makes the octets already received the last
-/// line (`DATA` takes them as such — see `read_body_line`'s EOF arm, which this
-/// test is also the coverage for). Without the half-close the server waits for
-/// more of the line until its transaction timer, which is what the test above
-/// measures — a `421`, not a `552`.
+/// A `DATA` transfer whose client **stops sending** is answered, not timed out.
+///
+/// The octets already received are the message's last line (there is no
+/// `.<CRLF>` anywhere in them), and the half-close says no more are coming — so
+/// the server can decide: over the line bound is `552 5.2.3`, and anything else
+/// is a message it finishes like any other (`250` when the queue takes it,
+/// `554` when a rule refuses it). The failure this pins is the one the first
+/// version of this test measured: with no half-close the server sits on the
+/// transaction timer and answers `421` — a timeout where the client had already
+/// given the server everything it was going to send.
+///
+/// # Why the two widths are apart
+///
+/// `DATA` sees one octet more of the last line than `BDAT` does: the terminator
+/// is `CRLF.CRLF`, so the `CR` that ends the body is part of a body line that
+/// did not end in a newline. `MAX_BODY_LINE` is therefore the widest tail both
+/// transports accept, and `MAX_BODY_LINE + 1` is where they part — the row in
+/// `the_line_bound_is_the_same_rule_on_both_transports` that says so instead of
+/// hiding it.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unterminated_last_line_is_accepted_when_the_client_finishes() {
+async fn data_stopped_by_the_client_answers_instead_of_timing_out() {
     use ayane_smtpd::server::MAX_BODY_LINE;
-    // The run is the body line before its terminating `CRLF`, which is the
-    // content both transports see. `DATA` accepts `MAX_BODY_LINE` of it and
-    // refuses one octet more, and `BDAT` has to say the same at both widths —
-    // that is the assertion, not a consequence of the constants.
+    // The three widths the review asked for, over a **stopped** client: under
+    // the bound, at it, and past it. The past-the-bound row is measured, not
+    // derived — `MAX_BODY_LINE + 3` is the first tail `DATA` refuses when the
+    // terminator never arrives, because the run it counts is those octets.
     for (run, expected) in [
         (MAX_BODY_LINE.saturating_sub(1), 250),
         (MAX_BODY_LINE, 250),
-        (MAX_BODY_LINE + 1, LINE_TOO_LONG.0),
+        (MAX_BODY_LINE + 3, LINE_TOO_LONG.0),
     ] {
         let harness = Harness::start(&format!("eof-data-{run}"), bounded()).await;
         let mut client = transaction(&harness);
         client.expect("DATA", 354);
-        let mut message = b"From: <a@example.net>\r\nSubject: eof\r\n\r\n".to_vec();
-        message.extend(std::iter::repeat_n(b'q', run));
-        // The message and the client's own terminator, in that order. The
-        // terminator is `CRLF . CRLF`, so the last body line is the run **plus
-        // the `CR` of that lead-in**: that is how a real client ends a message
-        // whose body does not end with a newline, and it is why the widest
-        // accepted body line here is `MAX_BODY_LINE + 1` rather than
-        // `MAX_BODY_LINE + 2`.
-        let mut wire = message.clone();
-        wire.extend_from_slice(b"\r\n.\r\n");
-        client.send_raw(&wire);
-        // The client is done sending: the terminator above is the transfer, so
-        // a `DATA` that accepts the last line answers `250`.
+        let mut body = b"From: <a@example.net>\r\nSubject: eof\r\n\r\n".to_vec();
+        body.extend(std::iter::repeat_n(b'q', run));
+        // The message, and then the client's send side closes: no terminator
+        // will ever follow, and the server has to decide.
+        client.send_raw(&body);
+        client.finish_sending();
         let reply = client
-            .try_read_reply_within(Duration::from_secs(10))
-            .unwrap_or_else(|| panic!("the transfer is answered: {run}"));
+            .try_read_reply_within(Duration::from_secs(5))
+            .unwrap_or_else(|| {
+                let drained = client.drain_available(Duration::from_millis(100));
+                panic!("the stopped transfer is answered: run={run} drained={drained:?}");
+            });
         let queued = harness.queued().len();
         harness.stop();
-
-        // `BDAT` sends the **same body octets**: the run, then the `CRLF` the
-        // terminator above gave it. That is the one wire form both transports
-        // see (see the module note on why `DATA` has a terminator and `BDAT`
-        // does not), and without it the two legs would be compared on different
-        // messages whenever the run is one that no `CRLF` follows.
-        let mut bdat_body = message.clone();
-        bdat_body.extend_from_slice(b"\r\n");
-        let bdat_harness = Harness::start(&format!("eof-bdat-{run}"), bounded()).await;
-        let mut bdat_client = transaction(&bdat_harness);
-        bdat_client.pending(&bdat_body);
-        let bdat_reply = bdat_client.command(&format!("BDAT {} LAST", bdat_body.len()));
-        let bdat_queued = bdat_harness.queued().len();
-        bdat_harness.stop();
-
         assert_eq!(
             reply.code, expected,
-            "a {run}-octet last line over DATA: {reply:?}"
+            "a {run}-octet last line with the client gone: {reply:?}"
         );
         assert_eq!(
-            bdat_reply.code, expected,
-            "a {run}-octet last line over BDAT: {bdat_reply:?}"
+            queued,
+            usize::from(expected == 250),
+            "{run}: {queued} queued"
         );
-        assert_eq!(queued, bdat_queued, "{run}: both transports queue the same");
         if expected != 250 {
             assert_eq!(reply.text, LINE_TOO_LONG.1, "{reply:?}");
-            assert_eq!(bdat_reply.text, LINE_TOO_LONG.1, "{bdat_reply:?}");
         }
+    }
+}
+
+/// The same octets over `BDAT`, where a chunk declares its own end: the
+/// agreement is at `MAX_BODY_LINE`, and one octet past it is the row the test
+/// above owns.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unterminated_last_line_is_accepted_when_the_client_finishes() {
+    use ayane_smtpd::server::MAX_BODY_LINE;
+    for (run, expected) in [(MAX_BODY_LINE.saturating_sub(1), 250), (MAX_BODY_LINE, 250)] {
+        let harness = Harness::start(&format!("eof-bdat-{run}"), bounded()).await;
+        let mut client = transaction(&harness);
+        let mut body = b"From: <a@example.net>\r\nSubject: eof\r\n\r\n".to_vec();
+        body.extend(std::iter::repeat_n(b'q', run));
+        client.pending(&body);
+        let reply = client.command(&format!("BDAT {} LAST", body.len()));
+        let queued = harness.queued().len();
+        harness.stop();
+        assert_eq!(reply.code, expected, "a {run}-octet last line: {reply:?}");
+        assert_eq!(
+            queued,
+            usize::from(expected == 250),
+            "{run}: {queued} queued"
+        );
     }
 }
 

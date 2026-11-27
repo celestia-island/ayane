@@ -161,8 +161,12 @@ pub enum ConfigError {
         #[source]
         source: std::net::AddrParseError,
     },
-    /// `AYANE_MAIL_LISTEN` names a listener that is not `role@addr`.
-    #[error("AYANE_MAIL_LISTEN `{value}` is not `role@addr` (roles: inbound, submission, submissions-tls)")]
+    /// `AYANE_MAIL_LISTENERS` names a listener that is not
+    /// `role@addr[,cert=PATH][,key=PATH]`.
+    #[error(
+        "AYANE_MAIL_LISTENERS: `{value}` is not `role@addr[,cert=PATH][,key=PATH]` \
+         (roles: inbound, submission, submissions-tls; listeners are separated by `;`)"
+    )]
     MailListen {
         /// The raw value.
         value: String,
@@ -288,7 +292,12 @@ fn mail_from_env(state_dir: &Path) -> Result<MailConfig, ConfigError> {
         "desired-state.json",
     );
     if let Ok(raw) = std::env::var("AYANE_MAIL_LISTENERS") {
-        for entry in raw.split(',').filter(|entry| !entry.trim().is_empty()) {
+        // `;` separates listeners; `,` separates a listener's own options
+        // (`cert=…,key=…`). The two are different punctuation because they are
+        // different things: with one of them, `inbound@:25,cert=…,key=…` parses
+        // as three listeners and a TLS listener cannot be written down at all —
+        // which is what this grammar's first version did.
+        for entry in raw.split(';').filter(|entry| !entry.trim().is_empty()) {
             mail.listeners.push(parse_listener(entry)?);
         }
     }
@@ -336,13 +345,17 @@ fn number<T: std::str::FromStr>(name: &'static str, default: T) -> Result<T, Con
     }
 }
 
-/// `role@addr` (with optional `,cert=…,key=…` for a TLS role).
+/// One `role@addr[,cert=PATH][,key=PATH]` entry.
+///
+/// The separator between entries is `;` (see `AYANE_MAIL_LISTENERS` above): the
+/// `,` inside an entry belongs to the entry, which is what lets a TLS listener
+/// name both files without the parser reading them as listeners of their own.
 fn parse_listener(entry: &str) -> Result<MailListener, ConfigError> {
     let entry = entry.trim();
     let mut parts = entry.split('@');
     let role_name = parts.next().unwrap_or_default().trim().to_owned();
     let rest = parts.next().unwrap_or_default().trim().to_owned();
-    if rest.is_empty() {
+    if rest.is_empty() || parts.next().is_some() {
         return Err(ConfigError::MailListen {
             value: entry.to_owned(),
         });
@@ -357,7 +370,8 @@ fn parse_listener(entry: &str) -> Result<MailListener, ConfigError> {
             })
         }
     };
-    // `addr[,cert=PATH][,key=PATH]`
+    // `addr[,cert=PATH][,key=PATH]` — the listener's own options, which is what
+    // the `,` is for. A listener is separated from the next one by `;`.
     let mut fields = rest.split(',');
     let address = fields.next().unwrap_or_default().trim();
     let listen = address.parse().map_err(|_| ConfigError::MailListen {

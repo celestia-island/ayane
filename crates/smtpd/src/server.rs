@@ -931,22 +931,18 @@ enum BodyFault {
 ///
 /// # The bound it measures
 ///
-/// Both shapes a body line has are measured against the same constant
-/// ([`RUN_BODY_LINE_BOUND`], which `DATA`'s own comparison reduces to): a
-/// `CRLF`-terminated line of up to `MAX_BODY_LINE + 1` octets of content is
-/// accepted and a longer one is refused, and the last line — which runs to the
-/// end of the message with no ending at all, the shape `DATA` accepts as its
-/// final line — is refused at the identical width. Measuring the unterminated
-/// tail against `MAX_BODY_LINE` alone made `BDAT` two octets stricter than
-/// `DATA` there, which is one message refused by one transport and accepted by
-/// the other.
+/// [`body_line_fault`] — the same function `DATA` calls — once per line of the
+/// body, with the `LF`'s index within the line's run for a terminated line and
+/// `None` for the last line, which has no ending. A line is refused at the
+/// octet `DATA` refuses it, because it is the same octet and the same
+/// comparison.
 ///
 /// # Errors
 ///
 /// Returns [`BodyFault::BareLf`] when a `\n` in the body is not directly
 /// preceded by a `\r`, or when the body's first octet is a `\n`; returns
-/// [`BodyFault::LineTooLong`] when a line's content is longer than
-/// [`RUN_BODY_LINE_BOUND`] (the bare-`LF` scan is first: a `LF` that ends an
+/// [`BodyFault::LineTooLong`] when a line is over [`BODY_LINE_BOUND`] (the
+/// bare-`LF` scan is first: a `LF` that ends an
 /// over-long line is still checked as a `LF`, which is the order `DATA` gets
 /// from reading the line's ending before it has seen the whole line).
 fn scan_record(record: &[u8], body_from: usize) -> Result<(), BodyFault> {
@@ -954,63 +950,66 @@ fn scan_record(record: &[u8], body_from: usize) -> Result<(), BodyFault> {
     if has_bare_lf(body) {
         return Err(BodyFault::BareLf);
     }
-    // One rule for both shapes, because `DATA` measures both at one width: it
-    // refuses a terminated line when its `LF` passes `RUN_BODY_LINE_BOUND`, and
-    // refuses the line it is still collecting when that buffer passes the same
-    // octet — the unterminated tail counted as a line with no ending.
-    let mut line_start = 0usize;
     let mut at = 0usize;
     loop {
-        let line_end =
-            memchr::memchr(b'\n', body.get(at..).unwrap_or_default()).map(|found| at + found);
-        // A terminated line is measured by its `LF` index, the tail by how long
-        // it is — the two shapes `DATA` bounds, each with its own width.
-        match line_end {
-            Some(line_end) => {
-                if line_end.saturating_sub(line_start) > RUN_BODY_LINE_BOUND {
-                    return Err(BodyFault::LineTooLong);
-                }
-            }
-            None => {
-                if body.len().saturating_sub(line_start) > TAIL_BODY_LINE_BOUND {
-                    return Err(BodyFault::LineTooLong);
-                }
-                return Ok(());
-            }
+        let Some(line_end) =
+            memchr::memchr(b'\n', body.get(at..).unwrap_or_default()).map(|found| at + found)
+        else {
+            // The last line: no ending, so its whole length is the run.
+            return body_line_fault(body.len() - at).map_or(Ok(()), Err);
+        };
+        // A terminated line: the run from where it starts through its `LF`.
+        if let Some(fault) = body_line_fault(line_end - at + 1) {
+            return Err(fault);
         }
-        if let Some(line_end) = line_end {
-            line_start = line_end + 1;
-            at = line_end + 1;
-        }
+        at = line_end + 1;
     }
 }
 
-/// The index of a body line's **last octet**, counted from where the line
-/// began, for a line that ends in `CRLF`: the `LF` of its ending.
+/// The largest body line either transport accepts, `CRLF` included.
 ///
-/// `DATA` asks the question twice, and both times it is this one number:
+/// This is `DATA`'s comparison — `position + 1 > MAX_BODY_LINE + 2`, where
+/// `position` is the `LF`'s index — read as an octet count: the run from where a
+/// line starts **through its `LF`** is at most `MAX_BODY_LINE + 2` octets, which
+/// is `MAX_BODY_LINE` octets of content and the two of its ending. The last line
+/// of a message is the same run with the ending missing, and the same bound.
 ///
-/// - **after the `LF` arrived** it refuses at `LF index + 1 > MAX_BODY_LINE + 2`,
-///   i.e. the last acceptable `LF` index is `MAX_BODY_LINE + 1`;
-/// - **before the `LF` arrived** it refuses once the buffer passes
-///   `MAX_BODY_LINE + 2` octets, and what it refuses then is the line whose `LF`
-///   would sit at index `MAX_BODY_LINE + 2` — one past the same bound.
+/// # One function, both transports
 ///
-/// So a `CRLF`-terminated line carries at most `MAX_BODY_LINE` octets of content
-/// before its ending. The **last line**, which has no ending anywhere, is the
-/// other width ([`TAIL_BODY_LINE_BOUND`]): `BDAT`'s chunks are that shape, and
-/// so is a `DATA` transfer whose client stopped.
-const RUN_BODY_LINE_BOUND: usize = MAX_BODY_LINE + 1;
+/// [`body_line_fault`] is the only place this rule is written. `DATA` asks it
+/// per line as the line arrives ([`Connection::read_body_line`]); `BDAT` asks it
+/// once over the reassembled body ([`scan_record`]). There is nothing to drift:
+/// a change here changes both answers in one commit, and the tests that pin it
+/// (`header_bound::the_line_bound_is_the_same_rule_on_both_transports`,
+/// `header_bound::an_unterminated_last_line_is_accepted_when_the_client_finishes`)
+/// measure the wire rather than this constant.
+const BODY_LINE_BOUND: usize = MAX_BODY_LINE + 2;
 
-/// How long the **last** line of a message may be: the body's tail, with no
-/// `CRLF` after it, which is the shape of a `BDAT` chunk chain's final line and
-/// of a `DATA` transfer whose client stopped sending.
+/// What is wrong with one body line's length — `None` when it fits.
 ///
-/// It is one octet more than [`RUN_BODY_LINE_BOUND`] because `DATA` holds one
-/// more octet of a line it has not finished: a buffer of `MAX_BODY_LINE + 2`
-/// octets is accepted before the next read, and the octet at the end of it is
-/// where a `CRLF`'s `LF` would go. Measured on the wire, both ways.
-const TAIL_BODY_LINE_BOUND: usize = MAX_BODY_LINE + 2;
+/// `run` is the number of octets from the start of the line **through its
+/// `LF`**, for a line that ends in `CRLF`; or the line's whole length when it is
+/// the message's last line and no ending arrived. Those are the two quantities
+/// `DATA` compares: `position + 1` for a line whose `LF` arrived, and the buffer
+/// it may not grow past for the one it is still collecting.
+fn body_line_fault(run: usize) -> Option<BodyFault> {
+    (run > BODY_LINE_BOUND).then_some(BodyFault::LineTooLong)
+}
+
+/// Whether a read error is the peer having stopped sending.
+///
+/// A clean half-close is `UnexpectedEof`; a client that closed the whole socket
+/// (or was killed) surfaces as `ConnectionReset`/`BrokenPipe`. Both mean "no
+/// more octets are coming" for the purpose of finishing a body — and to a
+/// `DATA` transfer that is the same event: the octets already received are its
+/// last line. Treating only the first as EOF is why a **stopped** transfer used
+/// to wait out the transaction timer instead of answering.
+fn is_eof(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+    )
+}
 
 /// How many octets of `message` are header section: up to and including the
 /// blank line that ends it, or the whole message when it has none. `None` when
@@ -1717,11 +1716,23 @@ impl Connection {
     /// the PLAIN continuation, both steps of LOGIN) rather than the one
     /// command shape a client happened to use.
     async fn check_password(&self, identity: &str, password: &str) -> Outcome {
-        // Not a mailbox at all (`ops@example.com\r\nBcc: …`, a bare name, an
-        // empty field): a syntax answer, before the credential — and before
-        // the per-address failure budget, which counts guesses, not noise.
+        // A value that is not a mailbox at all (`ops@example.com\r\nBcc: …`, a
+        // bare name, an empty field) is **not** answered differently from a
+        // wrong password. It used to be `501 Bad authentication identity
+        // syntax` before the credential was checked, which told a prober
+        // "that shape is not an address here" for free — one bit per attempt,
+        // outside the failure budget. Now it is a failed authentication like
+        // any other: `535`, and it spends the per-address budget, so probing it
+        // is as expensive as guessing a password.
+        //
+        // The identity is still validated before it is *used* (a bad one never
+        // reaches the password verifier below), and `AUTH` still refuses to
+        // continue a challenge for one — see `handle_auth_response`.
         if !authn::valid_identity(identity) {
-            return Outcome::AuthenticationIdentityInvalid;
+            if let Some(guard) = &self.config.auth_guard {
+                guard.record_failure(self.peer.ip(), Instant::now());
+            }
+            return Outcome::AuthenticationFailed;
         }
         // An address that spent its budget is refused **before the credential
         // is looked at**: otherwise every guess would still reach the password
@@ -1825,9 +1836,58 @@ impl Connection {
                 Ok(line) => line?,
             };
             let Some(line) = line else {
-                // The client hung up mid-body: nothing was acknowledged.
-                staged.abandon();
-                return Ok(());
+                // End of input with no terminator: the client stopped sending
+                // (or closed) mid-body. What it did send is the message's last
+                // line — `read_body_line` left it in the buffer for exactly this
+                // reason — and it is finished like any other body: bounded by
+                // the same line rule, then queued, or refused by a policy with
+                // its own answer. Draining what is left and abandoning the
+                // staged file would be the server throwing away a message the
+                // client believes (until it sees nothing) it sent.
+                if self.read_buf.is_empty() {
+                    // Nothing was ever sent for this body: no body at all.
+                    break;
+                }
+                let mut octets = std::mem::take(&mut self.read_buf);
+                if octets.last() == Some(&b'\r') {
+                    octets.pop();
+                }
+                if body_line_fault(octets.len()).is_some() {
+                    staged.abandon();
+                    self.session.fail_data();
+                    let reply = body_line_too_long();
+                    self.write(&reply).await?;
+                    self.quarantine_refused_upload();
+                    return Ok(());
+                }
+                octets.extend_from_slice(b"\r\n");
+                let line = BodyLine {
+                    octets: Some(octets),
+                    end_of_message: false,
+                };
+                if staged.size() + line.octets.as_ref().map_or(0, Vec::len) as u64
+                    > self.config.max_message_size
+                {
+                    staged.abandon();
+                    self.session.fail_data();
+                    return self.reply_end(false).await;
+                }
+                self.header
+                    .consume(line.octets.as_deref().unwrap_or_default());
+                if let Some(octets) = &line.octets {
+                    if let Err(err) = staged.write(octets) {
+                        tracing::error!(%err, "spool write failed");
+                        staged.abandon();
+                        self.session.fail_data();
+                        return self.reply_end(false).await;
+                    }
+                    hasher.write(octets);
+                    if head.len() < MAX_HEADER_BUFFER {
+                        let take = (MAX_HEADER_BUFFER - head.len()).min(octets.len());
+                        head.extend_from_slice(&octets[..take]);
+                    }
+                }
+                break;
             };
             let line = match line {
                 Ok(line) => line,
@@ -2794,6 +2854,17 @@ impl Connection {
                 None => self.stream.read(slice).await,
             };
             match result {
+                Ok(0) => {
+                    // A zero-byte read is the peer's end of stream, not "nothing
+                    // yet": `AsyncReadExt::read` on a socket returns 0 only at
+                    // EOF, and a caller that treated it as progress would spin
+                    // on a closed connection until its own timer fired.
+                    self.read_buf.truncate(buffer_end);
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "peer closed the connection",
+                    ));
+                }
                 Ok(read) => read,
                 Err(err) => {
                     self.read_buf.truncate(buffer_end);
@@ -2919,9 +2990,11 @@ impl Connection {
                 .position(|byte| *byte == b'\n')
             {
                 let position = scanned + relative;
+
                 // Refuse before copying: an over-long line must not make the
-                // server copy tens of kilobytes per attempt.
-                if position + 1 > MAX_BODY_LINE + 2 {
+                // server copy tens of kilobytes per attempt. The rule is
+                // [`body_line_fault`], the same one `BDAT`'s chained scan asks.
+                if body_line_fault(position + 1).is_some() {
                     return Ok(Some(Err(LINE_TOO_LONG)));
                 }
                 let mut line: Vec<u8> = self.read_buf.drain(..=position).collect();
@@ -2954,7 +3027,11 @@ impl Connection {
             // pieces (`\r`, `\r\n.`), which is not part of the line.
             let stub = terminator_stub(&self.read_buf);
 
-            if self.read_buf.len() > MAX_BODY_LINE + 2 + stub {
+            // The line still being collected: what is buffered is the run so
+            // far, and the `LF` (once it arrives) would be one of the octets
+            // still missing — so the run is compared as it stands, which is
+            // the same comparison `DATA` has always made here.
+            if body_line_fault(self.read_buf.len().saturating_sub(stub)).is_some() {
                 return Ok(Some(Err(LINE_TOO_LONG)));
             }
             // A read never runs more than a chunk past the line bound, so a
@@ -2968,29 +3045,33 @@ impl Connection {
 
             let before = self.read_buf.len();
             match self.fill(want, None).await {
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                Err(err) if is_eof(&err) => {
                     // The client stopped sending with `read_buf.len()` octets of
-                    // this line already in hand. `DATA` takes what arrived as
-                    // its last line (the way it takes a body whose final line
-                    // has no ending); returning `None` would call octets that
-                    // are a whole line "nothing to answer". The line is still
-                    // bounded — by the tail width, one octet past a terminated
-                    // line's, which is where its ending would have gone.
-                    if self.read_buf.len() > TAIL_BODY_LINE_BOUND {
-                        return Ok(Some(Err(LINE_TOO_LONG)));
-                    }
-                    let mut octets = std::mem::take(&mut self.read_buf);
-                    octets.extend_from_slice(b"\r\n");
-                    return Ok(Some(Ok(BodyLine {
-                        octets: Some(octets),
-                        end_of_message: false,
-                    })));
+                    // this line in hand — and no further octet will arrive. The
+                    // `LF` that would have ended the line never comes, so what
+                    // is here is the message's **last line**, and `DATA` takes
+                    // it as such rather than waiting out the transaction timer
+                    // for an ending the client is not going to send.
+                    //
+                    // It is bounded by the same rule as any other line
+                    // ([`body_line_fault`], on this run's length), and a
+                    // trailing `\r` is dropped: it is half of the ending the
+                    // client was about to write, not content.
+                    //
+                    // The buffer is **not** taken here. `DATA`'s loop and this
+                    // function are two readers over one buffer: draining it
+                    // here would leave a stale `scanned` cursor behind and the
+                    // loop would spin on an empty buffer — which is what the
+                    // first version of this arm did. Saying "end of input"
+                    // (`Ok(None)`) while leaving the octets in place is what
+                    // the caller already knows how to finish: it reads what is
+                    // there and answers.
+                    return Ok(None);
                 }
                 Err(err) => return Err(err.into()),
                 Ok(()) => {
-                    if self.read_buf.is_empty() {
-                        return Ok(None);
-                    }
+                    // Unreachable: `fill` reports a zero-byte read as EOF, so a
+                    // successful fill always appended at least one octet.
                     scanned = before;
                 }
             }
@@ -3866,45 +3947,60 @@ mod tests {
 
     #[test]
     fn the_body_scan_applies_the_data_line_bound_at_the_same_octet() {
-        // Two shapes, two widths, one constant — and the widths are the ones
-        // `DATA` draws on the wire (`header_bound` measures them there):
-        //
-        // - a `CRLF`-terminated line carries at most `MAX_BODY_LINE` octets of
-        //   content, because its `LF` index may reach `MAX_BODY_LINE + 1` and
-        //   nothing past it;
-        // - the last line carries at most `MAX_BODY_LINE + 2`, which is the
-        //   buffer `DATA` was still holding for a line it had not finished.
-        //
-        // The previous version asserted the second as `MAX_BODY_LINE` and the
-        // first as `MAX_BODY_LINE + 1`: two octets too strict on one side and
-        // one too loose on the other, which is one message with two answers.
+        // `body_line_fault` takes the run `DATA` compares, and the widths below
+        // are that comparison spelled out. The scan is fed **the shape the wire
+        // has**: a terminated line arrives with its `CRLF` in the run, so the
+        // scan hands the rule `content + 2`; a tail arrives alone and hands it
+        // its length. Both land on the one bound.
+        assert_eq!(
+            BODY_LINE_BOUND,
+            MAX_BODY_LINE + 2,
+            "DATA's own `position + 1 > MAX_BODY_LINE + 2`"
+        );
+        // A terminated line: run = content + 2, so the widest content is the
+        // widest run minus the CRLF.
+        for content in [MAX_BODY_LINE.saturating_sub(1), MAX_BODY_LINE] {
+            assert_eq!(
+                body_line_fault(content + 2),
+                None,
+                "a {content}-octet terminated line is inside the bound"
+            );
+        }
+        assert_eq!(
+            body_line_fault(MAX_BODY_LINE + 3),
+            Some(BodyFault::LineTooLong),
+            "one octet of content past the widest accepted terminates a refused line"
+        );
+        // A tail: its length is the run.
+        assert_eq!(body_line_fault(MAX_BODY_LINE), None);
+        assert_eq!(body_line_fault(BODY_LINE_BOUND), None);
+        assert_eq!(
+            body_line_fault(BODY_LINE_BOUND + 1),
+            Some(BodyFault::LineTooLong)
+        );
+
+        // And the scan, over both shapes at both sides of the bound.
         fn terminated(content: usize) -> Vec<u8> {
             let mut line = vec![b'x'; content];
             line.extend_from_slice(b"\r\n");
             line
         }
-        for content in [MAX_BODY_LINE.saturating_sub(1), MAX_BODY_LINE] {
-            assert_eq!(
-                scan_record(&terminated(content), 0),
-                Ok(()),
-                "a {content}-octet terminated line: DATA accepts it, so this must too"
-            );
-        }
+        assert_eq!(
+            scan_record(&terminated(MAX_BODY_LINE.saturating_sub(1)), 0),
+            Ok(())
+        );
+        assert_eq!(scan_record(&terminated(MAX_BODY_LINE), 0), Ok(()));
         assert_eq!(
             scan_record(&terminated(MAX_BODY_LINE + 1), 0),
             Err(BodyFault::LineTooLong),
-            "DATA's `LF` index check refuses this at MAX_BODY_LINE + 2, and so does this"
+            "the terminated shape is refused where DATA refuses it"
         );
-        for run in [MAX_BODY_LINE, MAX_BODY_LINE + 1, MAX_BODY_LINE + 2] {
-            assert_eq!(
-                scan_record(&vec![b'x'; run], 0),
-                Ok(()),
-                "a {run}-octet last line: it is the buffer DATA was still willing to hold"
-            );
-        }
+        assert_eq!(scan_record(&vec![b'x'; MAX_BODY_LINE], 0), Ok(()));
+        assert_eq!(scan_record(&vec![b'x'; BODY_LINE_BOUND], 0), Ok(()));
         assert_eq!(
-            scan_record(&vec![b'x'; MAX_BODY_LINE + 3], 0),
-            Err(BodyFault::LineTooLong)
+            scan_record(&vec![b'x'; BODY_LINE_BOUND + 1], 0),
+            Err(BodyFault::LineTooLong),
+            "one octet past the longest tail"
         );
         // The 70 KiB shape the defect was measured with, in both shapes.
         assert_eq!(
@@ -3917,7 +4013,7 @@ mod tests {
         );
         // A short line in front changes neither answer.
         let mut several = b"short\r\n".to_vec();
-        several.extend_from_slice(&vec![b'y'; MAX_BODY_LINE + 3]);
+        several.extend_from_slice(&vec![b'y'; BODY_LINE_BOUND + 1]);
         assert_eq!(scan_record(&several, 0), Err(BodyFault::LineTooLong));
         // The head is not body: a long *header* line is the header bound's
         // question, and the offset is what keeps them apart.
