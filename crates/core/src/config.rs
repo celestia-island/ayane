@@ -42,8 +42,15 @@ pub const DEFAULT_MAIL_ROOT: &str = "mail";
 /// One SMTP listener the mail service binds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailListener {
-    /// `inbound` (port 25 posture), `submission` (587 with STARTTLS) or
-    /// `submissions-tls` (465, implicit TLS).
+    /// `inbound` (port 25 posture), `submission` (587 with STARTTLS),
+    /// `submissions-tls` (465, implicit TLS) or `imap` (143 with STARTTLS, or
+    /// 993 with `imap-tls=`).
+    ///
+    /// A mail role is served by [`ayane_smtpd::serve`]; `imap` is served by
+    /// [`ayane_smtpd::serve_imap`]. The two are one configuration surface
+    /// because they are one service — the same credential check, the same TLS
+    /// files, the same mail root — and an operator who writes the IMAP port in
+    /// a second variable would be the one who lets them disagree.
     pub role: ListenerRole,
     /// The address to bind.
     pub listen: SocketAddr,
@@ -53,6 +60,14 @@ pub struct MailListener {
     pub tls_cert: Option<PathBuf>,
     /// The private key for [`MailListener::tls_cert`].
     pub tls_key: Option<PathBuf>,
+    /// A mail role's implicit-TLS switch, unused by `imap`.
+    ///
+    /// An `imap@…` entry decides *when* TLS starts with `imap-tls=1` (993:
+    /// the handshake precedes the greeting) or `imap-tls=0` / absent (143:
+    /// `STARTTLS`, and no password before it). A mail role's implicit TLS is
+    /// part of the role (`submissions-tls`), not an option, so this is `None`
+    /// for it.
+    pub imap_tls: Option<bool>,
 }
 
 /// The mail service's configuration: the part of the process that speaks SMTP.
@@ -153,10 +168,12 @@ pub enum ConfigError {
         source: std::net::AddrParseError,
     },
     /// `AYANE_MAIL_LISTENERS` names a listener that is not
-    /// `role@addr[,cert=PATH][,key=PATH]`.
+    /// `role@addr[,cert=PATH][,key=PATH]`, or an `imap` listener whose
+    /// `imap-tls=` is not a boolean.
     #[error(
         "AYANE_MAIL_LISTENERS: `{value}` is not `role@addr[,cert=PATH][,key=PATH]` \
-         (roles: inbound, submission, submissions-tls; listeners are separated by `;`)"
+         (roles: inbound, submission, submissions-tls, imap; listeners are \
+         separated by `;`)"
     )]
     MailListen {
         /// The raw value.
@@ -346,6 +363,7 @@ fn parse_listener(entry: &str) -> Result<MailListener, ConfigError> {
         "inbound" => ListenerRole::Inbound,
         "submission" => ListenerRole::Submission,
         "submissions-tls" | "submissions" => ListenerRole::SubmissionsTls,
+        "imap" => ListenerRole::Imap,
         _ => {
             return Err(ConfigError::MailListen {
                 value: entry.to_owned(),
@@ -361,17 +379,35 @@ fn parse_listener(entry: &str) -> Result<MailListener, ConfigError> {
     })?;
     let mut tls_cert = None;
     let mut tls_key = None;
+    let mut imap_tls = None;
     for field in fields {
         let field = field.trim();
         if let Some(value) = field.strip_prefix("cert=") {
             tls_cert = Some(PathBuf::from(value));
         } else if let Some(value) = field.strip_prefix("key=") {
             tls_key = Some(PathBuf::from(value));
+        } else if let Some(value) = field.strip_prefix("imap-tls=") {
+            // Only an IMAP listener has the choice, and saying so on any other
+            // one is a typo worth reporting rather than ignoring.
+            imap_tls = match value.trim() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => {
+                    return Err(ConfigError::MailListen {
+                        value: entry.to_owned(),
+                    })
+                }
+            };
         } else if !field.is_empty() {
             return Err(ConfigError::MailListen {
                 value: entry.to_owned(),
             });
         }
+    }
+    if imap_tls.is_some() && role != ListenerRole::Imap {
+        return Err(ConfigError::MailListen {
+            value: entry.to_owned(),
+        });
     }
     Ok(MailListener {
         role,
@@ -379,5 +415,6 @@ fn parse_listener(entry: &str) -> Result<MailListener, ConfigError> {
         role_name,
         tls_cert,
         tls_key,
+        imap_tls,
     })
 }

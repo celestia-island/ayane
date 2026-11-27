@@ -346,14 +346,18 @@ async fn build(
         .map_err(|err| MailError::Roots(err.to_string()))?;
     // A submission listener without TLS cannot offer AUTH, and a submission
     // listener that cannot authenticate accepts nothing: better to say so here
-    // than to serve a port that answers `538` to every login.
+    // than to serve a port that answers `538` to every login. An IMAP listener
+    // has the same shape of problem for the same reason — its session refuses
+    // `LOGIN` unless the transport is encrypted — so a TLS-less `imap` entry is
+    // refused here rather than started as a port that answers `NO` to every
+    // client.
     for listener in &mail.listeners {
-        if listener.role != ListenerRole::Inbound && listener.tls_cert.is_none() {
+        if !matches!(listener.role, ListenerRole::Inbound) && listener.tls_cert.is_none() {
             return Err(MailError::Listener {
                 listen: listener.listen,
                 reason: format!(
-                    "role {} needs a certificate: without TLS the AUTH capability is \
-                     not offered and every submission is refused",
+                    "role {} needs a certificate: without TLS a password is never \
+                     accepted, so every login is refused",
                     listener.role_name
                 ),
             });
@@ -395,8 +399,11 @@ async fn build(
 
     // Bind every socket before serving any of them, then start the tasks: a
     // listener that cannot take its address is a startup failure, not a
-    // half-served instance.
-    let mut sockets = Vec::with_capacity(configs.len());
+    // half-served instance. SMTP sockets and IMAP sockets are bound together
+    // and served by two different loops — one `serve` per protocol — so an
+    // instance that has both ports either has both or starts neither.
+    let mut smtp_sockets = Vec::with_capacity(configs.len());
+    let mut imap_sockets: Vec<(tokio::net::TcpListener, Arc<ayane_smtpd::ImapConfig>)> = Vec::new();
     for (config, listener) in configs.iter().zip(&mail.listeners) {
         let socket = tokio::net::TcpListener::bind(listener.listen)
             .await
@@ -410,7 +417,11 @@ async fn build(
             tls = config.tls.is_some(),
             "mail listener bound"
         );
-        sockets.push(socket);
+        if listener.role == ListenerRole::Imap {
+            imap_sockets.push((socket, Arc::new(imap_config(mail, listener, config)?)));
+        } else {
+            smtp_sockets.push(socket);
+        }
     }
 
     // The slot a reload replaces: seeded with the first listener's full section,
@@ -428,7 +439,7 @@ async fn build(
     );
 
     let mut tasks = Vec::new();
-    for (socket, config) in sockets.into_iter().zip(configs) {
+    for (socket, config) in smtp_sockets.into_iter().zip(configs) {
         let served = attach_metrics(config, metrics.clone());
         tasks.push(tokio::spawn(async move {
             // A listener whose `serve` returns has failed permanently (the
@@ -436,6 +447,13 @@ async fn build(
             // process keeps the other listeners and the API alive.
             if let Err(err) = ayane_smtpd::serve(socket, Arc::new(served)).await {
                 tracing::error!(%err, "mail listener stopped");
+            }
+        }));
+    }
+    for (socket, config) in imap_sockets {
+        tasks.push(tokio::spawn(async move {
+            if let Err(err) = ayane_smtpd::serve_imap(socket, config).await {
+                tracing::error!(%err, "imap listener stopped");
             }
         }));
     }
@@ -710,6 +728,43 @@ fn listener_config(
         );
     }
     Ok(config)
+}
+
+/// One IMAP listener's own configuration.
+///
+/// It is built from the mail role's configuration rather than beside it, so the
+/// two protocols cannot disagree about the three things that must not: the
+/// credential check (`config.passwords` — the same store-backed verifier a
+/// submission listener uses), the certificate (`config.tls`), and the mail root
+/// (where the delivery consumer writes and the reader reads).
+///
+/// # Errors
+///
+/// Returns [`MailError::Listener`] when an `imap` entry asks for implicit TLS
+/// without a certificate — there would be nothing to hand the socket to.
+fn imap_config(
+    mail: &MailConfig,
+    listener: &crate::config::MailListener,
+    base: &ServerConfig,
+) -> Result<ayane_smtpd::ImapConfig, MailError> {
+    let implicit = listener.imap_tls.unwrap_or(false);
+    if implicit && base.tls.is_none() {
+        return Err(MailError::Listener {
+            listen: listener.listen,
+            reason: "imap-tls=1 needs cert= and key=: there is no certificate to \
+                     hand the socket to"
+                .to_owned(),
+        });
+    }
+    Ok(ayane_smtpd::ImapConfig {
+        hostname: mail.hostname.clone(),
+        mail_root: mail.mail_root.clone(),
+        passwords: Arc::clone(&base.passwords),
+        tls: base.tls.clone(),
+        imap_tls: implicit,
+        per_ip_limit: mail.per_ip_limit,
+        command_timeout: ayane_smtpd::imap_server::AUTOLOGOUT,
+    })
 }
 
 /// Loads the TLS acceptor from a PEM chain and key.
@@ -1147,6 +1202,7 @@ mod tests {
             role_name: "inbound".to_owned(),
             tls_cert: None,
             tls_key: None,
+            imap_tls: None,
         }];
         let config = Config {
             listen: "127.0.0.1:0".parse().expect("listen"),

@@ -13,7 +13,15 @@
 //! ayane-smtpd --deliver --spool state/spool --mail-root /var/mail/vhosts \
 //!             --state state/desired-state.json --hostname mx.example.com \
 //!             [--retry-max-age-seconds N] [--quota BYTES]
+//! ayane-smtpd --imap --listen 0.0.0.0:993 --mail-root /var/mail/vhosts \
+//!             --state state/desired-state.json --hostname mx.example.com \
+//!             --tls-cert FILE --tls-key FILE [--imap-tls]
 //! ```
+//!
+//! The third mode is the IMAP face of the same mailboxes the delivery
+//! consumer writes into: `--imap` serves [`serve_imap`] over the mail root and
+//! authenticates against the same `--password-hashes` file a split-process
+//! submission listener reads.
 
 #![warn(missing_docs)]
 
@@ -24,8 +32,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ayane_smtpd::authn::PasswordVerifier;
+use ayane_smtpd::imap_server::AUTOLOGOUT;
 use ayane_smtpd::policy::AddressPolicy;
 use ayane_smtpd::queue::Spool;
+use ayane_smtpd::serve_imap;
 use ayane_smtpd::server::{serve, ServerConfig};
 use ayane_smtpd::session::Limits;
 use ayane_smtpd::verify::Verifier;
@@ -39,6 +49,26 @@ enum Options {
     Serve(ServeOptions),
     /// Drain the queue until stopped.
     Deliver(DeliverOptions),
+    /// Serve IMAP over the mail root until stopped.
+    Imap(ImapOptions),
+}
+
+/// The IMAP mode's options.
+#[derive(Debug)]
+struct ImapOptions {
+    listen: SocketAddr,
+    /// Where the mailboxes are — the root the delivery consumer writes into.
+    mail_root: PathBuf,
+    state: PathBuf,
+    hostname: String,
+    /// The account hashes `LOGIN` is checked against (the same file a
+    /// split-process submission listener reads).
+    password_hashes: BTreeMap<String, String>,
+    tls: Option<(PathBuf, PathBuf)>,
+    /// IMAPS shape: the handshake comes before the greeting.
+    implicit_tls: bool,
+    command_timeout: Duration,
+    per_ip_limit: usize,
 }
 
 /// The listener mode's options.
@@ -108,8 +138,15 @@ fn usage() -> &'static str {
     "usage: ayane-smtpd --role inbound|submission|submissions-tls \
         --listen ADDR --spool DIR --state FILE --hostname NAME \
         [--tls-cert FILE --tls-key FILE] [--max-size BYTES] \
-        [--max-header-bytes BYTES] [--per-ip LIMIT] \\
+        [--max-header-bytes BYTES] [--per-ip LIMIT] \
         [--password-hashes FILE]\n\
+     \x20 or: ayane-smtpd --imap --listen ADDR --mail-root DIR --state FILE \
+        --hostname NAME --tls-cert FILE --tls-key FILE \
+        [--imap-tls] [--password-hashes FILE] \
+        [--imap-timeout-seconds N] [--per-ip LIMIT]\n\
+     \x20 (--imap-tls makes the handshake precede the greeting: the 993 \
+        shape. Without it the listener offers STARTTLS and refuses LOGIN \
+        until it has been negotiated.)\n\
      \x20 or: ayane-smtpd --deliver --spool DIR --mail-root DIR --state FILE \
         --hostname NAME [--retry-max-age-seconds N] [--retry-max-attempts N] \
         [--quota BYTES] [--interval-seconds N] [--outbound] \
@@ -140,6 +177,9 @@ fn parse_options() -> Result<Options, String> {
     let mut max_header_bytes = ayane_smtpd::server::DEFAULT_MAX_HEADER_BYTES;
     let mut per_ip_limit = 8;
     let mut hash_file: Option<PathBuf> = None;
+    let mut imap = false;
+    let mut implicit_tls = false;
+    let mut command_timeout = AUTOLOGOUT;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -181,6 +221,15 @@ fn parse_options() -> Result<Options, String> {
                     .map_err(|err| format!("bad --per-ip: {err}"))?;
             }
             "--deliver" => deliver = true,
+            "--imap" => imap = true,
+            "--imap-tls" => implicit_tls = true,
+            "--imap-timeout-seconds" => {
+                command_timeout = Duration::from_secs(
+                    value()?
+                        .parse()
+                        .map_err(|err| format!("bad --imap-timeout-seconds: {err}"))?,
+                );
+            }
             "--retry-max-age-seconds" => {
                 // The RFC 5321 §4.5.4.1 horizon, expressed in seconds: an
                 // operator who needs a longer one says so, and the default is
@@ -220,9 +269,48 @@ fn parse_options() -> Result<Options, String> {
             other => return Err(format!("unknown flag {other}")),
         }
     }
-    let spool = spool.ok_or("--spool is required")?;
     let state = state.ok_or("--state is required")?;
     let hostname = hostname.ok_or("--hostname is required")?;
+    if imap {
+        // The two modes are the two protocols, and a process that said both
+        // would be serving one socket twice.
+        if deliver || role.is_some() {
+            return Err("--imap does not take --deliver or --role".to_owned());
+        }
+        let tls = match (cert, key) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            (None, None) => None,
+            _ => return Err("--tls-cert and --tls-key go together".to_owned()),
+        };
+        if tls.is_none() && implicit_tls {
+            return Err("--imap-tls needs --tls-cert and --tls-key".to_owned());
+        }
+        if tls.is_none() {
+            // The listener would refuse every `LOGIN` (see `ImapConfig::tls`),
+            // which is a port that answers nothing: refuse to start it instead
+            // of leaving an operator to discover the reason from a client.
+            return Err(
+                "--imap needs --tls-cert and --tls-key: without TLS no login \
+                        is ever accepted"
+                    .to_owned(),
+            );
+        }
+        return Ok(Options::Imap(ImapOptions {
+            listen: listen.ok_or("--listen is required with --imap")?,
+            mail_root: mail_root.ok_or("--mail-root is required with --imap")?,
+            state,
+            hostname,
+            password_hashes: match &hash_file {
+                Some(path) => read_passwd_file(path)?,
+                None => BTreeMap::new(),
+            },
+            tls,
+            implicit_tls,
+            command_timeout,
+            per_ip_limit,
+        }));
+    }
+    let spool = spool.ok_or("--spool is required")?;
     if deliver {
         if role.is_some() || listen.is_some() {
             return Err("--deliver does not take --role or --listen".to_owned());
@@ -441,7 +529,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match options {
         Options::Serve(options) => serve_listener(options).await,
         Options::Deliver(options) => deliver_forever(options).await,
+        Options::Imap(options) => serve_imap_listener(options).await,
     }
+}
+
+/// The IMAP half: bind, serve until the process is stopped.
+///
+/// The credential check is [`SnapshotVerifier`] — the same one a split-process
+/// submission listener runs, over the same `--password-hashes` file — so the
+/// two protocols agree about who may log in for exactly the reason they read
+/// one file. The state snapshot is validated here because the verifier's
+/// coverage is derived from it: a hash for an address the snapshot does not
+/// carry is a hash for nobody, and this refuses to serve that silently.
+async fn serve_imap_listener(options: ImapOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let state: ayane_proto::DesiredState = serde_json::from_slice(&std::fs::read(&options.state)?)?;
+    state.validate()?;
+    let Some((cert, key)) = &options.tls else {
+        return Err("--imap needs --tls-cert and --tls-key".into());
+    };
+    let config = Arc::new(ayane_smtpd::ImapConfig {
+        hostname: options.hostname.clone(),
+        mail_root: options.mail_root.clone(),
+        // The whole password check, not a copy of it: `SnapshotVerifier` is
+        // what the split-process listener already uses.
+        passwords: Arc::new(SnapshotVerifier::from_state(
+            &state,
+            &options.password_hashes,
+        )),
+        tls: Some(load_tls(cert, key)?),
+        imap_tls: options.implicit_tls,
+        per_ip_limit: options.per_ip_limit,
+        command_timeout: options.command_timeout,
+    });
+    let listener = tokio::net::TcpListener::bind(options.listen).await?;
+    tracing::info!(
+        listen = %options.listen,
+        mail_root = %options.mail_root.display(),
+        implicit_tls = options.implicit_tls,
+        "listening (IMAP)"
+    );
+    serve_imap(listener, config).await?;
+    Ok(())
 }
 
 /// The receiving half: bind, recover, serve until the process is stopped.

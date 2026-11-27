@@ -173,6 +173,8 @@
 pub mod authn;
 pub mod command;
 pub mod deliver;
+pub mod imap_server;
+pub mod imap_session;
 pub mod mailbox;
 pub mod maildir_reader;
 pub mod metrics;
@@ -192,6 +194,7 @@ pub use deliver::{
     MaildirStep, MaildirSync, RecipientOutcome, RecipientReport, RecordedRecipient, RemoteReply,
     RemoteReport, RemoteRequest, RemoteTransport, DEFAULTS,
 };
+pub use imap_server::{serve as serve_imap, ImapConfig};
 pub use mailbox::{Mailbox, MailboxError, POSTMASTER};
 pub use maildir_reader::{
     digest as message_digest, FlagChange, Flags, FolderListing, ListingRow, MaildirReader,
