@@ -1,12 +1,13 @@
 [package]
 name = "ayane"
-description = "Mail service control plane: domains, mailboxes, policy, webmail and MCP over a Postfix/Dovecot stack"
+description = "Self-contained mail service: SMTP (RFC 5321), delivery, DKIM/SPF/DMARC (mail-auth), maildir, webmail and MCP — no Postfix, no Dovecot"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license-file.workspace = true
+publish = true
 readme = "../../README.md"
 
 [dependencies]

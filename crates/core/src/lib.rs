@@ -1,4 +1,5 @@
 //! ayane — the control plane of the Celestia mail service.
+
 //!
 //! The crate owns the HTTP surface and the process lifecycle. Routing rules
 //! live in `ayane-mail`, the generated daemon configuration lives in
@@ -11,6 +12,7 @@
 //! is left of the old shape is the rendered Postfix/Dovecot map files — the
 //! deployed read path still consumes those — and the management API.
 
+pub use ayane_proto;
 pub mod api;
 pub mod apply;
 pub mod auth;
