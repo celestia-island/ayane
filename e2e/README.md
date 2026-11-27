@@ -30,14 +30,10 @@ reading it (or writing another client):
   answer is read here on purpose, with the socket's own octet counts, rather
   than through `imaplib`'s parser. The framing this script exercises is still
   the server's; only the *reading* is the test's.
-- **This server counts the announcement octets in `{n}`.** The announcement
-  `{188}` and the CRLF that ends its line are the first seven of the octets
-  the count promises; the message follows them. That is the octets a client
-  reports back in its own `{n}`, and the RFC 3501 §9 `literal` rule reads the
-  same way — but it is *not* how RFC 3501 §6.4.5's prose ("the number of
-  octets in the message") describes it, and a client that subtracts the
-  announcement lands seven octets early. Recorded as a known issue rather than
-  changed here.
+- **`{n}` counts the literal and nothing else** (RFC 3501 §4.3), and the script
+  asserts it: it reads exactly `n` octets and requires the next octet to be the
+  one that closes the item list (`)`). A count that included the announcement
+  would leave the reader seven octets early and it would see `{` instead.
 - `mx.test` resolves nowhere, so the script patches `socket.getaddrinfo` for
   that one name to loopback: the TLS handshake is therefore verified against
   the certificate's real name (no `check_hostname = False`).

@@ -75,6 +75,25 @@ impl Root {
         &self.0
     }
 
+    /// The same, with the message spelled out by the test.
+    fn deliver_raw(&self, unique: &str, bytes: &[u8]) {
+        let address = Address::parse("alice@example.test").expect("address");
+        let dir = MaildirReader::new(self.path())
+            .folder_dir(&address, INBOX, true)
+            .expect("maildir");
+        std::fs::write(
+            dir.join("new").join(format!(
+                "{}-{unique}.M{}.ayane-test",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_nanos()),
+                std::process::id()
+            )),
+            bytes,
+        )
+        .expect("message");
+    }
+
     /// A message in the account's INBOX, written the way a delivery lands.
     fn deliver(&self, subject: &str) {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -564,6 +583,93 @@ async fn a_listener_without_a_certificate_never_accepts_a_login() {
     let reply = client.say("a2 STARTTLS", "a2");
     assert!(reply[0].starts_with("a2 BAD"), "{reply:?}");
     assert_eq!(listener.passwords.asked.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_fetch_literal_is_exactly_as_long_as_it_announces() {
+    // RFC 3501 §4.3: a client reads `{n}` octets after the announcement's CRLF
+    // and then the rest of the response. This test *is* that client — it reads
+    // one octet at a time from the socket, counts `n` of them, and requires the
+    // next octet to be the one that closes the item list.
+    let root = Root::new("literal-length");
+    let message = format!(
+        "From: bob@example.test\r\nTo: alice@example.test\r\nSubject: {}\r\n\
+         Date: Mon, 1 Jan 2024 00:00:00 +0000\r\nMessage-ID: <literal@example.test>\r\n\r\n\
+         {{not-a-literal}}\r\nbody\r\n",
+        "x".repeat(80)
+    );
+    root.deliver_raw("literal-length", message.as_bytes());
+    let listener = Listener::start(root.path(), true).await;
+    let mut client = Client::tls(listener.connect());
+    assert!(client.line().starts_with("* OK"));
+    client.login();
+    let reply = client.say("a2 SELECT INBOX", "a2");
+    assert!(
+        reply.iter().any(|line| line.starts_with("* 1 EXISTS")),
+        "{reply:?}"
+    );
+
+    // Over TLS, `imaplib`-style line buffering would eat the literal, so the
+    // reply is read off the socket one octet at a time.
+    client.wire.write_all(b"a3 FETCH 1 BODY.PEEK[]\r\n");
+    let head = read_line_octetwise(&mut client.wire);
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let open = text.rfind('{').expect("an announcement");
+    let close = text.rfind('}').expect("the end of it");
+    let announced: usize = text[open + 1..close].parse().expect("a count");
+    assert_eq!(
+        announced,
+        message.len(),
+        "`{{n}}` counts the message, not the announcement: {text}"
+    );
+    let literal = read_octets(&mut client.wire, announced);
+    assert_eq!(
+        literal,
+        message.as_bytes(),
+        "the octets that follow are the message, first octet to last"
+    );
+    // The very next octet is the one that closes the FETCH item list.
+    let mut next = [0u8; 1];
+    client.wire.read_some(&mut next).expect("the trailer");
+    assert_eq!(next[0], b')', "the response resumes with `)`");
+    let rest = read_line_octetwise(&mut client.wire);
+    assert!(
+        rest.starts_with(b"\r\n"),
+        "and the item list's line ends there: {:?}",
+        String::from_utf8_lossy(&rest)
+    );
+    let tagged = read_line_octetwise(&mut client.wire);
+    assert!(
+        tagged.starts_with(b"a3 OK"),
+        "then the tagged reply: {:?}",
+        String::from_utf8_lossy(&tagged)
+    );
+}
+
+/// One CRLF-terminated line, octet by octet, CRLF included.
+fn read_line_octetwise(wire: &mut Wire) -> Vec<u8> {
+    let mut line = Vec::new();
+    loop {
+        let mut octet = [0u8; 1];
+        let read = wire.read_some(&mut octet).expect("a line arrives");
+        assert!(read > 0, "the connection closed mid-line");
+        line.push(octet[0]);
+        if line.ends_with(b"\r\n") {
+            return line;
+        }
+    }
+}
+
+/// Exactly `count` octets, octet by octet.
+fn read_octets(wire: &mut Wire, count: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        let mut octet = [0u8; 1];
+        let read = wire.read_some(&mut octet).expect("a literal octet arrives");
+        assert!(read > 0, "the connection closed inside a literal");
+        out.push(octet[0]);
+    }
+    out
 }
 
 #[tokio::test]

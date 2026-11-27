@@ -117,7 +117,11 @@ def pick_port() -> int:
 
 
 def main() -> int:
-    binary = Path(os.environ.get("AYANE_SMTPD_BIN", ROOT / "target/debug/ayane-smtpd"))
+    binary = Path(os.environ.get("AYANE_SMTPD_BIN", "target/debug/ayane-smtpd"))
+    if not binary.is_absolute():
+        # Relative to the build directory when there is one (a sandbox run sets
+        # `CARGO_TARGET_DIR`), else to the repository.
+        binary = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")) / "debug" / "ayane-smtpd"
     if not binary.exists():
         print(f"no binary at {binary}; build it with `cargo build -p ayane-smtpd`", file=sys.stderr)
         return 2
@@ -246,29 +250,31 @@ def main() -> int:
             fetch_tag = client._new_tag()
             client.send(fetch_tag + b" FETCH 1 (UID RFC822.SIZE BODY.PEEK[])\r\n")
             # The answer is `* 1 FETCH (…) BODY[] {n}` CRLF, then exactly `n`
-            # octets (which begin at the announcement's `{`, so the first of
-            # them are the `{n}` and CRLF themselves — see the note below),
-            # then the line's `)` trailer, then the tagged `OK`. Over TLS the
-            # client's line buffer cannot be used for any of it: a literal is
-            # the one thing a line reader cannot take.
-            head = read_line(client.sock, drop_crlf=False)
+            # octets of message, then the line's `)` trailer, then the tagged
+            # `OK` (RFC 3501 §4.3: `{n}` counts the literal, nothing else). Over
+            # TLS the client's line buffer cannot be used for any of it — a
+            # literal is the one thing a line reader cannot take — so every
+            # read here is off the socket, to its own count.
+            head = read_line(client.sock)
             if b"BODY[] {" not in head or not head.startswith(b"* 1 FETCH"):
                 raise SystemExit(f"unexpected FETCH head: {head!r}")
-            size = int(head.rsplit(b"{", 1)[1].rstrip(b"\r\n").rstrip(b"}"))
-            # `n` is octets of the message, and the message begins after the
-            # announcement's own octets (`{n}` and the CRLF that ends the line
-            # it sits on) — so `n` plus those is what the wire carries here.
-            promised = read_exactly(client.sock, size + len(head) - head.rfind(b"{"))
-            message = promised[len(head) - head.rfind(b"{") :]
-            trailer = client._get_line()
-            tagged = client._get_line()
-            if not tagged.startswith(fetch_tag + b" OK"):
-                raise SystemExit(f"FETCH answered {tagged!r} after {trailer!r}")
+            size = int(head.rsplit(b"{", 1)[1].rstrip(b"}"))
+            message = read_exactly(client.sock, size)
             if len(message) != size or b"the body imaplib should fetch" not in message:
                 raise SystemExit(f"FETCH returned {len(message)} octets, not the message")
+            # The next octet is the one that closes the FETCH item list: a
+            # count that included the announcement would leave the reader
+            # seven octets early and see `{`, not `)`.
+            trailer = read_line(client.sock)
+            if not trailer.endswith(b")"):
+                raise SystemExit(f"the literal was not followed by `)`: {trailer!r}")
+            tagged = read_line(client.sock)
+            if not tagged.startswith(fetch_tag + b" OK"):
+                raise SystemExit(f"FETCH answered {tagged!r} after {trailer!r}")
             steps.append(
-                f"FETCH {size}-octet literal: {head.decode(errors='replace')} | "
-                f"{trailer.decode(errors='replace')} | {tagged.decode(errors='replace')}"
+                f"FETCH {size}-octet literal, {len(message)} octets read, then "
+                f"{trailer.decode(errors='replace')!r}: "
+                f"{head.decode(errors='replace')} | {tagged.decode(errors='replace')}"
             )
             status, data = client.store("1", "+FLAGS", r"(\Flagged \Seen)")
             steps.append(f"STORE {status}: {data!r}")

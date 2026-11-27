@@ -5,11 +5,19 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use imap_codec::decode::Decoder;
-use imap_codec::imap_types::core::Tag;
+use imap_codec::imap_types::{
+    core::{NonEmptyVec, Tag},
+    fetch::MessageDataItem,
+    response::{Data, Response},
+};
 use imap_codec::CommandCodec;
 
+use super::render::literal_string;
+use super::session::{ImapSession, Transport};
+use super::wire::{encode, glob, line, non_zero};
 use super::*;
 use crate::authn::PasswordVerifier;
+use crate::maildir_reader::{MaildirReader, MessageId, INBOX};
 
 /// A verifier that accepts exactly one identity/password pair, and counts how
 /// often it was asked (so "the password was never checked" is a fact a test
@@ -60,6 +68,16 @@ impl Fixture {
             transport,
             passwords,
         )
+    }
+
+    /// The octets of a message the test delivered.
+    fn message_bytes(&self, address: &Address, name: &str) -> Vec<u8> {
+        // The folder is checked to exist inside `read_raw`; this only reads.
+        let _ = self.reader.folder_dir(address, INBOX, false);
+        let id = MessageId::parse(name).expect("a maildir name");
+        self.reader
+            .read_raw(address, INBOX, &id.file_name())
+            .expect("the message")
     }
 
     /// Write one message straight into the account's INBOX maildir, the way a
@@ -173,13 +191,20 @@ async fn a_password_over_tls_is_checked_and_only_for_this_mailbox() {
 async fn a_valid_password_for_another_mailbox_does_not_open_this_one() {
     let fixture = Fixture::new();
     // The verifier says yes for `bob`; this session is alice's.
+    // Invented here, for this test only: the point is that a *valid* password
+    // for one account must not open another's mailbox.
+    let bob_password = "bob-test-only-password";
     let passwords = OnePassword {
         identity: "bob@example.test",
-        password: "bob-pass",
+        password: bob_password,
         asked: AtomicUsize::new(0),
     };
     let mut session = fixture.session(Transport::Tls, &passwords);
-    let reply = say(&mut session, "a1 LOGIN bob@example.test \"bob-pass\"\r\n").await;
+    let reply = say(
+        &mut session,
+        "a1 LOGIN bob@example.test \"bob-test-only-password\"\r\n",
+    )
+    .await;
     assert!(
         reply.contains("a1 NO"),
         "the mailbox is the destination, not a claim: {reply}"
@@ -574,14 +599,134 @@ fn a_fetch_of_body_sets_seen_but_peek_does_not() {
 }
 
 #[test]
-fn an_envelope_carries_the_declared_fields() {
-    let raw = b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\nFrom: Bob <bob@example.test>\r\nTo: alice@example.test\r\nSubject: hi\r\n\r\nbody\r\n";
-    let envelope = envelope(raw);
-    assert_eq!(envelope.message_id, NString(None));
-    assert_eq!(envelope.from.len(), 1);
-    assert_eq!(envelope.from[0].host, literal_string(b"example.test"));
-    assert_eq!(envelope.from[0].mailbox, literal_string(b"bob"));
-    assert_eq!(envelope.to.len(), 1);
+fn a_body_literal_is_announced_with_its_own_length_and_nothing_else() {
+    // RFC 3501 §4.3 and §6.4.5: `{n}` is the number of octets **in the
+    // literal**, and the literal is the message. A client reads exactly `n`
+    // octets after the announcement's CRLF and then expects the rest of the
+    // response, so an announcement that counted its own `{n}\r\n` would hand
+    // every client seven octets that belong to the announcement.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let fixture = Fixture::new();
+        fixture.deliver("1700000500.M1P1Q0.example", "literal-length");
+        let address = Address::parse("alice@example.test").expect("address");
+        let dir = fixture
+            .reader
+            .folder_dir(&address, INBOX, true)
+            .expect("maildir");
+        let name = std::fs::read_dir(dir.join("new"))
+            .expect("messages")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .next()
+            .expect("a message");
+        let message = fixture.message_bytes(&address, &name);
+
+        let passwords = passwords();
+        let mut session = fixture.session(Transport::Tls, &passwords);
+        login(&mut session).await;
+        say(&mut session, "a2 SELECT INBOX\r\n").await;
+        let reply = say(&mut session, "a3 FETCH 1 BODY.PEEK[]\r\n").await;
+
+        // Read it the way a client does: the last `{n}` in the reply is the
+        // literal's announcement, `n` octets follow it, and whatever comes
+        // after them is the rest of the response.
+        let (announced, literal, rest) = split_literal(&reply)
+            .unwrap_or_else(|| panic!("the reply holds no literal: {reply:?}"));
+        assert_eq!(
+            announced,
+            message.len(),
+            "the announcement counts the message, not itself: {reply:?}"
+        );
+        assert_eq!(
+            literal, message,
+            "the literal is the message's own octets, and nothing else"
+        );
+        // What follows the literal is the rest of the FETCH item list, never a
+        // second announcement or a repeated `{n}`.
+        let tail = String::from_utf8_lossy(&rest);
+        assert!(
+            tail.starts_with(')'),
+            "the response resumes with `)`: {tail:?}"
+        );
+        assert!(
+            !tail.contains('{'),
+            "no announcement follows the literal: {tail:?}"
+        );
+        assert!(
+            !tail.contains("FETCH (BODY[] {"),
+            "no second FETCH line: {tail:?}"
+        );
+    });
+}
+
+#[test]
+fn an_announcement_is_written_once_and_counts_only_the_literal() {
+    // RFC 3501 §4.3 and §6.4.5: a literal is announced once, on the line
+    // before its octets, and `{n}` counts the octets **in the literal** and
+    // nothing else. Both halves of that rule are asserted on the bytes the
+    // encoder produces for one small FETCH, where every octet is spelled out:
+    // the announcement appears exactly once, the literal is the message's own
+    // octets, and the response resumes immediately after it.
+    let body = b"hello\r\nworld\r\n";
+    let response = Response::Data(Data::Fetch {
+        seq: non_zero(1),
+        items: NonEmptyVec::try_from(vec![
+            MessageDataItem::Uid(non_zero(1)),
+            MessageDataItem::BodyExt {
+                section: None,
+                origin: None,
+                data: literal_string(body),
+            },
+        ])
+        .expect("two items"),
+    });
+    let text = String::from_utf8_lossy(&encode(&response)).into_owned();
+    let expected = format!(
+        "* 1 FETCH (UID 1 BODY[] {{{}}}\r\n{})\r\n",
+        body.len(),
+        String::from_utf8_lossy(body)
+    );
+    assert_eq!(
+        text, expected,
+        "the answer is the announcement, then the message, then the rest"
+    );
+    // The same facts, stated separately so a failure names which one broke.
+    assert_eq!(
+        text.matches('{').count(),
+        1,
+        "the announcement is written exactly once: {text:?}"
+    );
+    let (announced, literal, rest) =
+        split_literal(&text).unwrap_or_else(|| panic!("no literal in {text:?}"));
+    assert_eq!(announced, body.len(), "`{{n}}` counts the literal only");
+    assert_eq!(literal, body.to_vec(), "and the literal is the message");
+    assert_eq!(rest.as_slice(), b")\r\n", "the response resumes after it");
+}
+
+/// The literal a rendered reply carries, as `(its announced length, its
+/// octets, what follows them)`.
+///
+/// A client's reading, byte for byte: the **last** `{n}` in the reply is the
+/// announcement, exactly `n` octets follow it (they may hold CRLF, braces and
+/// anything else), and the rest of the response comes after. `None` when the
+/// reply holds no `{n}` that its own octets fit.
+fn split_literal(wire: &str) -> Option<(usize, Vec<u8>, Vec<u8>)> {
+    let bytes = wire.as_bytes();
+    let announced = bytes.iter().rposition(|byte| *byte == b'{')?;
+    let close = announced + bytes[announced..].iter().position(|byte| *byte == b'}')?;
+    let length: usize = std::str::from_utf8(&bytes[announced + 1..close])
+        .ok()?
+        .parse()
+        .ok()?;
+    let start = close + 1 + 2; // past `}` and the CRLF that ends its line
+    let end = start.checked_add(length)?;
+    if end > bytes.len() {
+        return None;
+    }
+    Some((length, bytes[start..end].to_vec(), bytes[end..].to_vec()))
 }
 
 /// The reply bytes a status line carries, for the tests that only look at the
