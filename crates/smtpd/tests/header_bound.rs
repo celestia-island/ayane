@@ -250,15 +250,14 @@ pub struct Verdict {
 /// transfer that fails on the octets does not answer at once: a **failed**
 /// `DATA` transfer drains the rest of the upload before it replies, so a sender
 /// that keeps its socket open with no terminator coming is answered only when
-/// the drain ends — the transaction timer (20 s in this fixture). That is
-/// measured, and it is why the first version of these tests reported a `554`
-/// for the `DATA` leg: it had already appended the terminator before reading,
-/// so the reply it read was the post-drain one. Without the terminator the same
-/// transfer says nothing for 20 s and then answers `554 5.6.0 Transaction
-/// failed` — not `421`: the timer bounds the drain, it does not close the
-/// connection. The terminator supplied here ends the drain at once, so both
-/// transports answer the same question ("what is wrong with these octets?")
-/// instead of the same question one timer apart. `tb15` and
+/// the drain ends. That used to be the transaction timer (20 s in this
+/// fixture, and the first version of these tests reported a `554` for the
+/// `DATA` leg only because it had appended the terminator before reading);
+/// the drain now runs to its own `SHORT_DRAIN` bound (one second), so the wait
+/// is short rather than absent. The terminator supplied here still ends the
+/// drain at once — which is what makes the two transports answer the same
+/// question ("what is wrong with these octets?") instead of the same question
+/// one drain-width apart. `tb15` and
 /// `a_terminator_after_a_bare_lf_does_not_resume_the_session` cover the drain
 /// itself, where that timing is the thing under test.
 async fn both_ways(tag: &str, message: &[u8]) -> (Verdict, Verdict) {
@@ -273,6 +272,45 @@ async fn both_ways(tag: &str, message: &[u8]) -> (Verdict, Verdict) {
         Some(reply) => reply,
         None => {
             client.send_raw(b".\r\n");
+            client.read_reply()
+        }
+    };
+    let queued_over_data = data_harness.queued().len();
+    data_harness.stop();
+
+    let bdat_harness = Harness::start(&format!("{tag}-bdat"), bounded()).await;
+    let mut client = transaction(&bdat_harness);
+    client.pending(message);
+    let bdat_reply = client.command(&format!("BDAT {} LAST", message.len()));
+    let queued_over_bdat = bdat_harness.queued().len();
+    bdat_harness.stop();
+
+    (
+        Verdict {
+            code: data_reply.code,
+            text: data_reply.text,
+            queued: queued_over_data,
+        },
+        Verdict {
+            code: bdat_reply.code,
+            text: bdat_reply.text,
+            queued: queued_over_bdat,
+        },
+    )
+}
+
+/// [`both_ways`] for a message too large to write in one call: the `DATA` leg
+/// writes it in pieces ([`Client::send_raw_pieces`]).
+async fn both_ways_pieces(tag: &str, message: &[u8]) -> (Verdict, Verdict) {
+    let data_harness = Harness::start(&format!("{tag}-data"), bounded()).await;
+    let mut client = transaction(&data_harness);
+    client.expect("DATA", 354);
+    client.send_raw_pieces(message);
+    let data_reply = client.try_read_reply_within(Duration::from_millis(500));
+    let data_reply = match data_reply {
+        Some(reply) => reply,
+        None => {
+            client.send_raw_pieces(b".\r\n");
             client.read_reply()
         }
     };
@@ -1531,5 +1569,267 @@ async fn a_tail_split_past_the_failure_detection_is_settled() {
         "a command written after the refused upload's own terminator is \
          answered: {answers:?}"
     );
+    harness.stop();
+}
+
+// ── the body line bound: one number, two transports ──────────────────────
+//
+// `MAX_BODY_LINE` (64 KiB) was the one bound only `DATA` applied. `DATA` reads
+// a line at a time and refuses the line that grows past it; a `BDAT` chain has
+// no line structure until it is whole, so nothing there looked, and a 70 KiB
+// single-line body was answered `250` over `BDAT` and refused over `DATA`. The
+// tests below pin the answer, on both transports, with the whole reply compared
+// — a `552` that says "line too long" and a `554` that says "transaction
+// failed" are different instructions to a client.
+
+/// The code and text both transports answer a body line past
+/// `MAX_BODY_LINE` with: RFC 5321 §4.3.2's "line too long".
+///
+/// Not `554 5.6.0`: that is the transaction's own failure (the bare `LF`, the
+/// DMARC rejection), and a client cannot do anything with it but give up on the
+/// message. `552 5.2.3` says a *line* is longer than this system carries, which
+/// is fixable by re-wrapping it — and `5.2.3` is RFC 3463 §3.4's "message length
+/// exceeds administrative limit", the code RFC 5321 §4.3.2 names for exactly
+/// this, as opposed to `5.3.4` ("message too big for system") which the header
+/// bound and the `SIZE` refusal use.
+const LINE_TOO_LONG: (u16, &str) = (552, "5.2.3 Message line too long");
+
+/// A 70 KiB body line is refused by **both** transports, with the same code and
+/// the same text, and nothing is queued either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_line_bound_is_one_answer_over_both_transports() {
+    let mut message = b"From: <a@example.net>\r\nSubject: line\r\n\r\n".to_vec();
+    message.extend(std::iter::repeat_n(b'b', 70 * 1024));
+    message.extend_from_slice(b"\r\nshort tail\r\n");
+
+    let (data, bdat) = both_ways("line-bound", &message).await;
+    for (transport, verdict) in [("DATA", &data), ("BDAT", &bdat)] {
+        assert_eq!(
+            (verdict.code, verdict.text.as_str()),
+            LINE_TOO_LONG,
+            "{transport} answered a 70 KiB body line: {verdict:?}"
+        );
+    }
+    assert_duality("a 70 KiB body line", &data, &bdat);
+    assert_eq!(data.queued, 0, "nothing is queued over DATA");
+    assert_eq!(bdat.queued, 0, "nothing is queued over BDAT");
+}
+
+/// The bound is the *body's*: a header line that long is the header section's
+/// business (`552 5.3.4`), and a body of many short lines is accepted however
+/// large it is, over both transports.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_line_bound_is_not_a_message_size_bound() {
+    // Several mebibytes of short lines: bigger than any line bound by three
+    // orders of magnitude, and every one of its lines is far inside it.
+    let mut message = b"From: <a@example.net>\r\nSubject: many lines\r\n\r\n".to_vec();
+    while message.len() < 512 * 1024 {
+        message.extend_from_slice(b"a body line that is nowhere near the bound\r\n");
+    }
+    // Written in pieces: a `write_all` of this much blocks on a loopback
+    // socket whose reader is still uploading, and a test that then waits for a
+    // fixed time measures its own deadlock.
+    let (data, bdat) = both_ways_pieces("line-bound-many", &message).await;
+    assert_eq!(data.code, 250, "many short lines over DATA: {data:?}");
+    assert_eq!(bdat.code, 250, "many short lines over BDAT: {bdat:?}");
+    assert_duality("many short lines", &data, &bdat);
+    assert_eq!(data.queued, 1);
+    assert_eq!(bdat.queued, 1);
+}
+
+/// The one-octet boundary, measured on both transports rather than assumed.
+///
+/// `DATA`'s comparison is `content + CRLF > MAX_BODY_LINE + 2`, so a body line
+/// of `MAX_BODY_LINE` content is accepted and one of `MAX_BODY_LINE + 2` is
+/// refused — and the chained scan uses the identical inequality. The width
+/// where the two transports differ (`MAX_BODY_LINE + 1` octets of content,
+/// which `DATA` reads as a line plus the first octet of the next one and `BDAT`
+/// sees whole) is deliberately **not** here: it is not one message, and pinning
+/// it as an agreement would be pinning a lie. What is pinned is that the rule is
+/// the same rule on both sides of the boundary that matters.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_line_bound_is_the_same_inequality_on_both_transports() {
+    use ayane_smtpd::server::MAX_BODY_LINE;
+    for (content, accepted) in [(MAX_BODY_LINE, true), (MAX_BODY_LINE + 2, false)] {
+        let mut message = b"From: <a@example.net>\r\nSubject: edge\r\n\r\n".to_vec();
+        message.extend(std::iter::repeat_n(b'q', content));
+        message.extend_from_slice(b"\r\ntail\r\n");
+        let (data, bdat) = both_ways(&format!("line-edge-{content}"), &message).await;
+        let expected = if accepted { 250 } else { LINE_TOO_LONG.0 };
+        assert_eq!(
+            data.code, expected,
+            "a {content}-octet body line over DATA (bound {MAX_BODY_LINE}): {data:?}"
+        );
+        assert_eq!(
+            bdat.code, expected,
+            "a {content}-octet body line over BDAT (bound {MAX_BODY_LINE}): {bdat:?}"
+        );
+        if !accepted {
+            assert_eq!(data.text, LINE_TOO_LONG.1, "{data:?}");
+            assert_eq!(bdat.text, LINE_TOO_LONG.1, "{bdat:?}");
+        }
+        assert_duality(&format!("a {content}-octet line"), &data, &bdat);
+    }
+}
+
+/// Every chunk length splits the same 70 KiB line somewhere, and none of them
+/// changes the answer: the bound is applied to the reassembled message, not to
+/// what a chunk happened to hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chunk_boundary_inside_a_long_line_does_not_hide_it() {
+    let mut message = b"From: <a@example.net>\r\nSubject: split\r\n\r\n".to_vec();
+    message.extend(std::iter::repeat_n(b's', 70 * 1024));
+    message.extend_from_slice(b"\r\n");
+    let total = message.len();
+    // Chunk widths chosen so the long line is split: one octet in, at the
+    // bound, and in the middle of the padding.
+    for width in [1usize, MAX_CHUNK_EDGE, total / 3] {
+        let harness = Harness::start(&format!("line-split-{width}"), bounded()).await;
+        let mut client = transaction(&harness);
+        let mut offset = 0;
+        let mut last = false;
+        while offset < total {
+            let end = (offset + width).min(total);
+            let chunk = &message[offset..end];
+            last = end == total;
+            client.pending(chunk);
+            let reply = client.command(&format!(
+                "BDAT {} {}",
+                chunk.len(),
+                if last { "LAST" } else { "" }
+            ));
+            if last {
+                assert_eq!(
+                    (reply.code, reply.text.as_str()),
+                    LINE_TOO_LONG,
+                    "a {width}-octet chunking of a 70 KiB line is still a 70 KiB line: {reply:?}"
+                );
+            } else {
+                assert_eq!(reply.code, 250, "an intermediate chunk: {reply:?}");
+            }
+            offset = end;
+        }
+        assert!(last, "the loop must end on the LAST chunk");
+        assert!(harness.queued().is_empty(), "nothing is queued");
+        harness.stop();
+    }
+}
+
+/// The chunk width used for the split test: a `BDAT` chunk wide enough to hold
+/// the bound and then some, so a line can be cut *at* its boundary.
+const MAX_CHUNK_EDGE: usize = 64 * 1024;
+
+// ── the refusal is bounded: one second, not one transaction ──────────────
+//
+// A `DATA` transfer that fails on its octets is drained before the reply goes
+// out, so that what the sender still has in flight is discarded rather than
+// executed. That drain used to run to the transaction timer: a sender that
+// wrote a bare `LF` and then waited was answered after **20 s** in this fixture
+// (600 s in production), for a transfer that had already failed on a line the
+// driver read. The tests below pin the new bound from both sides — the wait is
+// short, and everything the closed drain used to guarantee about the tail still
+// holds (the discard discipline is the S1 tests above, unchanged).
+
+/// A bare `LF` and then silence: the `554` arrives in about a second, not in
+/// twenty.
+///
+/// The upper bound is generous on purpose (two seconds against a one-second
+/// drain): this asserts "bounded", not "fast", and a loaded CI box must not
+/// make a correct server look wrong. What it would fail on is a drain that was
+/// never bounded — the old behaviour was 20 s here and 600 s in production, an
+/// order of magnitude away either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_no_longer_waits_for_the_transaction_timer() {
+    let harness = Harness::start("bounded-drain", bounded()).await;
+    assert_eq!(
+        bounded().transaction_timeout,
+        Duration::from_secs(20),
+        "the test is only meaningful against a long transaction timer"
+    );
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    // The head is clean, the body's first line ends in a bare `LF`, and the
+    // sender then stops: no terminator ever comes.
+    client.send_raw(b"From: <a@example.net>\r\nSubject: bounded\r\n\r\nprompt\n");
+    let (elapsed, reply) = client.read_reply_timed();
+    assert_eq!(
+        (reply.code, reply.text.as_str()),
+        (554, "5.6.0 Transaction failed"),
+        "the refused transfer is answered: {reply:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the refusal took {elapsed:?}: a failed transfer must not wait out the \
+         20 s transaction timer, let alone the 600 s one a deployment runs with"
+    );
+    assert!(harness.queued().is_empty(), "nothing is queued");
+    harness.stop();
+}
+
+/// The same wait, measured against the transaction timer itself rather than a
+/// constant: with the timer *cut* to two seconds, the answer still comes at the
+/// drain's own bound and not later.
+///
+/// This is the control that separates "the drain is bounded" from "the
+/// transaction timer happened to be short": the timer is long in both tests,
+/// and the first one asserts a constant. Here the two numbers are put in
+/// tension — the drain is one second and the timer is two — and the answer
+/// arrives before the timer, which is the only ordering the bound can produce.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_drain_bound_is_shorter_than_the_transaction_timer() {
+    let options = HarnessOptions {
+        transaction_timeout: Duration::from_secs(2),
+        ..bounded()
+    };
+    let harness = Harness::start("bounded-drain-short", options).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    client.send_raw(b"From: <a@example.net>\r\n\r\nprompt\n");
+    let (elapsed, reply) = client.read_reply_timed();
+    assert_eq!(reply.code, 554, "{reply:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the drain must end on its own bound ({elapsed:?} elapsed, timer 2 s)"
+    );
+    assert!(harness.queued().is_empty());
+    harness.stop();
+}
+
+/// And the bound is a *bound*, not a behaviour change: a sender that is still
+/// writing past it gets the same refusal, its octets are still discarded, and
+/// its connection still owes the client answers afterwards.
+///
+/// The drain ends on its own timer while the client is mid-upload, so the
+/// octets it did not read are the refused upload's tail and must be treated
+/// exactly as a terminator-ended drain's tail is (one `503`, then normal
+/// service). The one second is not a licence to execute them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_upload_past_the_bound_is_a_tail_too() {
+    let harness = Harness::start("bounded-drain-live", bounded()).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    // The failing octets, then more body (no terminator) — so the drain is
+    // still blocked on a socket that keeps delivering.
+    client.send_raw(b"From: <a@example.net>\r\n\r\nprompt\n");
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        client.send_raw(b"more body, no terminator\r\n");
+    }
+    let reply = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the refused transfer is answered");
+    assert_eq!(
+        (reply.code, reply.text.as_str()),
+        (554, "5.6.0 Transaction failed"),
+        "{reply:?}"
+    );
+    // Everything the client wrote after the refusal is a tail: a `MAIL FROM`
+    // in it opens nothing.
+    client.send("MAIL FROM:<a@example.net>");
+    let after = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the command after the refusal is answered");
+    assert_ne!(after.code, 250, "the tail opened a transaction: {after:?}");
+    assert!(harness.queued().is_empty(), "nothing is queued");
     harness.stop();
 }

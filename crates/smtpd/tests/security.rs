@@ -512,7 +512,9 @@ async fn tb14_body_over_the_message_limit_fails_the_transaction() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tb14_over_long_data_line_fails_without_desync() {
     // The refused transfer is drained up to its terminator; a client that
-    // stops sending after the refusal is cut off by the transaction timer.
+    // stops sending after the refusal is cut off by the drain's own short
+    // bound, which is what keeps this test from waiting on the transaction
+    // timer.
     let options = HarnessOptions {
         transaction_timeout: Duration::from_millis(1500),
         ..HarnessOptions::inbound()
@@ -524,7 +526,7 @@ async fn tb14_over_long_data_line_fails_without_desync() {
     client.expect("RCPT TO:<inbox@example.com>", 250);
     client.expect("DATA", 354);
     // A 70 KiB line is past the body line bound; the server must drain to the
-    // terminator and answer 554 rather than treat the noise as commands.
+    // terminator and answer rather than treat the noise as commands.
     let long = format!("{}\r\n", "b".repeat(70 * 1024));
     // The rest of the "envelope" is inside the failed transfer: it is drained
     // with the body, never executed.
@@ -533,32 +535,34 @@ async fn tb14_over_long_data_line_fails_without_desync() {
     let reply = client
         .try_read_reply()
         .expect("the refused transfer is answered");
-    assert!(
-        matches!(reply.code, 554 | 421),
+    // `552 5.2.3` — RFC 5321 §4.3.2's "line too long" — and not the
+    // transaction's `554`: a line over a resource bound is a request the client
+    // can fix by re-wrapping it, which is what the code tells it. `BDAT` answers
+    // the same octets the same way (`header_bound::the_line_bound_is_one_answer`).
+    assert_eq!(
+        (reply.code, reply.text.as_str()),
+        (552, "5.2.3 Message line too long"),
         "an over-long body line fails the transfer: {reply:?}"
     );
     assert!(harness.queued().is_empty());
-    // The same `MAIL FROM` that was in the tail was answered `503` (see the
-    // assertion above): the connection will not open an envelope while it is
-    // still discarding the refused upload, because it cannot tell that command
-    // from the forged one right next to it.
+    // The same `MAIL FROM` that was in the tail is answered `503`, not run:
+    // the connection will not open an envelope while it is still discarding the
+    // refused upload, because it cannot tell that command from the forged one
+    // right next to it.
     //
     // What must hold either way is the sentence this test is named for: nothing
-    // in the tail was executed. The connection is offered a real transaction
-    // over and over, from a fresh connection each time, until the refusal has
-    // settled — and it must **never** be a `250`, and must never queue
-    // anything from the forged sender.
-    if reply.code == 554 {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            let probe = client.try_read_reply_within(Duration::from_millis(200));
-            assert!(
-                probe.is_none() || probe.as_ref().is_some_and(|r| r.code == 503),
-                "nothing in the tail is accepted: {probe:?}"
-            );
-            if probe.is_none() {
-                break;
-            }
+    // in the tail was executed. The connection must never answer a step of the
+    // forged transaction — never a `250`, and never a `354` that would let the
+    // second message in.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let probe = client.try_read_reply_within(Duration::from_millis(200));
+        assert!(
+            probe.is_none() || probe.as_ref().is_some_and(|r| r.code == 503),
+            "nothing in the tail is accepted: {probe:?}"
+        );
+        if probe.is_none() {
+            break;
         }
     }
     assert!(harness.queued().is_empty(), "still nothing queued");
@@ -1201,5 +1205,100 @@ async fn a_bare_postmaster_identity_is_the_host_s_own() {
         Some("postmaster@mx.test"),
         "the identity is recorded as the mailbox the path names"
     );
+    harness.stop();
+}
+
+// ── the traffic counters ────────────────────────────────────────────────
+//
+// The control plane's traffic page used to be built from Postfix log lines
+// (`connect from unknown[…]: …`, `to=<…>, relay=…, status=sent`). The engine
+// that produces those lines is no longer in the path, so the numbers have to
+// come from the layer that knows the event happened. These tests pin what the
+// listener counts, from the outside: what a client does, and what the counter
+// says afterwards.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn traffic_counts_what_the_listener_answered() {
+    use ayane_smtpd::metrics::Counter;
+
+    let options = HarnessOptions {
+        metrics: true,
+        ..HarnessOptions::inbound()
+    };
+    let harness = Harness::start("metrics", options).await;
+    let metrics = harness
+        .metrics
+        .clone()
+        .expect("the harness asked for counting");
+
+    // One connection, three recipients: two accepted, one refused.
+    let mut client = harness.client();
+    client.ehlo("client.test");
+    client.expect("MAIL FROM:<a@example.net>", 250);
+    client.expect("RCPT TO:<inbox@example.com>", 250);
+    client.expect("RCPT TO:<ops@example.com>", 250);
+    let refused = client.command("RCPT TO:<nobody@example.net>");
+    assert_eq!(refused.code, 550, "{refused:?}");
+    // The message goes in: one message, and the recipients it was accepted
+    // for were counted as they were accepted.
+    client.expect("DATA", 354);
+    client.send_raw(b"Subject: counted\r\n\r\nbody\r\n.\r\n");
+    assert_eq!(client.read_reply().code, 250);
+
+    // A second connection that only greets, so `connects` is 2 and nothing
+    // else moves.
+    let mut second = harness.client();
+    second.ehlo("client.test");
+
+    let snapshot = metrics.snapshot(ayane_smtpd::server::received_now_epoch(), 3600);
+    let row = snapshot
+        .inbound
+        .iter()
+        .find(|row| row.peer == "127.0.0.1")
+        .unwrap_or_else(|| panic!("no row for the loopback peer: {snapshot:?}"));
+    assert_eq!(row.connects, 2, "two connections were accepted: {row:?}");
+    assert_eq!(row.messages, 1, "one message was queued: {row:?}");
+    assert_eq!(row.recipients, 2, "two recipients were accepted: {row:?}");
+    assert_eq!(row.refused, 1, "one was refused: {row:?}");
+    // The reported totals are the same numbers, summed.
+    assert_eq!(snapshot.totals.connects, 2);
+    assert_eq!(snapshot.totals.messages_in, 1);
+    assert_eq!(snapshot.totals.recipients_in, 2);
+    assert_eq!(snapshot.totals.recipients_refused, 1);
+    // A listener that was never asked to count stays silent.
+    assert_eq!(
+        ayane_smtpd::metrics::Metrics::new().total(Counter::Connects),
+        0
+    );
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn traffic_does_not_count_a_refused_transaction_as_a_message() {
+    use ayane_smtpd::metrics::Counter;
+
+    let options = HarnessOptions {
+        metrics: true,
+        ..HarnessOptions::inbound()
+    };
+    let harness = Harness::start("metrics-refused", options).await;
+    let metrics = harness.metrics.clone().expect("counters");
+    let mut client = harness.client();
+    client.ehlo("client.test");
+    client.expect("MAIL FROM:<a@example.net>", 250);
+    client.expect("RCPT TO:<inbox@example.com>", 250);
+    client.expect("DATA", 354);
+    // A bare `LF` fails the transaction; nothing is queued, so no message is
+    // counted — but the recipient *was* accepted, and that half is true.
+    client.send_raw(b"Subject: bad\r\n\r\nbody\n.\r\n");
+    let reply = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the refused transfer is answered");
+    assert_eq!(reply.code, 554, "{reply:?}");
+    let now = ayane_smtpd::server::received_now_epoch();
+    assert_eq!(metrics.total(Counter::MessagesIn), 0);
+    assert_eq!(metrics.total(Counter::RecipientsIn), 1);
+    let snapshot = metrics.snapshot(now, 3600);
+    assert!(snapshot.totals.messages_in == 0, "{snapshot:?}");
     harness.stop();
 }

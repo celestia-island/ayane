@@ -393,6 +393,11 @@ async fn serve_listener(options: ServeOptions) -> Result<(), Box<dyn std::error:
         max_header_bytes: options.max_header_bytes,
         // The only bound on password guessing that survives a reconnect.
         auth_guard: Some(Arc::new(ayane_smtpd::server::AuthGuard::default())),
+        // A listener started from this binary has no one to hand the numbers
+        // to: the control plane that reports traffic starts its own listeners
+        // in-process (`--serve` here is the split-process shape, for an
+        // installation that wants the listener under its own unit).
+        metrics: None,
     });
     if options.role.needs_tls() && config.tls.is_none() {
         return Err("this role requires --tls-cert and --tls-key".into());

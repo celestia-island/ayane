@@ -5,9 +5,11 @@
 //! `ayane-engine`, the shared data model in `ayane-proto` and persistence in
 //! `ayane-store`.
 //!
-//! ayane never speaks SMTP or IMAP as a server. Postfix, Dovecot and rspamd
-//! are separate processes; this service renders their configuration, drives
-//! their reloads and serves the management API.
+//! ayane speaks SMTP itself: the listener, the spool, the delivery consumer
+//! and the outbound transport are [`ayane_smtpd`], and this crate runs them
+//! ([`engine`]) when the mail section of the configuration enables them. What
+//! is left of the old shape is the rendered Postfix/Dovecot map files — the
+//! deployed read path still consumes those — and the management API.
 
 pub mod api;
 pub mod apply;
@@ -15,6 +17,7 @@ pub mod auth;
 pub mod config;
 pub mod dns;
 pub mod driver;
+pub mod engine;
 pub mod net;
 pub mod rpc;
 pub mod session;

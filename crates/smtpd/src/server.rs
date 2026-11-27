@@ -105,11 +105,35 @@
 //!
 //! | Decision | `DATA` | `BDAT` |
 //! |---|---|---|
-//! | bare `LF` in the header section | refused on the line (`554 5.6.0`) | `header_len`, reported as `MalformedHead` |
-//! | bare `LF` in the body | refused on the line (`554 5.6.0`) | `scan_record`, reported as `MalformedBody` |
+//! | bare `LF` in the header section | refused on the line (`554 5.6.0`) | `header_len`, reported as `MalformedHead` (`554 5.6.0`) |
+//! | bare `LF` in the body | refused on the line (`554 5.6.0`) | `scan_record` → `BodyFault::BareLf` (`554 5.6.0`) |
+//! | a body line past [`MAX_BODY_LINE`] | refused on the line (`552 5.2.3`) | `scan_record` → `BodyFault::LineTooLong` (`552 5.2.3`) |
 //! | header section past the bound | charged per line (`552 5.3.4`) | `HeaderBudget::charge_message` (`552 5.3.4`) |
-//! | message past the size | refused while reading (`552`) | declared size, by the session |
+//! | message past the size | refused while reading (`552`) | declared size, by the session (`552`) |
 //! | a valid message | `250`, queued | `250`, queued |
+//!
+//! The line bound is the row that reads like a leftover and is not: every
+//! `DATA` line is one wire line, so the bound is one comparison as each line
+//! arrives, while a chunk may split a line anywhere — so over `BDAT` the same
+//! bound can only be applied once, to the reassembled record, and it is
+//! (`scan_record`). Both answer `552 5.2.3`, which is RFC 5321 §4.3.2's own
+//! "line too long" and RFC 3463 §3.4's "message length exceeds administrative
+//! limit" — not `5.3.4`, which says the *system* is too small for the message.
+//!
+//! # A failed transfer is drained for a second, not for the transaction timer
+//!
+//! The drain below exists so that the octets a refused upload still has in
+//! flight are thrown away instead of executed. What it must not do is wait for
+//! them: a sender that writes a bare `LF` and then goes quiet was answered only
+//! when the transaction timer expired — ten minutes in production, twenty
+//! seconds in the test fixture — for a transfer that had already failed on a
+//! line the driver read. So the drain runs to `SHORT_DRAIN` (one second, and
+//! never past the transaction deadline) and the refusal goes out then. The
+//! discipline that makes that safe is the one the drain had already: what
+//! arrives after the refusal is a **tail**, and a tail is discarded, not
+//! executed — a drain that ends on its own bound arms `settling` exactly as one
+//! that ends on the client's terminator does, so the octets still on the way
+//! can never start a transaction.
 //!
 //! The names in the `BDAT` column are private functions of this module, so they
 //! are plain code here rather than links: the table is about *where* the
@@ -241,6 +265,16 @@ pub struct ServerConfig {
     /// The per-IP AUTH failure budget and back-off; `None` disables it (tests
     /// that only exercise one connection, and never in a deployment).
     pub auth_guard: Option<Arc<AuthGuard>>,
+    /// Where traffic is counted; `None` counts nothing (a unit test that is not
+    /// about traffic, and a listener started by hand with no control plane to
+    /// read the numbers).
+    ///
+    /// The counts are taken here because this is the layer that *knows*: a
+    /// connection is accepted once, a recipient is accepted or refused once,
+    /// and a transaction is queued once. The control plane's traffic page used
+    /// to parse a Postfix log for the same three facts; see
+    /// [`crate::metrics`] for why that is now a number instead of a line.
+    pub metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -256,6 +290,7 @@ impl fmt::Debug for ServerConfig {
             .field("max_received_headers", &self.max_received_headers)
             .field("max_header_bytes", &self.max_header_bytes)
             .field("auth_guard", &self.auth_guard.is_some())
+            .field("metrics", &self.metrics.is_some())
             .field("domains", &self.state.domains.len())
             .finish_non_exhaustive()
     }
@@ -293,6 +328,14 @@ pub async fn serve(listener: TcpListener, config: Arc<ServerConfig>) -> Result<(
     let limiter = Arc::new(PerIpLimiter::new(config.per_ip_limit));
     loop {
         let (stream, peer) = listener.accept().await?;
+        if let Some(metrics) = &config.metrics {
+            metrics.record_peer(
+                &peer.ip().to_string(),
+                crate::metrics::Counter::Connects,
+                1,
+                crate::server::received_now_epoch(),
+            );
+        }
         let Some(permit) = limiter.acquire(peer.ip()) else {
             // Over the per-IP cap: greet-and-refuse is what the RFC allows;
             // closing immediately would look like a network fault to a
@@ -835,16 +878,25 @@ impl HeaderBudget {
     }
 }
 
-/// What a reassembled record's bare-`LF` scan found.
+/// What is wrong with the body of a reassembled message.
 ///
-/// A unit rather than a `bool`, for the same reason [`MalformedHead`] is one:
-/// the caller cannot reach the "no bare `LF` at all" case by forgetting to
-/// look at the answer.
+/// The two answers are **not** the same refusal, and that is why this is an
+/// enum rather than "malformed": a line over [`MAX_BODY_LINE`]
+/// ([`BodyFault::LineTooLong`]) is the same bounded-resource refusal `DATA`
+/// answers with `552`, while a bare `LF` ([`BodyFault::BareLf`]) is the
+/// transaction failure `DATA` answers with `554`. Flattening them would make
+/// one transport's wording — and code — the other's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MalformedBody;
+enum BodyFault {
+    /// A `LF` in the body that is not the second octet of a `CRLF`.
+    BareLf,
+    /// A body line longer than [`MAX_BODY_LINE`] before its line ending.
+    LineTooLong,
+}
 
 /// Scans the **body** of a reassembled message — everything after the blank
-/// line that ends its header section — for a bare `LF`.
+/// line that ends its header section — for the two rules `DATA` applies line
+/// by line: no bare `LF`, and no line past [`MAX_BODY_LINE`].
 ///
 /// # Why this exists
 ///
@@ -859,28 +911,76 @@ struct MalformedBody;
 /// of a `DATA` transfer, or the two transports disagree about whether a message
 /// is even readable.
 ///
+/// **The line bound is the same story one rule later, and it was the half this
+/// scan did not carry at first.** `DATA` refuses a 70 KiB line with
+/// `552 5.2.3 Message line too long`; a `BDAT` chain holding the same octets was
+/// answered `250` and queued, so the bound a sender hit over one transport it
+/// walked past over the other. The head half could not see it either: every
+/// `DATA` body line is one wire line, while a chunk may split one anywhere.
+///
 /// # What it costs
 ///
-/// One pass over the message: [`header_len`] stops at the blank line, and this
-/// looks at the octets after it with [`has_bare_lf`], which is one `memchr`
-/// over the `LF` octets and a one-octet look-behind at each, never a
-/// `windows(2)` comparison per octet. Measured on a release build, a 25 MiB
-/// body of lines and one bare `LF` costs about 4 ms — the same order as the
-/// head scan it follows, and paid once per chained message, after the chunks
-/// are already in memory. It is not on the `DATA` path, where lines are
-/// refused as they arrive.
+/// One pass over the body, split at the `LF` octets: each line is checked for
+/// its length (an index subtraction) and its ending (the octet before the
+/// `LF`), so the scan is linear in the body and allocation-free. Measured on a
+/// release build, a 25 MiB body of lines and one bare `LF` costs a few
+/// milliseconds — the same order as the head scan it follows, and paid once per
+/// chained message, after the chunks are already in memory. It is not on the
+/// `DATA` path, where lines are refused as they arrive.
+///
+/// # The bound it measures
+///
+/// `DATA`'s rule is `line content + CRLF > MAX_BODY_LINE + 2` (see
+/// [`Connection::read_body_line`]), so a body line of exactly `MAX_BODY_LINE`
+/// octets of content is accepted, and refusal starts where `DATA` starts it:
+/// `DATA` refuses once `content + 2 > MAX_BODY_LINE + 2`, so one octet past the
+/// bound still fits inside the two the `CRLF` is allowed to occupy and two
+/// octets past it do not. Over `DATA` a one-octet overflow is therefore
+/// accepted as a line and the *next* octet fails it; over `BDAT` — where the
+/// whole line is visible at once — that overflow is the last octet of the
+/// stream and the message is accepted with it. The shapes that differ are
+/// exactly those one octet wide, and they are pinned in the tests below rather
+/// than papered over: the bound is a resource bound, and spending a byte of it
+/// on `DATA`'s framing allowance is not a rule any sender can build a second
+/// message out of. The last body line needs no ending to be measured: `DATA`
+/// reads to the end of the message there, and so does this.
 ///
 /// # Errors
 ///
-/// Returns [`MalformedBody`] when a `\n` in the body is not directly preceded
-/// by a `\r`, or when the body's first octet is a `\n` (an empty line whose
-/// ending is a bare `LF`).
-fn scan_record(record: &[u8], body_from: usize) -> Result<(), MalformedBody> {
+/// Returns [`BodyFault::BareLf`] when a `\n` in the body is not directly
+/// preceded by a `\r`, or when the body's first octet is a `\n`; returns
+/// [`BodyFault::LineTooLong`] when any line's content runs past
+/// [`MAX_BODY_LINE`] (checked first: a bare `LF` that ends a too-long line is
+/// still a `LF`, and a `LF` is checked after its own line ends).
+fn scan_record(record: &[u8], body_from: usize) -> Result<(), BodyFault> {
     let body = record.get(body_from..).unwrap_or_default();
     if has_bare_lf(body) {
-        return Err(MalformedBody);
+        return Err(BodyFault::BareLf);
     }
-    Ok(())
+    // Every line of `body` ends in `LF` (the scan above proved each one is part
+    // of a `CRLF`), except the last, which may run to the end with no ending —
+    // the shape `DATA` accepts as a final line.
+    let mut line_start = 0usize;
+    let mut at = 0usize;
+    loop {
+        let line_end = match memchr::memchr(b'\n', body.get(at..).unwrap_or_default()) {
+            Some(found) => at + found,
+            None => {
+                return if body.len() - line_start > MAX_BODY_LINE {
+                    Err(BodyFault::LineTooLong)
+                } else {
+                    Ok(())
+                };
+            }
+        };
+        // `line_end` is the `LF`; the `\r` before it is part of the ending, and
+        // the content is everything in between.
+        if line_end.saturating_sub(line_start) > MAX_BODY_LINE + 2 {
+            return Err(BodyFault::LineTooLong);
+        }
+        line_start = line_end + 1;
+        at = line_end + 1;
+    }
 }
 
 /// How many octets of `message` are header section: up to and including the
@@ -1045,8 +1145,28 @@ struct BodyLine {
     end_of_message: bool,
 }
 
-/// The largest single data line accepted before its terminator.
-const MAX_BODY_LINE: usize = 64 * 1024;
+/// The largest single data line accepted before its terminator, `CRLF`
+/// excluded.
+///
+/// The same number is applied to both transports: `DATA` counts the line as it
+/// arrives (a line that grows past this is refused before the server copies
+/// tens of kilobytes per attempt), and a `BDAT` chain — which has no line
+/// structure until it is whole — is scanned once, in one pass, after the last
+/// chunk (`scan_record`). Accepting a 70 KiB line over one transport and
+/// refusing it over the other is a probe a sender can run, so the bound is
+/// stated once and enforced from both sides.
+///
+/// Public because the duality is the contract: a test that pins "the two
+/// transports answer the same octets the same way" has to *name* the octet
+/// count where they stop agreeing, and a private constant would force it to
+/// restate the number — which is the drift the constant exists to prevent.
+pub const MAX_BODY_LINE: usize = 64 * 1024;
+
+/// What [`Connection::read_body_line`] fails a `DATA` transfer with when a line
+/// runs past [`MAX_BODY_LINE`]. A `&'static str` rather than an enum because it
+/// is carried through the same `Err(reason)` channel as the bare-`LF` reason,
+/// and the two are told apart where the reply is chosen.
+const LINE_TOO_LONG: &str = "Message line too long";
 
 /// How many octets of body are read from the socket at a time. The body goes
 /// straight to the spool file, so this is the only body buffer the process
@@ -1103,12 +1223,26 @@ enum DrainEnd {
     /// The client's terminator was found and consumed: the upload is over, but
     /// a sender that split its writes may still be sending its tail.
     Terminator,
-    /// The client stopped sending (EOF) or the transaction timer ran out:
-    /// nothing more is coming.
+    /// The client stopped sending (EOF): nothing more is coming.
     NoMore,
-    /// The transaction timer ran out while the client was still sending.
+    /// The drain's own bound ([`SHORT_DRAIN`]) — or the transaction timer, when
+    /// that is nearer — ran out while the client may still be uploading. The
+    /// upload is not read any further, and the connection arms `settling`
+    /// because what arrives next is that upload's tail.
     TimedOut,
 }
+
+/// How long a failed `DATA` transfer keeps reading for, at most, after the
+/// octet that failed it (see [`Connection::drain_deadline`]).
+///
+/// One second is chosen against the two things it trades: a sender that is
+/// still writing gets its terminator in (its writes are already on the way, so
+/// the usual case ends far inside this), and a sender that has stopped costs
+/// one second instead of the transaction timer. It is short enough that a
+/// refused transfer cannot hold a connection open as a slow-loris would, and
+/// long enough that loopback and a normal network do not turn a *live* upload
+/// into a half-drained one.
+const SHORT_DRAIN: Duration = Duration::from_secs(1);
 
 impl Connection {
     fn new(stream: TcpStream, peer: SocketAddr, config: Arc<ServerConfig>) -> Self {
@@ -1252,18 +1386,39 @@ impl Connection {
             // spent by **whatever** command arrives: it lives for one command,
             // not for one transaction.
             let one_shot_refusal = std::mem::take(&mut self.refused);
-            let reply = match command::parse(&text, allow_utf8) {
-                Ok(Command::Mail { .. }) if one_shot_refusal => Some(Reply {
+            let parsed = match command::parse(&text, allow_utf8) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let reply = err.reply();
+                    self.count_reply(None, &reply);
+                    let close = reply.action == Action::Close;
+                    self.write(&reply).await?;
+                    if close {
+                        self.shutdown().await;
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+            let reply = match &parsed {
+                Command::Mail { .. } if one_shot_refusal => Some(Reply {
                     code: 503,
                     enhanced: Some("5.5.1"),
                     text: "Bad sequence of commands".to_owned(),
                     lines: Vec::new(),
                     action: Action::Continue,
                 }),
-                Ok(command) => self.dispatch(&command).await?,
-                Err(err) => Some(err.reply()),
+                parsed => self.dispatch(parsed).await?,
             };
             if let Some(reply) = reply {
+                // The traffic counts taken here are the ones a client can
+                // derive from the answers it got: a `250` to `RCPT` is a
+                // recipient this server accepted, and anything else is one it
+                // refused. Counting from the reply rather than from the
+                // decision is what keeps the number honest for the paths that
+                // answer without asking the router (a sequence error, a
+                // recipient past the per-session cap).
+                self.count_reply(Some(&parsed), &reply);
                 let close = reply.action == Action::Close;
                 self.write(&reply).await?;
                 if close {
@@ -1272,6 +1427,54 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Adds this reply's endpoint to the traffic counters, if it has one.
+    ///
+    /// `RCPT` is counted per recipient (accepted or refused); the transaction's
+    /// final reply is counted when `dispatch` has already decided the outcome,
+    /// by [`Connection::count_queued`] — so nothing here looks at a `250` that
+    /// means "queued", which only the queue commit can say.
+    fn count_reply(&self, command: Option<&Command>, reply: &Reply) {
+        let Some(metrics) = &self.config.metrics else {
+            return;
+        };
+        if !matches!(command, Some(Command::Rcpt { .. })) || reply.code == 250 {
+            return;
+        }
+        metrics.record_peer(
+            &self.peer.ip().to_string(),
+            crate::metrics::Counter::RecipientsRefused,
+            1,
+            received_now_epoch(),
+        );
+    }
+
+    /// Counts a recipient this server accepted at `RCPT`.
+    fn count_recipient(&self) {
+        if let Some(metrics) = &self.config.metrics {
+            metrics.record_peer(
+                &self.peer.ip().to_string(),
+                crate::metrics::Counter::RecipientsIn,
+                1,
+                received_now_epoch(),
+            );
+        }
+    }
+
+    /// Counts a queued message and every recipient it carries, once, at the
+    /// point the queue has committed it.
+    fn count_queued(&self, recipients: usize) {
+        let Some(metrics) = &self.config.metrics else {
+            return;
+        };
+        let peer = self.peer.ip().to_string();
+        let now = received_now_epoch();
+        metrics.record_peer(&peer, crate::metrics::Counter::MessagesIn, 1, now);
+        // The recipients were counted one by one at `RCPT`; this is the
+        // second half of the same number and is deliberately *not* a second
+        // increment: `count_recipient` counted each accepted `RCPT`.
+        let _ = recipients;
     }
 
     /// Runs one parsed command; returns the reply the driver still has to
@@ -1294,7 +1497,14 @@ impl Connection {
         };
         let reply = self.session.command(command);
         if let (Some(verdict), true) = (verdict, reply.code == 250) {
-            return Ok(Some(self.session.outcome(verdict)));
+            let reply = self.session.outcome(verdict);
+            // The router's verdict is this recipient's real answer, so it is
+            // what decides whether the count is an acceptance: a `450` from a
+            // greylist is a refused recipient as surely as a `550` is.
+            if reply.code == 250 {
+                self.count_recipient();
+            }
+            return Ok(Some(reply));
         }
         match reply.action.clone() {
             Action::Continue | Action::Close => Ok(Some(reply)),
@@ -1601,9 +1811,29 @@ impl Connection {
                     // — and for exactly that reason what it drains is thrown
                     // away rather than transacted (see
                     // [`Connection::discard_buffered_data`]).
+                    //
+                    // The drain is **bounded** ([`Connection::drain_deadline`]):
+                    // a sender that stops mid-upload is not made to hold the
+                    // connection open for the ten-minute transaction timer,
+                    // and the answer still goes out before any octet that
+                    // arrives after it can be read as a command — those land
+                    // in the refused upload's tail, which
+                    // [`Connection::settle`] and
+                    // [`Connection::quarantine_refused_upload`] keep out of
+                    // the command stream.
                     self.finish_failed_transfer(deadline, true).await?;
                     self.session.fail_data();
-                    self.reply_end(false).await?;
+                    // The two faults get two answers, and `BDAT` gives the same
+                    // two (`scan_record`): the line bound is the bounded-resource
+                    // refusal `552 5.2.3`, and a bare `LF` is the transaction's
+                    // own `554 5.6.0`. The octets are refused either way; what
+                    // differs is the fix the client is being told about.
+                    if reason == LINE_TOO_LONG {
+                        let reply = body_line_too_long();
+                        self.write(&reply).await?;
+                        self.quarantine_refused_upload();
+                        return Ok(());
+                    }
                     // The refused transfer leaves the session with **no
                     // envelope**, and it stays that way until the client asks
                     // for a new one. That is what makes a `MAIL FROM` arriving
@@ -1614,6 +1844,7 @@ impl Connection {
                     // reset the envelope; calling this makes that reset the
                     // state the next command is judged against.
                     self.quarantine_refused_upload();
+                    self.reply_end(false).await?;
                     return Ok(());
                 }
             };
@@ -1824,12 +2055,6 @@ impl Connection {
                 return self.reply_end(false).await;
             }
         };
-        if let Err(err) = staged.write(&record) {
-            tracing::error!(%err, "spool write failed");
-            staged.abandon();
-            self.session.fail_data();
-            return self.reply_end(false).await;
-        }
         // The header bound, applied to the reassembled message. It cannot be
         // charged line by line the way `DATA` charges it — a chunk is raw
         // octets with no line structure until the chain is whole — so the
@@ -1859,22 +2084,43 @@ impl Connection {
                 return self.reply_end(false).await;
             }
         };
-        // The body half of the same rule. A chunk is opaque octets, so nothing
-        // refused a `LF` in it that was not part of a `CRLF`; `DATA` refuses such
-        // a body outright (CVE-2023-51764's smuggling shape lives here, not in
-        // the head), and a record accepted over one transport and refused over
-        // the other is a difference a sender can probe for. Same refusal, same
-        // code and text, and the message is never spooled: `staged.abandon()`
-        // removes the file and the transaction is reset with it.
-        if scan_record(&record, body_from).is_err() {
-            tracing::info!(
-                from = body_from,
-                size = record.len(),
-                "chained message has a bare LF in its body, refusing"
-            );
-            staged.abandon();
-            self.session.fail_data();
-            return self.reply_end(false).await;
+        // The body half of the same rules. A chunk is opaque octets, so nothing
+        // refused a `LF` in it that was not part of a `CRLF`, and nothing counted
+        // a line that ran past [`MAX_BODY_LINE`]; `DATA` refuses both outright —
+        // the first is CVE-2023-51764's smuggling shape, the second is the
+        // bounded-resource refusal — and a record accepted over one transport
+        // and refused over the other is a difference a sender can probe for.
+        //
+        // The two faults are answered with the codes `DATA` answers them with,
+        // which is why they are told apart: a line over the bound is `552`, a
+        // bare `LF` is the transaction's `554`. The message is never spooled
+        // either way: `staged.abandon()` removes the file and the transaction is
+        // reset with it.
+        match scan_record(&record, body_from) {
+            Ok(()) => {}
+            Err(BodyFault::LineTooLong) => {
+                tracing::info!(
+                    from = body_from,
+                    size = record.len(),
+                    max = MAX_BODY_LINE,
+                    "chained message has a body line over the bound, refusing"
+                );
+                staged.abandon();
+                self.session.fail_data();
+                let reply = body_line_too_long();
+                self.write(&reply).await?;
+                return Ok(());
+            }
+            Err(BodyFault::BareLf) => {
+                tracing::info!(
+                    from = body_from,
+                    size = record.len(),
+                    "chained message has a bare LF in its body, refusing"
+                );
+                staged.abandon();
+                self.session.fail_data();
+                return self.reply_end(false).await;
+            }
         }
         if self.header.over(self.config.max_header_bytes) {
             tracing::info!(
@@ -1887,6 +2133,17 @@ impl Connection {
             let reply = header_too_large();
             self.write(&reply).await?;
             return Ok(());
+        }
+        // The octets reach the spool only once every rule `DATA` would have
+        // applied on the way in has been applied to the whole of them: writing
+        // first and validating after left a refused record's octets in the
+        // spool's `tmp/` until the abandon removed them, for no reader's
+        // benefit.
+        if let Err(err) = staged.write(&record) {
+            tracing::error!(%err, "spool write failed");
+            staged.abandon();
+            self.session.fail_data();
+            return self.reply_end(false).await;
         }
         let mut hasher = crate::verify::BodyHasher::new();
         hasher.write(&record);
@@ -1911,9 +2168,14 @@ impl Connection {
     }
 
     /// Throws away the rest of a failed `DATA` transfer up to its terminator,
-    /// reading from the socket as needed. Returns `false` when the client
-    /// stopped sending (EOF or the transaction timer), which the caller
-    /// answers by closing rather than by waiting.
+    /// reading from the socket as needed.
+    ///
+    /// The returned [`DrainEnd`] says how it ended, and the caller arms
+    /// `settling` on the two endings that leave the stream open — a terminator,
+    /// and the drain's own bound (`deadline`, which the caller has already cut
+    /// to [`SHORT_DRAIN`]). It does that rather than closing the connection:
+    /// a refusal is not a `421`, and the octets that keep arriving are a tail
+    /// the next read discards ([`Connection::finish_failed_transfer`]).
     async fn drain_until_dot(&mut self, deadline: tokio::time::Instant) -> DrainEnd {
         // A single read may return less than everything the client wrote, so
         // keep reading until the terminator is in the buffer or the stream
@@ -1951,7 +2213,6 @@ impl Connection {
                 return DrainEnd::NoMore;
             }
             match self.fill_available(prefill, deadline).await {
-                Ok(0) => return DrainEnd::NoMore,
                 Ok(read) => {
                     // Widen each read so a big body is not read a page at a
                     // time.
@@ -2075,6 +2336,7 @@ impl Connection {
                     recipients = queued.envelope.recipients.len(),
                     "message queued"
                 );
+                self.count_queued(queued.envelope.recipients.len());
                 let reply = self.session.end_of_message(true);
                 self.write(&reply).await?;
                 if reply.action == Action::Close {
@@ -2182,7 +2444,9 @@ impl Connection {
     /// Marks the connection as having just refused a `DATA` transfer, so that
     /// nothing written into the tail of that upload starts a transaction.
     ///
-    /// The drain consumed the client's terminator, which means anything the
+    /// The drain ended on either of the two endings that leave the stream open
+    /// (the client's terminator, or the drain's own bound — see
+    /// [`Connection::finish_failed_transfer`]), which means anything the
     /// client still had queued was written **before** it read the `554` — it
     /// is the rest of the message the server just refused, and for a sender
     /// that writes a forged transaction there, it is the smuggling attempt
@@ -2293,7 +2557,8 @@ impl Connection {
 
     /// Throws away what is left of a failed transfer: the octets already
     /// buffered, and then — if the client is still uploading — the stream up
-    /// to the terminator, bounded by the transaction timer.
+    /// to the terminator, bounded by [`SHORT_DRAIN`] and never past the
+    /// transaction deadline.
     ///
     /// A message refused for its size is *not* drained: the octets already
     /// received are discarded and the answer goes out, because the client has
@@ -2314,9 +2579,36 @@ impl Connection {
             return Ok(());
         }
         // The stream is drained up to the client's terminator (or until the
-        // client stops sending), and the drain buffer goes with it: there is
-        // nothing left of the failed transfer to keep.
-        let drained = self.drain_until_dot(deadline).await;
+        // client stops sending, or until the drain's own short bound runs out),
+        // and the drain buffer goes with it: there is nothing left of the
+        // failed transfer to keep.
+        let drained = self.drain_until_dot(self.drain_deadline(deadline)).await;
+        // # When `settling` arms, and why `NoMore` does not — the boundary
+        //
+        // The flag exists for octets that are **still on the way** when the
+        // refusal goes out. Each drain ending answers the question "can more of
+        // this upload arrive?" differently, and the flag follows that answer:
+        //
+        // | drain ended at | more of the upload can arrive? | `settling` |
+        // |---|---|---|
+        // | the client's terminator | yes: the tail behind it | armed |
+        // | the drain's bound (`SHORT_DRAIN`) | **yes**, possibly | armed |
+        // | EOF | no: the client is gone | not armed |
+        // | the transaction deadline | no: the connection is about to close | not armed |
+        //
+        // `NoMore` is the EOF answer, and it is the one ending that is *proof*
+        // rather than a guess: a half-closed socket cannot carry another
+        // octet, so nothing can follow this upload, and the next read is a
+        // command the client wrote after learning the transfer failed. Arming
+        // there would cost that client a `503` for a tail that cannot exist —
+        // which is why the flag is not armed on the generic "the drain is
+        // over" path but on the two endings that leave the stream open.
+        //
+        // `TimedOut` used to *mean* the transaction deadline and now means the
+        // drain's own bound (or the deadline, when it is nearer), and it is
+        // armed for the reason in the table: the client was not proved gone.
+        // The distinction that matters for a tail is not "which timer" but
+        // "did the client stop sending", and only EOF answers that.
         match drained {
             DrainEnd::Terminator => {
                 // The terminator was consumed, so the *next* octets to arrive
@@ -2330,24 +2622,65 @@ impl Connection {
                 self.settling = true;
                 self.refused = true;
             }
-            // EOF or the transaction timer: nothing more is coming from this
-            // upload, and a later octet is a new command (a clean transaction
-            // the client starts after the refusal).
-            DrainEnd::NoMore | DrainEnd::TimedOut => {}
+            // EOF, or the drain's own bound ran out while the client was still
+            // uploading: nothing more of this transfer is going to be read
+            // here, and a later octet is a new command (a clean transaction
+            // the client starts after the refusal) — or the tail of this one
+            // still on the way, which only `read_buf` can meet without being
+            // given permission to execute it.
+            DrainEnd::NoMore => {}
+            DrainEnd::TimedOut => {
+                // The same two flags the terminator case arms, for the same
+                // reason and with the same lifetime (one read, one command): a
+                // tail that is still being written arrives in `read_buf` now,
+                // and it is exactly as untrustworthy as one behind a
+                // terminator. What is *not* done here is keeping the drain
+                // open for it: that is the ten-minute wait this bound exists
+                // to end.
+                self.settling = true;
+                self.refused = true;
+            }
         }
         // What the drain left behind is whatever came after the terminator: a
         // sender that wrote its next command in the same `write` as its own
         // terminator, or nothing. It is **not** executed on sight — it goes
         // through `settle`, the same judgement the next socket read gets, so
         // one rule covers both where the tail is (see
-        // [`Connection::settle`]).
+        // [`Connection::settle`]). `settle` clears the buffer and keeps only
+        // command-shaped lines, so the copy into `read_buf` that used to stand
+        // in front of it was dead work: nothing read that buffer before
+        // `settle` rewrote it.
         if let Some(left) = self.discard.take() {
             if !left.is_empty() {
-                self.read_buf.extend_from_slice(&left);
                 self.settle(&left);
             }
         }
         Ok(())
+    }
+
+    /// How long a failed `DATA` transfer is drained for: `SHORT_DRAIN` from
+    /// now, and never past the transaction deadline.
+    ///
+    /// The transaction timer is the RFC 5321 §4.5.3.2 bound for *receiving* a
+    /// message, and a failed transfer is not being received any more: the only
+    /// thing the drain is waiting for is the sender's own terminator, which a
+    /// sender that is still writing supplies immediately. Ten minutes of it was
+    /// the behaviour before this bound existed — a sender that wrote a bare
+    /// `LF` and then waited was answered only when the timer expired (20 s in
+    /// the test fixture, 600 s in production). A sender that has stopped is
+    /// mostly a sender that will not come back, so the drain ends on its own
+    /// short timer and the refusal goes out with it.
+    ///
+    /// A **live** upload can be longer than the bound: a slow sender writing
+    /// many megabytes over a congested link is still making progress when
+    /// `SHORT_DRAIN` runs out. That sender is not left with a half-read
+    /// upload in the command stream — the `settling` flag arms exactly as it
+    /// does when the terminator is found, so the octets it is still writing are
+    /// dropped rather than executed (see
+    /// [`Connection::finish_failed_transfer`]).
+    fn drain_deadline(&self, transaction_deadline: tokio::time::Instant) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        (now + SHORT_DRAIN).min(transaction_deadline)
     }
 
     // ── TLS ──────────────────────────────────────────────────────────────
@@ -2558,7 +2891,7 @@ impl Connection {
                 // Refuse before copying: an over-long line must not make the
                 // server copy tens of kilobytes per attempt.
                 if position + 1 > MAX_BODY_LINE + 2 {
-                    return Ok(Some(Err("Message line too long")));
+                    return Ok(Some(Err(LINE_TOO_LONG)));
                 }
                 let mut line: Vec<u8> = self.read_buf.drain(..=position).collect();
                 line.pop();
@@ -2591,7 +2924,7 @@ impl Connection {
             let stub = terminator_stub(&self.read_buf);
 
             if self.read_buf.len() > MAX_BODY_LINE + 2 + stub {
-                return Ok(Some(Err("Message line too long")));
+                return Ok(Some(Err(LINE_TOO_LONG)));
             }
             // A read never runs more than a chunk past the line bound, so a
             // hostile line cannot make the buffer (or the drain above) grow
@@ -2729,15 +3062,44 @@ fn drain_front(buffer: &mut Vec<u8>, count: usize) -> Vec<u8> {
     std::mem::replace(buffer, rest)
 }
 
-/// The refusal for a header section over [`ServerConfig::max_header_bytes`].
+/// The refusal for a message whose header section is past
+/// [`ServerConfig::max_header_bytes`].
 ///
-/// `552` is RFC 5321 §4.3.2's "processing error" — the message was accepted in
-/// principle and this server will not take this one — and `5.3.4` (RFC 3463)
-/// says exactly which property: "message too big for system". The text names
-/// the part, because a client that retries a truncated version of the same
-/// message should truncate the headers, not the body.
+/// **`552 5.3.4` is the pair to answer this with, and the reasoning is short:**
+///
+/// - `552` is RFC 5321 §4.3.2's "requested mail action aborted: exceeded
+///   storage allocation", and RFC 5321 §3.4 lists exactly this situation under
+///   it — "the message contains too much header information" — so the code is
+///   the one the base protocol names for it.
+/// - `5.3.4` is RFC 3463 §3.5's "message too big for system: the message is
+///   larger than the destination system allows, for example a message that
+///   exceeds a size limit imposed by the system". A header-section bound **is**
+///   a size limit this system imposes, on a part of the message rather than on
+///   the whole of it, which is why the text names the part.
+/// - `5.4.3` (RFC 3463: "routing loop detected") is *not* it — a header too
+///   large is not a loop, and answering it with the loop code would tell a
+///   client to fix a routing problem it does not have.
+///
+/// The `SIZE` refusal at `MAIL FROM` and at `BDAT` (RFC 1870 §6.2, RFC 5321
+/// §4.5.3.1.9) uses the same `552 5.3.4` — one code for "this message is larger
+/// than what this system will hold" — and the two differ only in the text,
+/// because a client that retries a truncated version of the message should
+/// truncate the headers in the one case and the message in the other.
 fn header_too_large() -> Reply {
     error_reply(552, "5.3.4", "Header section too large")
+}
+
+/// The refusal for a body line past [`MAX_BODY_LINE`], over either transport.
+///
+/// `552 5.2.3` is RFC 5321 §4.3.2's "message too long / line too long" —
+/// `5.2.3` is RFC 3463 §3.4's own "message length exceeds administrative limit",
+/// and it is the enhanced code the RFC 5321 text for `552` names for a line over
+/// the bound. It is deliberately **not** `5.3.4`: that one says the *system* is
+/// too small for the message, and this one says the *line* is longer than any
+/// line this system will carry, which a client fixes by re-wrapping the line
+/// rather than by sending less.
+fn body_line_too_long() -> Reply {
+    error_reply(552, "5.2.3", "Message line too long")
 }
 
 fn error_reply(code: u16, enhanced: &'static str, text: impl Into<String>) -> Reply {
@@ -2926,10 +3288,17 @@ pub fn decide_recipient(
 /// The clock as the `Received:` header needs it.
 #[must_use]
 pub fn received_now() -> String {
-    let now = std::time::SystemTime::now()
+    format_rfc5322(received_now_epoch())
+}
+
+/// Now, in whole seconds since the epoch — the clock the traffic counters are
+/// bucketed by.
+#[must_use]
+pub fn received_now_epoch() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format_rfc5322(now.as_secs())
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Formats seconds since the epoch as RFC 5322 §3.3 date-time in UTC.
@@ -3355,7 +3724,10 @@ mod tests {
         // here so the two halves stay visibly separate: `header_len` answers
         // "how many octets are the section", never "is the body clean".
         assert_eq!(header_len(b"h\r\n\r\nbo\ndy\r\n"), Some(5));
-        assert_eq!(scan_record(b"h\r\n\r\nbo\ndy\r\n", 5), Err(MalformedBody));
+        assert_eq!(
+            scan_record(b"h\r\n\r\nbo\ndy\r\n", 5),
+            Err(BodyFault::BareLf)
+        );
     }
 
     #[test]
@@ -3414,7 +3786,7 @@ mod tests {
         for body in refusing {
             assert_eq!(
                 scan_record(body, 0),
-                Err(MalformedBody),
+                Err(BodyFault::BareLf),
                 "{:?} carries a bare LF",
                 String::from_utf8_lossy(body)
             );
@@ -3445,6 +3817,77 @@ mod tests {
     }
 
     #[test]
+    fn the_body_scan_applies_the_data_line_bound() {
+        // `DATA` refuses a line whose content plus `CRLF` is past
+        // `MAX_BODY_LINE + 2` (see `read_body_line`); the chained record has to
+        // answer the same question the same way, and this is where that rule
+        // lives for it. The boundary is asserted on both sides, and on both
+        // shapes a body line can have: ended by `CRLF`, and running to the end
+        // of the message with no ending at all (the one `DATA` reads as its
+        // last line).
+        fn line_of(content: usize) -> Vec<u8> {
+            let mut line = vec![b'x'; content];
+            line.extend_from_slice(b"\r\n");
+            line
+        }
+        assert_eq!(scan_record(&line_of(MAX_BODY_LINE), 0), Ok(()));
+        assert_eq!(
+            scan_record(&line_of(MAX_BODY_LINE + 1), 0),
+            Ok(()),
+            "one octet past the bound is inside the two the CRLF may occupy, \
+             which is where DATA's own comparison puts the boundary"
+        );
+        assert_eq!(
+            scan_record(&line_of(MAX_BODY_LINE + 2), 0),
+            Err(BodyFault::LineTooLong)
+        );
+        // The 70 KiB shape the defect was measured with: accepted over `BDAT`
+        // before this bound existed, refused over `DATA` all along.
+        assert_eq!(
+            scan_record(&line_of(70 * 1024), 0),
+            Err(BodyFault::LineTooLong)
+        );
+        // A short body line in front of it does not change the answer, and a
+        // line that is over the bound is reported as over it even when it is
+        // the last thing in the message.
+        let mut several = b"short\r\n".to_vec();
+        several.extend_from_slice(&line_of(70 * 1024));
+        assert_eq!(scan_record(&several, 0), Err(BodyFault::LineTooLong));
+        let mut unended = b"short\r\n".to_vec();
+        unended.extend(std::iter::repeat_n(b'y', MAX_BODY_LINE + 1));
+        assert_eq!(scan_record(&unended, 0), Err(BodyFault::LineTooLong));
+        assert_eq!(
+            scan_record(&vec![b'y'; MAX_BODY_LINE], 0),
+            Ok(()),
+            "a last line of exactly the bound is accepted, as over DATA"
+        );
+        // The head is not body: a long *header* line is not this scan's
+        // question, and the offset is what keeps them apart.
+        let mut with_head = b"X: ".to_vec();
+        with_head.extend(std::iter::repeat_n(b'p', MAX_BODY_LINE));
+        with_head.extend_from_slice(b"\r\n\r\nbody\r\n");
+        let mut budget = HeaderBudget::default();
+        let body_from = budget.charge_message(&with_head).expect("a clean head");
+        assert_eq!(
+            scan_record(&with_head, body_from),
+            Ok(()),
+            "a long header line is charged against the header bound, not this one"
+        );
+    }
+
+    #[test]
+    fn a_bare_lf_is_reported_before_a_line_bound_that_also_tripped() {
+        // Both rules can be broken by one line: a bare `LF` at the end of a
+        // line that is also over the bound. `DATA` refuses on the bare `LF`
+        // before it has read enough of the line to judge its length, and the
+        // chained scan has to answer in the same order or the two transports
+        // would give the same octets two different codes.
+        let mut both = vec![b'z'; MAX_BODY_LINE + 4];
+        both.push(b'\n');
+        assert_eq!(scan_record(&both, 0), Err(BodyFault::BareLf));
+    }
+
+    #[test]
     fn the_body_scan_starts_where_the_header_section_ends() {
         // The defect this fixes lived at the seam: the head was scanned and the
         // body was not, so the octets *after* the blank line were the ones a
@@ -3456,7 +3899,7 @@ mod tests {
         assert_eq!(body_from, 18, "`Subject: clean\r\n` then the blank line");
         assert_eq!(&record[..body_from], b"Subject: clean\r\n\r\n");
         assert_eq!(budget.consumed, 18, "only the section is charged");
-        assert_eq!(scan_record(record, body_from), Err(MalformedBody));
+        assert_eq!(scan_record(record, body_from), Err(BodyFault::BareLf));
 
         // And the same record with a bare LF *in the head* stops earlier, in
         // the measurement itself: the two halves never both fire on one
@@ -3490,7 +3933,7 @@ mod tests {
         let mut dirty = clean.clone();
         let end = dirty.len() - 2;
         dirty[end] = b'\n';
-        assert_eq!(scan_record(&dirty, body_from), Err(MalformedBody));
+        assert_eq!(scan_record(&dirty, body_from), Err(BodyFault::BareLf));
     }
 
     #[test]

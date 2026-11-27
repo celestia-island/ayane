@@ -213,6 +213,7 @@ async fn tb14_the_message_is_on_disk_while_data_is_still_running() {
         auth_guard: Some(std::sync::Arc::new(
             ayane_smtpd::server::AuthGuard::default(),
         )),
+        metrics: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

@@ -21,6 +21,11 @@ ayane-engine = { workspace = true }
 ayane-proto = { workspace = true }
 ayane-mail = { workspace = true }
 ayane-store = { workspace = true }
+ayane-smtpd = { workspace = true }
+arc-swap = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 getrandom = { workspace = true }
 hickory-resolver = { workspace = true }
 rust-embed = { workspace = true }

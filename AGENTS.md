@@ -38,8 +38,13 @@ CI 不在 PR 上跑（工作区口径）：`ci.yml` 仅 `workflow_dispatch`；`d
 - `ayane-engine`：纯渲染，输出 Postfix / Dovecot / rspamd 配置文本。
 - `ayane-store`：redb 持久化（经 lacrymira KV 面）+ 密码哈希；快照式存取，无部分态。
 - `ayane`（core）：HTTP 面 + apply 循环 + 进程生命周期；不直接解析邮件。
+- `ayane-smtpd`：本仓自写的邮件面（收信 / 队列 / 投递 / 出站 / 计数器）。`ayane serve` 在
+  `AYANE_MAIL_ENABLED=1` 时于**同一进程**内跑它（`crates/core/src/engine.rs`），reload = 热替换
+  `Arc<ServerConfig>`；`ayane-smtpd --serve/--deliver` 是分进程形态。`admin.net.traffic` 读
+  `ayane_smtpd::metrics` 的结构化计数，不再解析任何日志文本。
 - 渲染必须确定性：同一状态两次输出逐字节相同，**先 diff 再写盘再 reload**。
-- `crates/core/tests/smoke.rs` 是 `#[ignore]` 的端到端冒烟（要引擎 rig 在跑）：
+- `crates/core/tests/engine_e2e.rs` 是同进程邮件面的端到端（真 socket 收信 → maildir → 计数 → apply/reload），
+  不需要任何外部服务；`crates/core/tests/smoke.rs` 是 `#[ignore]` 的端到端冒烟（要引擎 rig 在跑）：
   `just engine-up && just serve` 后 `cargo test -p ayane --test smoke -- --ignored --nocapture`。
 - 引擎 rig 端口（node-1 本机回环，登记在 `_ledger/ports-and-domains.md`）：
   3023 ayane API / 3043 IMAP / 30587 submission / 3025 MTA（调试用）。

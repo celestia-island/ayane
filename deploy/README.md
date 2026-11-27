@@ -26,6 +26,38 @@
 | `AYANE_QUARANTINE_ADDRESS` | `quarantine@example.com` | 隔离区收件地址 |
 | `AYANE_LOG` | `ayane=info` | `tracing` 过滤串 |
 
+### 1.1 邮件面（同进程，默认关闭）
+
+`ayane serve` 一旦打开邮件段就在**本进程**里同时跑控制面与邮件面（SMTP 监听、投递消费、出站），
+不再需要 Postfix/Dovecot 容器。默认关闭：不设 `AYANE_MAIL_ENABLED` 时进程行为与打开前逐字节一致
+（不绑端口、不开 spool、不起任何任务）。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `AYANE_MAIL_ENABLED` | `0` | `1` 打开邮件面；打开后 `AYANE_MAIL_LISTENERS` 与 `AYANE_MAIL_HOSTNAME` 为必填 |
+| `AYANE_MAIL_HOSTNAME` | `localhost` | 问候语 / `Received:` / DMARC `authserv-id` 的名；`localhost` 会被拒绝启动 |
+| `AYANE_MAIL_LISTENERS` | 空 | 逗号分隔的 `role@addr[,cert=PATH][key=PATH]`；role = `inbound` / `submission` / `submissions-tls`（后两个需证书） |
+| `AYANE_MAIL_SPOOL_ROOT` | `$AYANE_STATE_DIR/spool` | 待投递队列根；**不可**与 `mail_root` 相同或互为子目录 |
+| `AYANE_MAIL_ROOT` | `$AYANE_STATE_DIR/mail` | 落盘 maildir 根（spool 的兄弟目录，块⑤ 保留名教训） |
+| `AYANE_MAIL_STATE` | `$AYANE_STATE_DIR/desired-state.json` | 投递消费与 DKIM 签名读取的路由快照；**由 `admin.apply` 写入** |
+| `AYANE_MAIL_MAX_MESSAGE_SIZE` | `26214400` | `SIZE` 上限（字节） |
+| `AYANE_MAIL_MAX_HEADER_BYTES` | `1048576` | 头段上限（超限 `552 5.3.4`） |
+| `AYANE_MAIL_PER_IP_LIMIT` | `8` | 单 IP 并发连接数 |
+| `AYANE_MAIL_RETRY_MAX_AGE_SECONDS` | `432000` | 重试地平线（RFC 5321 §4.5.4.1 = 5 天） |
+| `AYANE_MAIL_RETRY_MAX_ATTEMPTS` | `0` | 尝试上限，`0` = 用策略默认 |
+| `AYANE_MAIL_QUOTA_BYTES` | `0` | 单信箱配额，`0` = 不限 |
+| `AYANE_MAIL_DELIVERY_INTERVAL_SECONDS` | `30` | 空闲时投递轮询上限 |
+| `AYANE_MAIL_OUTBOUND` | `0` | `1` = 域外收件人经 MX 直投（需 25 出站与 PTR） |
+| `AYANE_MAIL_SMTP_PORT` | `25` | 出站连接端口 |
+| `AYANE_MAIL_DKIM_KEY_ENV` | 空 | 每个域的签名私钥所在环境变量模板，如 `AYANE_DKIM_KEY_{domain}`（域名的点写成 `_`） |
+
+启动顺序因此是：起控制面（邮件段同时绑定）→ 建域/建账号 → `admin.apply`（写 `desired-state.json`
+与各渲染表）→ 收信。**投递消费按 `AYANE_MAIL_STATE` 路由**：首次 apply 之前它读不到快照，会把这一轮
+记为跳过（日志 `the state snapshot cannot be used`），队列里的信件不会丢，apply 之后自动投递。
+
+分进程形态仍然可用：`ayane-smtpd --serve` / `--deliver` 读同一份 `desired-state.json` 与同一个 spool；
+那种形态下计数器不经过控制面（`admin.net.traffic` 显示为空），这是该形态的已知取舍。
+
 前门反向代理须把浏览器的原始 `Host` 头原样透传给 ayane（Caddy 的 `reverse_proxy` 默认如此；nginx 须显式
 `proxy_set_header Host $host;`）——否则 `/api/ws` 的同源校验（比对 `Origin` 与 `Host`）会以 403
 拒绝浏览器的每一次 WebSocket 升级；不带 `Origin` 头的非浏览器客户端不受影响。
@@ -34,9 +66,11 @@
 
 1. 解析域名：`AYANE_HOSTNAME` 的 A/AAAA 与邮件域的 MX 指向本实例入口。
 2. 起 PostgreSQL，建库建角色；DSN 写进 `.env`。
-3. 起引擎容器：Postfix → Dovecot → rspamd → ClamAV → Valkey（顺序见 compose）。
-4. 起控制面；`/api/health` 返回 `status=ok`。
-5. 控制面渲染 Postfix / Dovecot / rspamd 配置 → 校验 → reload（先 diff 再写盘）。
+3. （可选）起老引擎容器：`ayane serve` 自带的邮件面已在步骤 4 内，这一步只对「读侧仍由 Dovecot 提供
+   IMAP」的既有实例有意义；新实例不需要它。
+4. 起控制面（`ayane serve`，邮件段打开时同一进程即绑定 SMTP 监听）；`/api/health` 返回 `status=ok`。
+5. 控制面渲染配置文件并写路由快照（先 diff 再写盘）→ 热替换监听器配置；投递消费随即读到快照。
+   **不再有 `docker compose exec … reload`**：邮件面在本进程内，reload = 换 `Arc<ServerConfig>`。
 6. 建域、建首个账号、配隔离区与策略。
 7. 证书：`volume` / `upload` / `acme` 三选一，`openssl s_client` 验链。
 8. 出站：中继凭据实测一封；无中继则确认 PTR 与 25 出站。
