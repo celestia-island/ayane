@@ -2286,7 +2286,7 @@ pub enum FromDomain {
 /// Deliberately literal: the header section ends at the first blank line, the
 /// field name is matched case-insensitively, and the domain is the part of the
 /// last address in the field after its last `@`. See [`FromDomain`] for what
-/// "last field" and "ambiguous" mean here.
+/// "a second field" and "ambiguous" mean here.
 #[must_use]
 pub fn from_domain(message: &[u8]) -> FromDomain {
     let head_len = message
