@@ -1214,3 +1214,74 @@ async fn a_valid_transfer_still_allows_pipelining_behind_its_terminator() {
     );
     harness.stop();
 }
+
+/// The trade the refusal makes, from the client's side: **one `503`, then the
+/// client is back to normal.**
+///
+/// The server cannot tell a refused transfer's tail from a new command at the
+/// byte level — both are `MAIL FROM:`-style lines — so the first command after
+/// a refusal is refused (`503`) and the next one is served. The decision is of
+/// 2026-11-26, and it exists so that a legitimate client that had nothing to do
+/// with the tail pays one retry and never loses its connection.
+///
+/// This is the contract the previous test protects from the other side: that
+/// test proves a forged tail can never open a transaction; this one proves the
+/// cost of that protection is exactly one `503` and nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_costs_one_503_and_a_retry_recovers() {
+    let harness = Harness::start("s1-retry", bounded()).await;
+    let mut client = transaction(&harness);
+    client.expect("DATA", 354);
+    let mut first = b"From: <a@example.net>\r\nSubject: s1\r\n\r\n".to_vec();
+    first.extend_from_slice(b"prompt\n.\r\n");
+    client.send_raw(&first);
+    let refusal = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the refused transfer is answered");
+    assert_eq!(
+        (refusal.code, refusal.text.as_str()),
+        (554, "5.6.0 Transaction failed")
+    );
+
+    // The client tries to start a new message straight after the `554`: the
+    // server is still discarding the tail and answers `503` — it is not
+    // pretending the command was garbage, and it is not closing the socket.
+    client.send("MAIL FROM:<a@example.net>");
+    let first_after = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the command after a refusal is answered");
+    assert_eq!(
+        (first_after.code, first_after.text.as_str()),
+        (503, "5.5.1 Bad sequence of commands"),
+        "one command, one answer, connection still open: {first_after:?}"
+    );
+
+    // The retry is served in full: a complete transaction and a message that
+    // queues. This is what "a client that retries once is back to normal"
+    // means, and it is what the `503` above must not cost.
+    client.expect("MAIL FROM:<a@example.net>", 250);
+    client.expect("RCPT TO:<inbox@example.com>", 250);
+    client.expect("DATA", 354);
+    let mut body = b"From: <a@example.net>\r\nSubject: retry\r\n\r\n".to_vec();
+    body.extend_from_slice(b"a clean retry\r\n.\r\n");
+    client.send_raw(&body);
+    let queued_reply = client
+        .try_read_reply_within(Duration::from_secs(5))
+        .expect("the retried message is answered");
+    assert_eq!(
+        (queued_reply.code, queued_reply.text.as_str()),
+        (250, "2.0.0 OK: queued"),
+        "{queued_reply:?}"
+    );
+    let senders: Vec<String> = harness
+        .queued()
+        .iter()
+        .map(|m| m.envelope.mail_from.clone())
+        .collect();
+    assert_eq!(
+        senders,
+        vec!["a@example.net".to_owned()],
+        "the retried message is the only one queued: {senders:?}"
+    );
+    harness.stop();
+}

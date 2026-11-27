@@ -96,6 +96,13 @@
 //! wants to send a new message gets a normal transaction out of it. See
 //! `Connection::quarantine_refused_upload`.
 //!
+//! **The server cannot tell a refused transfer's tail from a new command at the
+//! byte level — both are `MAIL FROM:`-style lines — so the first command after a
+//! refusal is answered `503` and a client that retries once is back to normal —
+//! decision of 2026-11-26.** The connection is never closed for it: one retry
+//! costs a legitimate client nothing, and guessing the other way costs a forged
+//! transaction a mailbox.
+//!
 //! | Decision | `DATA` | `BDAT` |
 //! |---|---|---|
 //! | bare `LF` in the header section | refused on the line (`554 5.6.0`) | `header_len`, reported as `MalformedHead` |
@@ -721,7 +728,9 @@ struct Connection {
     settling: bool,
     /// Armed with `settling`, and for one command longer: a `MAIL FROM` read
     /// from the refused upload's tail opens no transaction (`503`) — see
-    /// [`Connection::quarantine_refused_upload`]. Spent on that first command.
+    /// [`Connection::quarantine_refused_upload`] for the trade behind that
+    /// (first command after a refusal is `503`, a retry recovers; 2026-11-26).
+    /// Spent on that first command.
     refused: bool,
     auth_state: Option<AuthState>,
     tls: bool,
@@ -1230,32 +1239,24 @@ impl Connection {
                 Transaction::Open(envelope) if envelope.smtputf8
             );
             let text = String::from_utf8_lossy(&line).into_owned();
+            // One command after a refusal is the last of what the refused
+            // upload put on the wire: it opens no envelope
+            // ([`Connection::quarantine_refused_upload`]). Every *other*
+            // command is answered normally — this is about who may open a
+            // transaction, not about the connection being unusable — and the
+            // flag is spent by whichever command this is, so the client's
+            // retry after that one is served.
+            let one_shot_refusal = self.refused;
+            self.refused = false;
             let reply = match command::parse(&text, allow_utf8) {
-                // Nothing in the tail of a refused upload starts an envelope:
-                // see [`Connection::quarantine_refused_upload`]. Every other
-                // command is answered normally — this is about who may open a
-                // transaction, not about the connection being unusable.
-                Ok(Command::Mail { .. }) if self.refused => Some(Reply {
+                Ok(Command::Mail { .. }) if one_shot_refusal => Some(Reply {
                     code: 503,
                     enhanced: Some("5.5.1"),
                     text: "Bad sequence of commands".to_owned(),
                     lines: Vec::new(),
                     action: Action::Continue,
                 }),
-                Ok(command) => {
-                    let judged_refused = self.refused;
-                    let r = self.dispatch(&command).await?;
-                    // The command this read carried has now been judged
-                    // against `refused`; everything after it is the client
-                    // talking again, on a connection that owes it the ordinary
-                    // answers. (Cleared after the dispatch for exactly that
-                    // reason: the arm above asks the flag, and this is the
-                    // command it is asking about.)
-                    if judged_refused {
-                        self.refused = false;
-                    }
-                    r
-                }
+                Ok(command) => self.dispatch(&command).await?,
                 Err(err) => Some(err.reply()),
             };
             if let Some(reply) = reply {
@@ -2173,17 +2174,31 @@ impl Connection {
     /// instead: a `MAIL FROM` that arrives while `refused` is set is answered
     /// `503 Bad sequence` and opens nothing.
     ///
-    /// `refused` is cleared by the read that consumes `settling`. Both flags
-    /// arm together in [`Connection::finish_failed_transfer`]:
+    /// Both flags arm together in [`Connection::finish_failed_transfer`] and
+    /// are spent in order:
     ///
-    /// - `settling` — the *read* that ends settling has its octets dropped, and
-    /// - `refused` — every `MAIL FROM` from that read until the next one is
-    ///   answered `503`.
+    /// - `settling` — spent by [`Connection::settle`] on the next read, which
+    ///   drops that read's octets as far as they are not a whole line;
+    /// - `refused` — spent by the first command dispatched after that read, so
+    ///   a `MAIL FROM` is answered `503` for as long as the tail is arriving.
     ///
     /// A command **already** in `read_buf` when the refusal went out is not
     /// affected: it was written before the drain could have consumed anything
     /// of it, and it is exactly the "new transaction after the answer" the
     /// rest of this module promises to serve.
+    ///
+    /// # The trade this makes, on purpose
+    ///
+    /// **The server cannot tell a refused transfer's tail from a new command at
+    /// the byte level — both are `MAIL FROM:`-style lines — so the first command
+    /// after a refusal is answered `503` and a client that retries once is back
+    /// to normal — decision of 2026-11-26.** The narrower alternative, cutting
+    /// the connection on the refusal, loses a client that had nothing to do
+    /// with the tail; the wider one, a per-address penalty table, is a stateful
+    /// knob that buys nothing here, because the cost of being wrong is one
+    /// retry and the cost of guessing wrong in the other direction is a forged
+    /// transaction. So the refusal costs a legitimate client exactly one `503`,
+    /// and never costs it the connection.
     fn quarantine_refused_upload(&mut self) {
         self.session.end_after_refusal();
         self.refused = true;
