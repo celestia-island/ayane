@@ -173,6 +173,7 @@
 pub mod authn;
 pub mod command;
 pub mod deliver;
+pub mod imap_session;
 pub mod mailbox;
 pub mod maildir_reader;
 pub mod metrics;
