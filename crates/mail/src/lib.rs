@@ -31,12 +31,37 @@ pub enum Route {
     Reject,
 }
 
+/// The precedence between objects that claim the same address.
+///
+/// [`DesiredState::validate`] does not refuse a state where one address is
+/// claimed twice — a deployment that already holds one has to keep working —
+/// so this order *is* the answer, and it is fixed rather than incidental:
+///
+/// ```text
+/// account (Mailbox)  >  shared mailbox  >  alias  >  catch-all
+/// ```
+///
+/// - An **account** is the address itself; nothing can outrank it.
+/// - A **shared mailbox** is a real mailbox here (its members open it over
+///   IMAP), so mail for it must land locally; an alias that would forward it
+///   away loses, because forwarding a mailbox's own mail leaves every member
+///   with an empty mailbox and a copy somewhere else.
+/// - An **alias** is an explicit one-to-many rule and outranks the
+///   **catch-all**, which only fires for addresses no object names.
+///
+/// Each step is checked for *both* the recipient and (when the policy allows
+/// `+tag`) its base form before the next step runs, so a shared mailbox
+/// spelled `team+alerts@` still beats an alias on `team@`. The order is
+/// asserted by `a_shared_mailbox_outranks_an_alias_and_an_alias_outranks_the_catch_all`.
+pub const ROUTE_PRECEDENCE: &[&str] = &["account", "shared", "alias", "catch-all"];
+
 /// Decide the route for one SMTP envelope.
 ///
 /// Order of evaluation, which is also the documented policy:
 ///
 /// 1. a sender on the deny list is rejected before anything else;
-/// 2. an existing account, shared mailbox or alias wins;
+/// 2. an existing account, shared mailbox or alias wins — in that order, see
+///    [`ROUTE_PRECEDENCE`];
 /// 3. an unknown recipient in a domain with a catch-all goes to that mailbox —
 ///    unless the allow list is non-empty and the sender is not on it, in which
 ///    case the message is quarantined;
@@ -60,6 +85,10 @@ pub fn route(state: &DesiredState, sender: &Address, recipient: &Address) -> Rou
         return Route::Reject;
     }
 
+    // Step by step, not candidate by candidate: the whole candidate list is
+    // asked each precedence level before the next level is consulted. That is
+    // what makes the order in [`ROUTE_PRECEDENCE`] a property of the router
+    // rather than of the order `candidate_recipients` happens to produce.
     let candidates = candidate_recipients(&state.policy.variants, recipient);
     for candidate in &candidates {
         if state
@@ -69,6 +98,8 @@ pub fn route(state: &DesiredState, sender: &Address, recipient: &Address) -> Rou
         {
             return Route::Mailbox(candidate.clone());
         }
+    }
+    for candidate in &candidates {
         if state
             .shared
             .iter()
@@ -76,6 +107,8 @@ pub fn route(state: &DesiredState, sender: &Address, recipient: &Address) -> Rou
         {
             return Route::Shared(candidate.clone());
         }
+    }
+    for candidate in &candidates {
         if let Some(alias) = state
             .aliases
             .iter()
@@ -235,6 +268,77 @@ mod tests {
         let state = state_with_catch_all(Vec::new());
         let route = route(&state, &addr("a@b.example"), &addr("team@example.com"));
         assert_eq!(route, Route::Shared(addr("team@example.com")));
+    }
+
+    #[test]
+    fn a_shared_mailbox_outranks_an_alias_and_an_alias_outranks_the_catch_all() {
+        // The whole precedence in one table, because a state may hold all
+        // three claims on one address (`validate` reports it as a warning
+        // rather than refusing the state) and this is the answer that keeps
+        // it working: shared > alias > catch-all.
+        let _ = ROUTE_PRECEDENCE;
+        let mut state = state_with_catch_all(Vec::new());
+        // `team@` is a shared mailbox, an alias source and the catch-all.
+        state.domains[0].catch_all = Some(addr("team@example.com"));
+        state.aliases.push(ayane_proto::Alias {
+            source: addr("team@example.com"),
+            targets: vec![addr("elsewhere@other.example")],
+        });
+        assert_eq!(
+            route(&state, &addr("a@b.example"), &addr("team@example.com")),
+            Route::Shared(addr("team@example.com")),
+            "a shared mailbox is delivered here, never forwarded away"
+        );
+        // An alias source that is not a shared mailbox beats the catch-all.
+        state.aliases.push(ayane_proto::Alias {
+            source: addr("list@example.com"),
+            targets: vec![addr("elsewhere@other.example")],
+        });
+        assert_eq!(
+            route(&state, &addr("a@b.example"), &addr("list@example.com")),
+            Route::Forward(vec![addr("elsewhere@other.example")])
+        );
+        // …and the catch-all still catches what nothing names.
+        assert_eq!(
+            route(&state, &addr("a@b.example"), &addr("nobody@example.com")),
+            Route::CatchAll(addr("team@example.com"))
+        );
+    }
+
+    #[test]
+    fn an_account_outranks_everything_else_claiming_its_address() {
+        let mut state = state_with_catch_all(Vec::new());
+        state.domains[0].catch_all = Some(addr("inbox@example.com"));
+        state.aliases.push(ayane_proto::Alias {
+            source: addr("inbox@example.com"),
+            targets: vec![addr("elsewhere@other.example")],
+        });
+        assert_eq!(
+            route(&state, &addr("a@b.example"), &addr("inbox@example.com")),
+            Route::Mailbox(addr("inbox@example.com")),
+            "the account is the address itself"
+        );
+    }
+
+    #[test]
+    fn a_plus_tagged_shared_mailbox_still_beats_an_alias_on_its_base() {
+        // The precedence runs level by level over the *whole* candidate list,
+        // so the folded `team@` a `team+alerts@` produces is still looked up
+        // as a shared mailbox before any alias is consulted.
+        let mut state = state_with_catch_all(Vec::new());
+        state.policy.variants.inbound_plus = true;
+        state.aliases.push(ayane_proto::Alias {
+            source: addr("team@example.com"),
+            targets: vec![addr("elsewhere@other.example")],
+        });
+        assert_eq!(
+            route(
+                &state,
+                &addr("a@b.example"),
+                &addr("team+alerts@example.com")
+            ),
+            Route::Shared(addr("team@example.com"))
+        );
     }
 
     #[test]

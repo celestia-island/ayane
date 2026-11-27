@@ -211,6 +211,12 @@ pub struct Harness {
 }
 
 impl Harness {
+    /// The mail tree the fixture's deliveries land in: a sibling of the
+    /// spool, never the spool itself.
+    pub fn mail_root(&self) -> std::path::PathBuf {
+        self.dir.path().join("mail")
+    }
+
     /// Starts a listener on a loopback port.
     pub async fn start(tag: &str, options: HarnessOptions) -> Self {
         let dir = TempDir::new(tag);

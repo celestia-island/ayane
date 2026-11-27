@@ -1,11 +1,13 @@
-//! The inbound SMTP side of the ayane mail service.
+//! The inbound SMTP side of the ayane mail service, and the delivery consumer
+//! that empties the queue it fills.
 //!
-//! This crate lands in layers. It holds four of them, and three share one
+//! This crate lands in layers. It holds six of them, and four share one
 //! property worth stating up front: **they open no socket, read no clock, and
-//! keep no state outside themselves.** [`queue`] is the only one that touches
-//! the disk, and it touches nothing else. [`server`] is the one that owns
-//! sockets, timers and TLS — and it owns *nothing else*: every decision it
-//! makes is a question it asks one of the three layers below.
+//! keep no state outside themselves.** [`queue`] and [`deliver`] are the ones
+//! that touch the disk; [`retry`] is pure arithmetic over what a delivery
+//! recorded; [`server`] is the one that owns sockets, timers and TLS — and it
+//! owns *nothing else*: every decision it makes is a question it asks one of
+//! the layers below.
 //!
 //! # The session layer — pure logic
 //!
@@ -118,6 +120,27 @@
 //! temporary failure must not lose mail; what it must never do is read as
 //! `pass`, and it does not.
 //!
+//! # The delivery consumer — where a message goes after the 250
+//!
+//! [`deliver`] is the other half of the queue, and it owns the two decisions
+//! the spool cannot make:
+//!
+//! 1. **Where each recipient goes.** It asks [`ayane_mail::route`] — the same
+//!    pure router `RCPT` consults, so a message is delivered where the
+//!    transaction said it would be — and then writes a maildir, writes the
+//!    quarantine, or re-enqueues a forward. It never re-decides policy.
+//! 2. **Whether a failure is retried.** [`retry`] is the ladder: first hour
+//!    twice, then every few hours, five days at the outside (RFC 5321
+//!    §4.5.4.1), with the horizon and the attempt cap configurable. When the
+//!    horizon ends the recipient is bounced with an RFC 3464 report — unless
+//!    the reverse-path is null, which is the one recipient a mail system may
+//!    never bounce (RFC 5321 §6.1).
+//!
+//! The crash story is the spool's plus one file: the claim moves a message out
+//! of `new/`, the maildir write is ordered so that a crash duplicates rather
+//! than loses (see [`deliver`]), and recovery puts a message a dead consumer
+//! left behind back into the queue.
+//!
 //! # The listener split is structural, not configured
 //!
 //! [`policy`] answers two *different listeners*, not one listener with a flag:
@@ -130,8 +153,8 @@
 //!
 //! # The driver — the one layer that owns the outside world
 //!
-//! [`server`] is a tokio I/O driver over the three layers below it, and its
-//! job is to keep every bound those layers *cannot* see: the RFC 5321 §4.5.3.2
+//! [`server`] is a tokio I/O driver over the layers below it, and its job is
+//! to keep every bound those layers *cannot* see: the RFC 5321 §4.5.3.2
 //! timers, the command and body line limits, the per-IP connection cap, the
 //! BDAT chunk buffer, the **header section bound** the streaming verifier
 //! needs from it, and the per-address AUTH failure budget a reconnect cannot
@@ -149,9 +172,11 @@
 
 pub mod authn;
 pub mod command;
+pub mod deliver;
 pub mod mailbox;
 pub mod policy;
 pub mod queue;
+pub mod retry;
 pub mod server;
 pub mod session;
 pub mod verify;
@@ -159,6 +184,10 @@ pub mod zone;
 
 pub use authn::{valid_identity, DenyAll, PasswordVerifier, SaslError};
 pub use command::{Command, ParseError};
+pub use deliver::{
+    AuditEvent, Defaults, Deliverer, DeliveryRecord, DeliveryReport, Disposition, MaildirHook,
+    MaildirStep, MaildirSync, RecipientOutcome, RecipientReport, RecordedRecipient, DEFAULTS,
+};
 pub use mailbox::{Mailbox, MailboxError, POSTMASTER};
 pub use policy::{inbound_recipient, submission_recipient, AddressPolicy, ListenerRole};
 pub use policy::{RecipientVerdict, SessionRefusal, Verdict};
@@ -166,6 +195,7 @@ pub use queue::{
     Envelope, FsyncEvent, FsyncKind, FsyncObserver, FsyncOp, QueueState, QueuedMessage, Spool,
     StagedMessage, SyncHook,
 };
+pub use retry::{RecipientState, RetryClass, RetryDecision, RetryPolicy};
 pub use server::{serve, AuthGate, AuthGuard, ServerConfig, ServerError};
 pub use session::{Action, Extensions, Limits, Outcome, Phase, Reply, Session};
 pub use verify::{

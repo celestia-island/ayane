@@ -2047,7 +2047,13 @@ impl Connection {
             }
             None => crate::verify::Verification {
                 verdict: PolicyVerdict::Accept,
-                prepend: Vec::new(),
+                // With no verifier there is nothing to prepend *but* the trace
+                // field, and RFC 5321 §4.4 owes every hop its own `Received:`
+                // whether or not the hop verified anything: a deployment with
+                // verification off would otherwise hand the next hop a message
+                // with no record of where it came from (and the queue's
+                // forward-loop bound would count one `Received:` too few).
+                prepend: format!("Received: {received}\r\n").into_bytes(),
                 summary: "verification disabled".to_owned(),
             },
         };
