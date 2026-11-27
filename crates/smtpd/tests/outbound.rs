@@ -958,18 +958,9 @@ fn fixture_key() -> (&'static str, &'static str) {
     )
 }
 
-#[test]
-fn an_outbound_message_carries_a_signature_that_verifies() {
-    // The signature is checked by the same `mail-auth` verifier production
-    // runs, over the octets the receiver actually got: the test's server
-    // captures the DATA upload and the verifier reads it back.
-    let body = b"From: Alice <alice@example.test>\r\n\
-                 To: girl@remote.test\r\n\
-                 Subject: signed\r\n\
-                 Date: Tue, 14 Jul 2026 03:33:20 +0000\r\n\
-                 Message-ID: <one@example.test>\r\n\
-                 \r\n\
-                 signed body\r\n";
+/// Sends one message through an `Outbound` with `signer` installed and
+/// returns the octets a scripted receiver captured.
+fn deliver_signed(body: &[u8], signer: Option<Signer>) -> Vec<u8> {
     let (addr, captured) = scripted(|stream, captured| {
         let mut reader = BufReader::new(stream.try_clone().expect("clone"));
         let mut writer = stream;
@@ -991,17 +982,16 @@ fn an_outbound_message_carries_a_signature_that_verifies() {
         read_line(&mut reader, captured);
         writer.write_all(b"221 bye\r\n").expect("quit");
     });
-
-    let (private, public) = fixture_key();
-    let signer = Signer::rsa("example.test", "ayane", private).expect("a fixture key");
-    let outbound = Outbound::new(
+    let mut outbound = Outbound::new(
         Arc::new(StaticResolver::empty().with_mx("remote.test", vec![(0, "mx.remote.test")]))
             as Arc<dyn Resolver>,
         "mx.origin.test",
     )
     .with_address("mx.remote.test", addr)
-    .with_tls_policy(TlsPolicy::InsecureForTests)
-    .with_signer(signer);
+    .with_tls_policy(TlsPolicy::InsecureForTests);
+    if let Some(signer) = signer {
+        outbound = outbound.with_signer(signer);
+    }
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1015,8 +1005,51 @@ fn an_outbound_message_carries_a_signature_that_verifies() {
             1_000,
         ));
     assert_eq!(result.delivered().count(), 1, "{result:?}");
+    captured.data()
+}
 
-    let received = captured.data();
+/// Whether the verifier, given the fixture's public key in a fixed zone, says
+/// the message carries a passing signature.
+fn verifies(received: &[u8]) -> String {
+    use mail_auth::dns::TxtRecordParser as _;
+    let (_, public) = fixture_key();
+    let record = mail_auth::dkim::DomainKey::parse(public.as_bytes()).expect("a DKIM1 record");
+    let zone = ayane_smtpd::zone::FixedZone::empty_authority().with_txt(
+        "ayane._domainkey.example.test",
+        mail_auth::dns::TxtRecord::from(record),
+    );
+    let verifier = ayane_smtpd::verify::Verifier::with_zone("mx.remote.test", zone);
+    let streamed = ayane_smtpd::verify::StreamedMessage::from_bytes(received).expect("a message");
+    let facts = ayane_smtpd::verify::SessionFacts {
+        remote_ip: "192.0.2.1".parse().expect("ip"),
+        helo: "mx.origin.test".to_owned(),
+        mail_from: "alice@example.test".to_owned(),
+        authenticated: None,
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(verifier.verify(streamed, &facts, "from mx.origin.test"))
+        .summary
+}
+
+fn fixture_signer() -> Signer {
+    let (private, _) = fixture_key();
+    Signer::rsa("example.test", "ayane", private).expect("a fixture key")
+}
+
+#[test]
+fn an_outbound_message_carries_a_signature_that_verifies() {
+    // The signature is checked by the same `mail-auth` verifier production
+    // runs, over the octets the receiver actually got.
+    let body = b"From: Alice <alice@example.test>\r\n\
+                 To: girl@remote.test\r\n\
+                 Subject: signed\r\n\
+                 Date: Tue, 14 Jul 2026 03:33:20 +0000\r\n\
+                 Message-ID: <one@example.test>\r\n\
+                 \r\nsigned body\r\n";
+    let received = deliver_signed(body, Some(fixture_signer()));
     let text = String::from_utf8_lossy(&received);
     assert!(
         text.starts_with("DKIM-Signature: "),
@@ -1030,34 +1063,87 @@ fn an_outbound_message_carries_a_signature_that_verifies() {
         text.contains("d=example.test") && text.contains("s=ayane"),
         "{text}"
     );
-
-    // The verifier, given the matching public key in a fixed zone, says pass.
-    use mail_auth::dns::TxtRecordParser as _;
-    let record = mail_auth::dkim::DomainKey::parse(public.as_bytes()).expect("a DKIM1 record");
-    let zone = ayane_smtpd::zone::FixedZone::empty_authority().with_txt(
-        "ayane._domainkey.example.test",
-        mail_auth::dns::TxtRecord::from(record),
-    );
-    let verifier = ayane_smtpd::verify::Verifier::with_zone("mx.remote.test", zone);
-    // The strict parse the verifier does, asked directly for its verdict on
-    // the DKIM headers: a signature the parser rejects never reaches the
-    // crypto.
-    let streamed = ayane_smtpd::verify::StreamedMessage::from_bytes(&received).expect("a message");
-    let facts = ayane_smtpd::verify::SessionFacts {
-        remote_ip: "192.0.2.1".parse().expect("ip"),
-        helo: "mx.origin.test".to_owned(),
-        mail_from: "alice@example.test".to_owned(),
-        authenticated: None,
-    };
-    let verification = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime")
-        .block_on(verifier.verify(streamed, &facts, "from mx.origin.test"));
+    let summary = verifies(&received);
     assert!(
-        verification.summary.contains("dkim=1/1"),
-        "the signature must verify as a pass: {}",
-        verification.summary
+        summary.contains("dkim=1/1"),
+        "the signature must verify as a pass: {summary}"
+    );
+}
+
+#[test]
+fn a_malformed_header_before_the_from_does_not_suppress_the_signature() {
+    // R1's S1-1 over the wire: a field name that is not UTF-8 and a `From`
+    // with no `@` both used to abort the scan, so a message from a signed
+    // domain went out unsigned — silently, and with one junk line as the only
+    // cost to an attacker.
+    let body = b"X-Junk-\xff\xfe: not a field name\r\n\
+                 From: Alice <alice@example.test>\r\n\
+                 To: girl@remote.test\r\n\
+                 Subject: still signed\r\n\
+                 Date: Tue, 14 Jul 2026 03:33:20 +0000\r\n\
+                 \r\nbody\r\n";
+    let received = deliver_signed(body, Some(fixture_signer()));
+    let text = String::from_utf8_lossy(&received);
+    assert!(
+        text.starts_with("DKIM-Signature: "),
+        "one junk field above the real From must not suppress the signature: {text}"
+    );
+    assert!(text.contains("d=example.test"), "{text}");
+    assert!(
+        verifies(&received).contains("dkim=1/1"),
+        "and the signature still verifies"
+    );
+
+    // The second half of S1-1: a `From` field whose *own* value has no domain
+    // used to end the scan too. It still contributes nothing, and the real
+    // `From` below it is still the one signed — but a message with two `From`
+    // fields is now ambiguous by design, so this shape is exercised through
+    // `from_domain` in the unit tests. Over the wire the reachable case is a
+    // domainless `From` followed by a real `To` and no other `From`: that
+    // message has no signing domain at all and must go out unsigned.
+    let body = b"From: nobody-at-all\r\n\
+                 To: girl@remote.test\r\n\
+                 Subject: no domain\r\n\
+                 Date: Tue, 14 Jul 2026 03:33:20 +0000\r\n\
+                 \r\nbody\r\n";
+    let received = deliver_signed(body, Some(fixture_signer()));
+    let text = String::from_utf8_lossy(&received);
+    assert!(
+        !text.contains("DKIM-Signature:"),
+        "a From with no domain names nothing to sign for: {text}"
+    );
+}
+
+#[test]
+fn two_from_fields_go_out_unsigned_rather_than_signed_for_one_of_them() {
+    // R1's S2-1 over the wire: a reader and DMARC take the *last* `From`, so a
+    // signature for the first would give a forger "DKIM pass" for a domain the
+    // message does not claim.
+    let body = b"From: Alice <alice@example.test>\r\n\
+                 From: Bank <security@victim.test>\r\n\
+                 To: girl@remote.test\r\n\
+                 Subject: two Froms\r\n\
+                 Date: Tue, 14 Jul 2026 03:33:20 +0000\r\n\
+                 \r\nbody\r\n";
+    let received = deliver_signed(body, Some(fixture_signer()));
+    let text = String::from_utf8_lossy(&received);
+    assert!(
+        !text.contains("DKIM-Signature:"),
+        "an ambiguous message must not be vouched for: {text}"
+    );
+    assert!(
+        !text.contains("d=example.test"),
+        "and certainly not for the first From: {text}"
+    );
+    // It is still delivered — the refusal is about the signature, not the
+    // message — and the trace field is this hop's.
+    assert!(
+        text.contains("(ayane) by mx.remote.test"),
+        "the message still left with its trace field: {text}"
+    );
+    assert!(
+        text.contains("From: Bank <security@victim.test>"),
+        "the octets are unchanged: {text}"
     );
 }
 
@@ -1113,6 +1199,9 @@ fn a_domain_with_no_signer_goes_out_unsigned() {
 struct ScriptedTransport {
     replies: Mutex<Vec<ayane_smtpd::RemoteReply>>,
     calls: AtomicUsize,
+    /// The recipient list of every group the delivery layer asked about, in
+    /// order: the shape of the transaction, not just how many calls there were.
+    groups: Mutex<Vec<(String, Vec<String>)>>,
 }
 
 impl ScriptedTransport {
@@ -1120,7 +1209,13 @@ impl ScriptedTransport {
         Arc::new(Self {
             replies: Mutex::new(replies),
             calls: AtomicUsize::new(0),
+            groups: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The groups seen so far, as `(domain, recipients)`.
+    fn groups(&self) -> Vec<(String, Vec<String>)> {
+        self.groups.lock().expect("groups").clone()
     }
 }
 
@@ -1130,6 +1225,10 @@ impl ayane_smtpd::RemoteTransport for ScriptedTransport {
         request: &ayane_smtpd::RemoteRequest<'_>,
     ) -> std::io::Result<Vec<ayane_smtpd::RemoteReport>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.groups
+            .lock()
+            .expect("groups")
+            .push((request.domain.to_owned(), request.recipients.to_vec()));
         let mut replies = self.replies.lock().expect("replies");
         let reply = if replies.len() > 1 {
             replies.remove(0)
@@ -1352,6 +1451,24 @@ fn one_pass_groups_every_recipient_of_a_domain_into_one_transaction() {
         transport.calls.load(Ordering::SeqCst),
         2,
         "one call per destination domain, not one per recipient"
+    );
+    // The shape of that, not just the count: each domain is one transaction
+    // carrying all of its recipients, so a real client would write one `MAIL
+    // FROM` and one `DATA` per group and one `RCPT` per recipient.
+    let groups = transport.groups();
+    assert_eq!(
+        groups,
+        vec![
+            (
+                "elsewhere.test".to_owned(),
+                vec!["c@elsewhere.test".to_owned()]
+            ),
+            (
+                "remote.test".to_owned(),
+                vec!["a@remote.test".to_owned(), "b@remote.test".to_owned()]
+            ),
+        ],
+        "one group per domain, carrying every one of its recipients"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

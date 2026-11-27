@@ -84,6 +84,13 @@ struct DeliverOptions {
     /// `LoadCredential`, a 0600 env file) and this process only reads the name:
     /// nothing here opens a path of its own, and no key is ever written to the
     /// state snapshot.
+    ///
+    /// **The substituted name carries no dot.** A POSIX environment variable
+    /// name may not contain one, and every hosted domain has one, so the
+    /// domain is spelled with `_` where its dots are:
+    /// `--dkim-key-env 'AYANE_DKIM_KEY_{domain}'` reads `example.com`'s key
+    /// from `AYANE_DKIM_KEY_example_com`. See
+    /// [`ayane_smtpd::outbound::dkim_env_name`].
     dkim_key_env: Option<String>,
 }
 
@@ -96,7 +103,9 @@ fn usage() -> &'static str {
      \x20 or: ayane-smtpd --deliver --spool DIR --mail-root DIR --state FILE \
         --hostname NAME [--retry-max-age-seconds N] [--retry-max-attempts N] \
         [--quota BYTES] [--interval-seconds N] [--outbound] \
-        [--smtp-port N] [--dkim-key-env VAR]"
+        [--smtp-port N] [--dkim-key-env VAR]\n\
+     \x20 (VAR may contain {domain}; a domain's dots become _ in the name: \
+        example.com -> example_com)"
 }
 
 fn parse_options() -> Result<Options, String> {

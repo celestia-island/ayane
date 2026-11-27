@@ -1483,21 +1483,46 @@ pub struct ReceivedField {
     pub by: String,
     /// RFC 3848's protocol word: `ESMTPS` upgraded, `ESMTP` not.
     pub protocol: &'static str,
+    /// Whether the connection *offered* TLS and the upgrade failed.
+    ///
+    /// The two `ESMTP` cases are different facts about the same wire: a
+    /// receiver that never advertised `STARTTLS` says nothing about the
+    /// sender, and one that advertised it and then failed the handshake does.
+    /// The protocol word is the same (`ESMTP` — the connection really was
+    /// plaintext), and this is what keeps them apart: a downgrade says so in
+    /// the field, because the operator's next question after "was this
+    /// encrypted?" is "why wasn't it?".
+    pub starttls_failed: bool,
     /// The queue id, so the field joins an operator's log to the message.
     pub id: String,
     /// The RFC 5322 date.
     pub date: String,
 }
 
+/// The `Received:` comment that records a failed opportunistic upgrade.
+///
+/// RFC 5321 §4.4 permits a comment in a trace field, and this is the one this
+/// crate writes: `with ESMTP (starttls-failed)` says the peer offered TLS and
+/// the handshake did not complete. A connection where that happened is still
+/// `ESMTP` — it was never `ESMTPS` — and the comment is the difference between
+/// "the peer does not do TLS" and "the peer does, and something is wrong with
+/// it".
+pub const STARTTLS_FAILED_NOTE: &str = "(starttls-failed)";
+
 impl ReceivedField {
     /// The value that follows `Received: ` (no field name, no CRLF).
     #[must_use]
     pub fn value(&self) -> String {
+        let protocol = if self.starttls_failed {
+            format!("{} {}", self.protocol, STARTTLS_FAILED_NOTE)
+        } else {
+            self.protocol.to_owned()
+        };
         format!(
             "from {from} (ayane) by {by} with {protocol} id {id}; {date}",
             from = sanitize(&self.from, 255),
             by = sanitize(&self.by, 255),
-            protocol = self.protocol,
+            protocol = protocol,
             id = sanitize(&self.id, 255),
             date = sanitize(&self.date, 64),
         )
@@ -1731,9 +1756,27 @@ pub fn signers_from_env(
 ) -> Result<BTreeMap<String, Signer>, SignError> {
     let mut signers = BTreeMap::new();
     for (domain, config) in Outbound::signers_for(state) {
-        let variable = template.replace("{domain}", &domain);
+        // The variable name is `template` with the domain substituted. A
+        // domain is a DNS name and an environment variable name is not: a dot
+        // is legal in the first and — on a POSIX shell — not in the second, so
+        // the domain is spelled in the variable the way an operator can write
+        // it. See [`dkim_env_name`].
+        let variable = dkim_env_name(template, &domain);
         match std::env::var(&variable) {
             Ok(pem) if !pem.trim().is_empty() => {
+                // The key is the domain's, and the domain is the one the
+                // message will claim. A second format check here is depth, not
+                // belief: `state.validate()` already refused a malformed
+                // hosted name, and a key configured for a name a sender could
+                // not claim is a signature nobody verifies.
+                if let Err(err) = ayane_proto::check_domain(&domain) {
+                    tracing::warn!(
+                        domain = %domain,
+                        error = %err,
+                        "a DKIM key is configured for a name that is not a domain:                          refusing to sign for it"
+                    );
+                    continue;
+                }
                 signers.insert(
                     domain.clone(),
                     Signer::rsa(&domain, &config.selector, &pem)?,
@@ -1750,6 +1793,32 @@ pub fn signers_from_env(
         }
     }
     Ok(signers)
+}
+
+/// The environment variable holding `domain`'s DKIM key, from a template.
+///
+/// `{domain}` is replaced by the domain with every octet outside
+/// `[A-Za-z0-9_]` turned into `_`, because a POSIX environment variable name
+/// may not contain a dot: `example.com` becomes `example_com`, so
+/// `AYANE_DKIM_KEY_{domain}` names `AYANE_DKIM_KEY_example_com`.
+///
+/// A template that already contains the sanitised spelling is honoured as
+/// written (no double substitution), so an operator who wrote
+/// `AYANE_DKIM_KEY_example_com` by hand and an operator who wrote the template
+/// get the same variable.
+#[must_use]
+pub fn dkim_env_name(template: &str, domain: &str) -> String {
+    let sanitised: String = domain
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    template.replace("{domain}", &sanitised)
 }
 
 /// Puts a `DKIM-Signature` field on top of `message`.
@@ -2090,6 +2159,7 @@ impl Outbound {
             from: self.client.hostname.clone(),
             by: endpoint.host.clone(),
             protocol: tls.protocol(),
+            starttls_failed: matches!(tls, TlsOutcome::Downgraded(_)),
             id: id.to_owned(),
             date: crate::server::format_rfc5322(now_epoch),
         };
@@ -2104,10 +2174,27 @@ impl Outbound {
     ///
     /// The signing domain is the `From` header's, not the envelope's: RFC 6376
     /// §5.4 signs what the reader sees, and a signature over a domain the
-    /// message does not claim addresses nobody.
+    /// message does not claim addresses nobody. See [`FromDomain`] for which
+    /// `From` that is and why an ambiguous message is never signed.
     fn sign(&self, received: &[u8]) -> Result<Vec<u8>, AttemptError> {
-        let Some(domain) = from_domain(received) else {
-            return Ok(received.to_vec());
+        let domain = match from_domain(received) {
+            FromDomain::One(domain) => domain,
+            // Two `From` fields: malformed, and a signature would say "this is
+            // genuinely from" about a message whose own author is unclear. The
+            // receiver decides what to do with it; this crate does not vouch
+            // for it.
+            FromDomain::Ambiguous { domains } => {
+                tracing::warn!(
+                    domains = %domains.join(","),
+                    "the message carries more than one From field: not signing it"
+                );
+                return Ok(received.to_vec());
+            }
+            FromDomain::NoDomain => {
+                // Either no `From` at all or none with a domain. Unsigned is
+                // the right answer for both: there is no domain to claim.
+                return Ok(received.to_vec());
+            }
         };
         let Some(signer) = self.signer(&domain) else {
             return Ok(received.to_vec());
@@ -2119,40 +2206,116 @@ impl Outbound {
     }
 }
 
-/// The domain of the first `From` header field in `message`'s header section.
+/// The domain a message is signed for, from its `From` header field(s).
+///
+/// # Which `From` — the last one, and why
+///
+/// RFC 5322 §3.6 says a message has exactly one `From` field, but a message on
+/// the wire may carry several, and when it does, **readers and DMARC take the
+/// last one** — the one nearest the body, which is the one a chain of relays
+/// most recently added. A signer that picked the first would sign
+/// `example.test` for a message whose reader sees `victim.test`: the receiver
+/// would report DKIM `pass` for a domain the message does not claim, which is
+/// the exact combination a forger wants. So the *last* `From` field's domain
+/// is what this returns.
+///
+/// # Multiple `From` is a refusal, not a choice
+///
+/// Taking the last one is already the safer reading, but a message with two
+/// `From` fields is malformed, and signing it would lend a valid signature to
+/// a shape that receivers handle inconsistently (some read the first, some the
+/// last, DMARC reads the last). So [`from_domain`] returns the analysis rather
+/// than a bare `Option`, and a second `From` field is a [`FromDomain::Ambiguous`]
+/// that the transport refuses to sign and logs. A message nobody signed is
+/// worse than one signed for the wrong domain only for the sender; an ambiguous
+/// one is worse for everybody.
+///
+/// # Failing on one field never silences the others
+///
+/// The header section is scanned field by field. A field name that is not
+/// UTF-8, or is not `From`, is **skipped** — not a reason to give up on the
+/// fields after it. Only a `From` field whose *own* value yields no domain
+/// makes the answer `NoDomain`, and even then the scan continues, so
+/// `From: nobody` followed by `From: Alice <alice@example.test>` still signs
+/// for `example.test`. That distinction is the difference between "this message
+/// has no usable `From`" and "the first thing I looked at confused me": the
+/// former is a fact about the message, the latter was a bug that let one
+/// throwaway header line suppress signing for a whole domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FromDomain {
+    /// Exactly one `From` field, naming this signing domain.
+    One(String),
+    /// Two or more `From` fields: malformed, and never signed for.
+    Ambiguous {
+        /// Every domain those fields named, in message order. Empty when none
+        /// of them yielded a domain.
+        domains: Vec<String>,
+    },
+    /// No `From` field carries a usable domain.
+    NoDomain,
+}
+
+/// The signing domain a message's `From` field names.
 ///
 /// Deliberately literal: the header section ends at the first blank line, the
 /// field name is matched case-insensitively, and the domain is the part of the
-/// first address after the last `@` before the field ends. Anything that does
-/// not look like an address yields `None`, which leaves the message unsigned
-/// rather than signing it for a domain nobody can check.
+/// last address in the field after its last `@`. See [`FromDomain`] for what
+/// "last field" and "ambiguous" mean here.
 #[must_use]
-pub fn from_domain(message: &[u8]) -> Option<String> {
+pub fn from_domain(message: &[u8]) -> FromDomain {
     let head_len = message
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .unwrap_or(message.len());
     let head = &message[..head_len];
+    let mut domains: Vec<String> = Vec::new();
+    let mut seen = 0usize;
     for field in head.split(|byte| *byte == b'\n') {
         let field = field.strip_suffix(b"\r").unwrap_or(field);
         let Some(colon) = field.iter().position(|byte| *byte == b':') else {
+            // A folded continuation line, or a line that is not a field at
+            // all. Neither can be a `From` field's *start*, and neither is a
+            // reason to stop looking.
             continue;
         };
-        let name = std::str::from_utf8(&field[..colon]).ok()?;
+        // A field name outside ASCII is a field no SMTP server this crate talks
+        // to writes, and it is skipped rather than ending the search: one
+        // junk line must not decide whether the message below it is signed.
+        let Ok(name) = std::str::from_utf8(&field[..colon]) else {
+            continue;
+        };
         if !name.eq_ignore_ascii_case("from") {
             continue;
         }
-        let value = String::from_utf8_lossy(&field[colon + 1..]).into_owned();
-        let at = value.rfind('@')?;
-        let rest = &value[at + 1..];
-        let domain: String = rest
-            .chars()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '.')
-            .collect();
-        let domain = domain.trim_matches('.').to_ascii_lowercase();
-        return (!domain.is_empty()).then_some(domain);
+        seen += 1;
+        // A `From` field that yields no domain does not end the scan either:
+        // the *next* one may be the real one. `None` from this field only
+        // means this field contributed nothing.
+        if let Some(domain) = value_domain(&field[colon + 1..]) {
+            domains.push(domain);
+        }
     }
-    None
+    if seen > 1 {
+        return FromDomain::Ambiguous { domains };
+    }
+    match domains.into_iter().next() {
+        Some(domain) => FromDomain::One(domain),
+        None => FromDomain::NoDomain,
+    }
+}
+
+/// The domain of the last address in one `From` field's value, when it has
+/// one.
+fn value_domain(value: &[u8]) -> Option<String> {
+    let value = String::from_utf8_lossy(value);
+    let at = value.rfind('@')?;
+    let rest = &value[at + 1..];
+    let domain: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '.')
+        .collect();
+    let domain = domain.trim_matches('.').to_ascii_lowercase();
+    (!domain.is_empty()).then_some(domain)
 }
 
 /// The delivery layer's view of [`Outbound`].
@@ -2306,6 +2469,11 @@ impl GroupResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signing-test key: the same throwaway RSA-2048 pair `tests/outbound.rs`
+    /// uses, registered in `_ledger/tool-exemptions.md`. It authenticates
+    /// nothing outside these tests.
+    const FIXTURE_KEY: &str = include_str!("../tests/fixtures/dkim-private.pem");
 
     fn ip(raw: &str) -> IpAddr {
         raw.parse().expect("fixture address")
@@ -2580,6 +2748,7 @@ mod tests {
             from: "mx.example.com".to_owned(),
             by: "mx.destination.example".to_owned(),
             protocol: "ESMTPS",
+            starttls_failed: false,
             id: "abc123".to_owned(),
             date: "Tue, 14 Jul 2026 03:33:20 +0000".to_owned(),
         };
@@ -2608,6 +2777,7 @@ mod tests {
             from: "mx.example.com".to_owned(),
             by: "evil\r\nX-Injected: yes".to_owned(),
             protocol: "ESMTP",
+            starttls_failed: false,
             id: "abc".to_owned(),
             date: "Tue, 14 Jul 2026 03:33:20 +0000".to_owned(),
         };
@@ -2630,6 +2800,7 @@ mod tests {
             from: "mx.example.com".to_owned(),
             by: format!("{}.example", "a".repeat(400)),
             protocol: "ESMTPS",
+            starttls_failed: false,
             id: "b".repeat(400),
             date: "Tue, 14 Jul 2026 03:33:20 +0000".to_owned(),
         };
@@ -2651,11 +2822,74 @@ mod tests {
     }
 
     #[test]
+    fn a_downgraded_connection_says_so_in_the_trace_field() {
+        // Both are `ESMTP` — the connection really was plaintext — and the
+        // comment is the only thing that separates "the peer does not do TLS"
+        // from "the peer does and the handshake broke".
+        let plaintext = ReceivedField {
+            from: "mx.example.com".to_owned(),
+            by: "mx.dest.example".to_owned(),
+            protocol: "ESMTP",
+            starttls_failed: false,
+            id: "abc".to_owned(),
+            date: "Tue, 14 Jul 2026 03:33:20 +0000".to_owned(),
+        };
+        let downgraded = ReceivedField {
+            starttls_failed: true,
+            ..plaintext.clone()
+        };
+        assert!(
+            plaintext.value().contains("with ESMTP id "),
+            "{}",
+            plaintext.value()
+        );
+        assert!(
+            !plaintext.value().contains("starttls-failed"),
+            "{}",
+            plaintext.value()
+        );
+        let value = downgraded.value();
+        assert!(
+            value.contains("with ESMTP (starttls-failed) id "),
+            "{value}"
+        );
+        assert!(
+            !value.contains("ESMTPS"),
+            "a failed upgrade is never reported as a successful one: {value}"
+        );
+    }
+
+    #[test]
+    fn the_dkim_environment_variable_name_has_no_dot_in_it() {
+        // A POSIX environment variable name may not contain a dot, and every
+        // hosted domain has one.
+        assert_eq!(
+            dkim_env_name("AYANE_DKIM_KEY_{domain}", "example.com"),
+            "AYANE_DKIM_KEY_example_com"
+        );
+        assert_eq!(
+            dkim_env_name("AYANE_DKIM_KEY_{domain}", "mail.example.co.uk"),
+            "AYANE_DKIM_KEY_mail_example_co_uk"
+        );
+        // The sanitised spelling is not substituted again.
+        assert_eq!(
+            dkim_env_name("AYANE_DKIM_KEY_example_com", "example.com"),
+            "AYANE_DKIM_KEY_example_com"
+        );
+        // A template with no placeholder is used as written.
+        assert_eq!(
+            dkim_env_name("SOME_CONSTANT", "example.com"),
+            "SOME_CONSTANT"
+        );
+    }
+
+    #[test]
     fn a_short_value_is_not_folded() {
         let field = ReceivedField {
             from: "mx.example.com".to_owned(),
             by: "mx.dest.example".to_owned(),
             protocol: "ESMTP",
+            starttls_failed: false,
             id: "abc".to_owned(),
             date: "Tue, 14 Jul 2026 03:33:20 +0000".to_owned(),
         };
@@ -2668,6 +2902,7 @@ mod tests {
             from: "mx.example.com".to_owned(),
             by: "mx.dest.example".to_owned(),
             protocol: "ESMTPS",
+            starttls_failed: false,
             id: "abc".to_owned(),
             date: "Tue, 14 Jul 2026 03:33:20 +0000".to_owned(),
         };
@@ -2709,26 +2944,115 @@ mod tests {
 
     // ── the signing domain ───────────────────────────────────────────────
 
+    fn one(domain: &str) -> FromDomain {
+        FromDomain::One(domain.to_owned())
+    }
+
     #[test]
     fn the_signing_domain_comes_from_the_from_header() {
         assert_eq!(
             from_domain(b"From: Alice <alice@example.com>\r\nTo: x@y\r\n\r\nbody"),
-            Some("example.com".to_owned())
+            one("example.com")
         );
-        // Case folds, a display name is skipped, and a header listed later in
+        // Case folds, a display name is skipped, and a field listed later in
         // the section still counts.
         assert_eq!(
             from_domain(b"To: x@y\r\nFrom: \"A, B\" <A@EXAMPLE.COM>\r\n\r\nbody"),
-            Some("example.com".to_owned())
+            one("example.com")
         );
         // No `From` at all: nothing to sign for.
-        assert_eq!(from_domain(b"To: x@y\r\n\r\nbody"), None);
+        assert_eq!(from_domain(b"To: x@y\r\n\r\nbody"), FromDomain::NoDomain);
         // A `From` without a domain cannot name a key.
-        assert_eq!(from_domain(b"From: nobody\r\n\r\nbody"), None);
+        assert_eq!(
+            from_domain(b"From: nobody\r\n\r\nbody"),
+            FromDomain::NoDomain
+        );
         // A body that mentions `From:` is not a header.
         assert_eq!(
             from_domain(b"Subject: s\r\n\r\nFrom: a@example.com\r\n"),
-            None
+            FromDomain::NoDomain
         );
+    }
+
+    #[test]
+    fn a_malformed_field_before_the_from_does_not_suppress_signing() {
+        // The defect this pins: a header line whose *name* is not UTF-8 (or is
+        // not `From`) used to abort the whole scan with `?`, so one throwaway
+        // line above the real `From` left every message from the domain
+        // unsigned — silently.
+        let mut message = Vec::new();
+        message.extend_from_slice(b"X-Junk-\xff\xfe: not a field name\r\n");
+        message.extend_from_slice(b"From: nobody-at-all\r\n"); // no `@`
+        message.extend_from_slice(b"From: Alice <alice@example.test>\r\n");
+        message.extend_from_slice(b"\r\nbody\r\n");
+        // Two `From` fields is now `Ambiguous` by design (see below), so the
+        // assertion is about the *scan*: the real domain was still found.
+        assert_eq!(
+            from_domain(&message),
+            FromDomain::Ambiguous {
+                domains: vec!["example.test".to_owned()]
+            },
+            "the non-UTF-8 name and the domainless From must not hide the real one"
+        );
+
+        // One junk field and one real `From` — the shape that used to go out
+        // unsigned.
+        let mut message = Vec::new();
+        message.extend_from_slice(b"X-Junk-\xff: junk\r\n");
+        message.extend_from_slice(b"From: Alice <alice@example.test>\r\n");
+        message.extend_from_slice(b"\r\nbody\r\n");
+        assert_eq!(from_domain(&message), one("example.test"));
+
+        // A `From` with no `@` and then a real one is the same story with a
+        // domainless field instead of a bad name.
+        let message = b"From: nobody\r\nFrom: Alice <alice@example.test>\r\n\r\nbody";
+        assert_eq!(
+            from_domain(message),
+            FromDomain::Ambiguous {
+                domains: vec!["example.test".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn two_from_fields_are_ambiguous_and_never_signed() {
+        // The reader and DMARC take the *last* `From` (RFC 5322 §3.6 says
+        // there is exactly one, so this is malformed input). Signing the first
+        // one would let a forger obtain "DKIM pass" for a domain the message
+        // does not claim, so a second `From` is a refusal, not a choice.
+        let message = b"From: Alice <alice@example.test>\r\n\
+                        From: Bank <security@victim.test>\r\n\
+                        \r\nbody\r\n";
+        assert_eq!(
+            from_domain(message),
+            FromDomain::Ambiguous {
+                domains: vec!["example.test".to_owned(), "victim.test".to_owned()]
+            }
+        );
+        // The `Outbound` built with a signer for the first domain must still
+        // leave the message unsigned: a signature for `example.test` on a
+        // message whose last `From` is `victim.test` is the dangerous half.
+        let signer = Signer::rsa("example.test", "ayane", FIXTURE_KEY).expect("the fixture key");
+        let outbound =
+            Outbound::new(Arc::new(StaticResolver::empty()), "mx.origin.test").with_signer(signer);
+        let signed = outbound.sign(message).expect("signing does not fail");
+        assert_eq!(
+            signed, message,
+            "an ambiguous message must go out unsigned, not signed for one of its From fields"
+        );
+    }
+
+    #[test]
+    fn a_single_from_is_signed_for_its_own_domain() {
+        // The positive control for the refusal above: one `From` is signed,
+        // so the test cannot pass by signing nothing ever.
+        let signer = Signer::rsa("example.test", "ayane", FIXTURE_KEY).expect("the fixture key");
+        let outbound =
+            Outbound::new(Arc::new(StaticResolver::empty()), "mx.origin.test").with_signer(signer);
+        let message = b"From: Alice <alice@example.test>\r\n\r\nbody\r\n";
+        let signed = outbound.sign(message).expect("signing works");
+        let text = String::from_utf8_lossy(&signed);
+        assert!(text.starts_with("DKIM-Signature: "), "{text}");
+        assert!(text.contains("d=example.test"), "{text}");
     }
 }
