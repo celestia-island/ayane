@@ -35,7 +35,6 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "0BSD",
-    "CC0-1.0",
     # webpki-roots (reqwest rustls-tls root store) — permissive data
     # license, already allowed across the family (arona/chest/0721).
     "CDLA-Permissive-2.0",
@@ -109,13 +108,14 @@ name = "kirino-macro"
 expression = "LicenseRef-SySL-1.0"
 license-files = [{ path = "LICENSE", hash = 0x629cea03 }]
 
-# The family error landing (plana, git master): the same SySL 1.0 text as the
-# rows above, read from the workspace root it shares (hash = plana's own
-# LICENSE at 0.8.1, the file the sibling repos pin for the same purpose).
+# The family error landing (plana): the same SySL 1.0 text as the rows
+# above. Since plana put the crate on its release line it ships from the
+# registry, and the packaged tarball carries the workspace-root LICENSE at
+# the crate root (hash = the file plana 0.8.1 ships).
 [[licenses.clarify]]
 name = "plana-error-landing"
 expression = "LicenseRef-SySL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0xda2b7c13 }]
+license-files = [{ path = "LICENSE", hash = 0xda2b7c13 }]
 
 [[licenses.clarify]]
 name = "ring"
@@ -133,8 +133,5 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# plana's error landing is not published on crates.io, so it rides the plana
-# master branch (same allow-list entry as the sibling repos).
-allow-git = [
-    "https://github.com/celestia-island/plana",
-]
+# No git dependencies: the plana error landing joined plana's crates.io
+# release line, and the git edge this list used to allow is gone.
