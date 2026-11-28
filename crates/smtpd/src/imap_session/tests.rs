@@ -527,7 +527,7 @@ async fn sequence_numbers_are_uid_order_and_expunge_renumbers() {
 }
 
 #[tokio::test]
-async fn append_stores_the_literal_verbatim_and_returns_no_uidplus() {
+async fn append_stores_the_literal_verbatim_and_answers_appenduid() {
     let fixture = Fixture::new();
     let passwords = passwords();
     let mut session = fixture.session(Transport::Tls, &passwords);
@@ -548,8 +548,12 @@ async fn append_stores_the_literal_verbatim_and_returns_no_uidplus() {
         "the selected mailbox is told: {reply}"
     );
     assert!(
-        !reply.contains("COPYUID") && !reply.contains("APPENDUID"),
-        "UIDPLUS is not advertised: {reply}"
+        reply.contains("APPENDUID"),
+        "UIDPLUS is advertised, so the code is obligatory (RFC 4315 §3): {reply}"
+    );
+    assert!(
+        !reply.contains("COPYUID"),
+        "COPYUID belongs to COPY, not APPEND: {reply}"
     );
     let dir = fixture
         .reader

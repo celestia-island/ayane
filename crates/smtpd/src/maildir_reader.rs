@@ -768,6 +768,31 @@ impl MaildirReader {
         id: &str,
         change: FlagChange,
     ) -> Result<Renamed, ReaderError> {
+        self.set_flags_full(address, folder, id, change, None)
+    }
+
+    /// [`MaildirReader::set_flags`] with the maildir `T` (`\Deleted`) folded
+    /// into the same rename.
+    ///
+    /// The webmail has three flags and moves deleted mail instead of marking
+    /// it, so [`MaildirReader::set_flags`] covers its eight call sites with
+    /// no change — and IMAP `STORE` needs the `T` bit as part of the *same*
+    /// change: RFC 7162 §3.1 gives one `STORE` one mod-sequence, which only
+    /// holds if the whole flag set lands in one bump and one rename (the
+    /// previous two-rename shape in the IMAP session also left a half-flagged
+    /// name visible between the renames; folding the bits removes that).
+    ///
+    /// # Errors
+    ///
+    /// As [`MaildirReader::set_flags`].
+    pub fn set_flags_full(
+        &self,
+        address: &Address,
+        folder: &str,
+        id: &str,
+        change: FlagChange,
+        trashed: Option<bool>,
+    ) -> Result<Renamed, ReaderError> {
         let dir = self.folder_dir(address, folder, false)?;
         let wanted = MessageId::parse(id)?;
         let (found, path) = self.locate(&dir, &wanted, folder)?;
@@ -778,9 +803,14 @@ impl MaildirReader {
         if let Some(flagged) = change.flagged {
             flags.flagged = flagged;
         }
+        if let Some(trashed) = trashed {
+            flags.trashed = trashed;
+        }
         let target = found.with_flags(flags);
         if target.file_name() == found.file_name() {
-            // Nothing asked changed: the rename would be to the same name.
+            // Nothing asked changed: the rename would be to the same name,
+            // and RFC 7162 §3.1 says a no-op STORE must not advance the
+            // mod-sequence — so the early return here is the no-bump path.
             return Ok(Renamed {
                 from: found.file_name(),
                 to: target.file_name(),
@@ -798,6 +828,15 @@ impl MaildirReader {
                 folder.to_owned(),
             ));
         }
+        // The mod-sequence is stamped **before** the rename: a crash between
+        // the two leaves a client that re-fetches one message, never one that
+        // silently misses the change (the order contract is documented in
+        // `imap_session::modseq`). Every flag change the server makes — IMAP
+        // `STORE`, the webmail's read/star flips — goes through this one
+        // primitive, which is what keeps those records honest; renames of a
+        // `cur/` file that bypass it break the CONDSTORE contract.
+        crate::imap_session::modseq::bump(&dir, &[found.unique().to_owned()])
+            .map_err(|e| ReaderError::io(&dir, e))?;
         rename_hard(&path, &to, folder, &found)?;
         Ok(Renamed {
             from: found.file_name(),
@@ -833,6 +872,15 @@ impl MaildirReader {
                 to_folder.to_owned(),
             ));
         }
+        // RFC 7162 §3.2 counts a MOVE among the commands that must advance
+        // the source folder's mod-sequence, and the record is written before
+        // the rename (the order contract in `imap_session::modseq`): a crash
+        // in between leaves the message where it was — a planned move that
+        // did not happen — instead of a moved message no client is told
+        // about. The target side needs nothing here: its scan assigns the
+        // arriving message's mod-sequence when it first lists the folder.
+        crate::imap_session::modseq::record_expunge(&source_dir, found.unique())
+            .map_err(|e| ReaderError::io(&source_dir, e))?;
         std::fs::rename(&path, &to).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 ReaderError::Missing {
@@ -888,6 +936,15 @@ impl MaildirReader {
                 ReaderError::io(&path, e)
             }
         })?;
+        // The expunge record is written while the message is already
+        // un-listable (`tmp/`) but not yet gone — the one place the record
+        // follows the rename, because it is the *quarantine* rename that
+        // changes visibility, and record and visibility must not disagree
+        // (`imap_session::modseq`'s module documentation). A failure here
+        // propagates: the message stays in `tmp/` under a `.trash.` name
+        // rather than disappearing unrecorded.
+        crate::imap_session::modseq::record_expunge(&dir, found.unique())
+            .map_err(|e| ReaderError::io(&dir, e))?;
         fs::remove_file(&quarantine).map_err(|e| ReaderError::io(&quarantine, e))?;
         // The quarantine `tmp/` is synced, and so is the folder the file came
         // from: a crash that forgot the unlink would otherwise hand the

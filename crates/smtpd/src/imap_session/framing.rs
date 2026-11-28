@@ -77,6 +77,21 @@ pub fn read_command<R: Read>(stream: &mut R) -> io::Result<Framed> {
                 // A malformed line is skipped to its CRLF, so the next command
                 // starts where the client believes a command starts.
                 if let Some(end) = pending.windows(2).position(|window| window == b"\r\n") {
+                    // One refusal has a second chance: the extension-parameter
+                    // grammar codec 1.0 cannot frame (`SELECT … (CONDSTORE)`,
+                    // `UID EXPUNGE …`). The sidecar parser strips those
+                    // parameters; a line that decodes stripped **is** a
+                    // command, handed on as the client wrote it.
+                    if let super::ext_wire::Extraction::Parsed(_, stripped) =
+                        super::ext_wire::extract(&pending)
+                    {
+                        if CommandCodec::default().decode(&stripped).is_ok() {
+                            return Ok(Framed::Complete {
+                                bytes: pending,
+                                continuations,
+                            });
+                        }
+                    }
                     return Ok(Framed::Refused(tag_of(&pending[..end])));
                 }
             }

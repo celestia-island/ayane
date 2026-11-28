@@ -4,7 +4,9 @@
 //! Every arm here answers through [`line`] or the session's own helpers, so a
 //! reply is spelled the same whether it came from this table, from the
 //! connection half (`ImapSession::refuse_no` and friends), or from a status
-//! line.
+//! line. The extension parameters a command carried (`ExtParams`, lifted off
+//! the raw bytes by [`super::ext_wire`] before the codec ever saw the line)
+//! ride alongside the parsed command.
 
 use imap_codec::imap_types::{
     command::{Command as Wire, CommandBody},
@@ -13,13 +15,23 @@ use imap_codec::imap_types::{
 
 use crate::authn::decode_plain;
 
+use super::ext_wire::ExtParams;
 use super::session::{ImapSession, State};
 use super::wire::{astring_text, capabilities, line, name_of, state_refusal};
 use super::{Kind, Outcome};
 
 impl ImapSession<'_> {
-    /// Handle one parsed command and answer with what to write.
+    /// Handle one parsed command — with no extension parameters, as a test
+    /// table drives it — and answer with what to write.
     pub async fn handle(&mut self, command: &Wire<'_>) -> Outcome {
+        self.handle_ext(command, &ExtParams::default()).await
+    }
+
+    /// Handle one parsed command with the extension parameters its raw bytes
+    /// carried. The parameters exist outside the codec's grammar (see
+    /// [`super::ext_wire`]); every arm that can receive one ignores it unless
+    /// the grammar it belongs to has arrived.
+    pub(crate) async fn handle_ext(&mut self, command: &Wire<'_>, ext: &ExtParams) -> Outcome {
         let tag = command.tag.as_ref().to_owned();
         if self.state == State::Logout {
             return self.bad(&tag, "no commands after LOGOUT");
@@ -85,8 +97,9 @@ impl ImapSession<'_> {
                 mailbox,
                 item_names,
             } => self.status(&tag, mailbox, item_names),
-            B::Select { mailbox } => self.select(&tag, mailbox, false),
-            B::Examine { mailbox } => self.select(&tag, mailbox, true),
+            B::Select { mailbox } => self.select(&tag, mailbox, false, ext),
+            B::Examine { mailbox } => self.select(&tag, mailbox, true, ext),
+            B::Enable { capabilities } => self.enable(&tag, capabilities.as_ref()),
             B::Unselect => {
                 self.selected = None;
                 self.state = State::Authenticated;
@@ -96,7 +109,13 @@ impl ImapSession<'_> {
                 }
             }
             B::Close => self.close(&tag),
-            B::Expunge => self.expunge(&tag),
+            B::Expunge => match &ext.uid_expunge {
+                // `UID EXPUNGE <set>` arrives as a plain `EXPUNGE` the sidecar
+                // parser stripped (see `super::ext_wire`); the set is what
+                // makes it the RFC 4315 §2.1 command.
+                Some(ranges) => self.uid_expunge(&tag, ranges),
+                None => self.expunge(&tag),
+            },
             B::Append {
                 mailbox,
                 flags,
@@ -107,15 +126,25 @@ impl ImapSession<'_> {
                 sequence_set,
                 macro_or_item_names,
                 uid,
-            } => self.fetch(&tag, sequence_set, macro_or_item_names, *uid),
+            } => self.fetch(&tag, sequence_set, macro_or_item_names, *uid, ext),
             B::Store {
                 sequence_set,
                 kind,
                 response,
                 flags,
                 uid,
-            } => self.store(&tag, sequence_set, *kind, *response, flags, *uid),
-            B::Search { criteria, uid, .. } => self.search(&tag, criteria, *uid),
+            } => self.store(
+                &tag,
+                sequence_set,
+                super::store::StoreRequest {
+                    kind: *kind,
+                    response: *response,
+                    flags,
+                    uid: *uid,
+                    ext,
+                },
+            ),
+            B::Search { criteria, uid, .. } => self.search(&tag, criteria, *uid, ext),
             B::Copy {
                 sequence_set,
                 mailbox,

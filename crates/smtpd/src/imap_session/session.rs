@@ -86,6 +86,9 @@ pub(crate) struct Selected {
     pub(crate) messages: Vec<Row>,
     /// The UIDs this session announced as `\Recent`.
     pub(crate) recent: Vec<u32>,
+    /// The folder's mod-sequence watermark at the last rescan — the value
+    /// `SELECT` reported as `[HIGHESTMODSEQ]` (RFC 7162 §3.1.2.1).
+    pub(crate) highest_modseq: u64,
 }
 
 impl Selected {
@@ -164,6 +167,17 @@ pub struct ImapSession<'a> {
     /// told (a unit test driving the table) assumes it can — which is what
     /// makes [`Transport`] alone a safe default.
     pub(crate) starttls: bool,
+    /// CONDSTORE is active on this connection: an enabling command (RFC 7162
+    /// §3.1.2 — `ENABLE CONDSTORE`, a `SELECT`/`EXAMINE` with `(CONDSTORE)`,
+    /// `STATUS … HIGHESTMODSEQ`, a `MODSEQ` fetch item or search key,
+    /// `CHANGEDSINCE`, `UNCHANGEDSINCE`) has run, so every untagged FETCH
+    /// carries `MODSEQ` until the connection ends.
+    pub(crate) condstore_enabled: bool,
+    /// QRESYNC is active (RFC 7162 §3.2.2): `ENABLE QRESYNC` (which implies
+    /// CONDSTORE) has been answered positively. Before it, the `(QRESYNC …)`
+    /// SELECT parameter and the `VANISHED` fetch modifier must be answered
+    /// `BAD`, and expunges are reported as `EXPUNGE` lines, never `VANISHED`.
+    pub(crate) qresync_enabled: bool,
 }
 
 impl std::fmt::Debug for ImapSession<'_> {

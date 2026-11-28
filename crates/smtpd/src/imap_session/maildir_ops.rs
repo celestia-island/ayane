@@ -19,8 +19,8 @@ use crate::maildir_reader::{Flags, MessageId};
 
 use super::session::{By, ImapSession, Selected};
 use super::uidlist::UidMap;
-use super::wire::{line, non_zero};
-use super::{Kind, Outcome, Row};
+use super::wire::non_zero;
+use super::{Outcome, Row};
 
 impl ImapSession<'_> {
     /// The folder's messages as `(unique, file name, in_cur)`. `new/` first.
@@ -46,13 +46,33 @@ impl ImapSession<'_> {
         Ok(live)
     }
 
-    /// Rescan a folder through its table, storing the table if it grew.
+    /// Rescan a folder through its table, storing the table if it grew, and
+    /// bring the mod-sequence sidecar into step.
+    ///
+    /// The mod-sequence assignment is lazy by design (RFC 7162 §3.1 wants
+    /// APPENDs and outside mechanisms — here, SMTP delivery — to land above
+    /// the watermark without the writer knowing the table exists): a message
+    /// gets its value at the first scan that lists it, which is also where it
+    /// gets its UID. The values are sequential in scan order, so "newer than
+    /// everything before it" holds by construction.
     pub(crate) fn scan(&self, dir: &Path, map: &mut UidMap) -> io::Result<Vec<Row>> {
         let before = map.clone();
         let list = map.sync(&Self::live(dir)?);
         if *map != before {
             map.store(dir)?;
         }
+        let live: Vec<String> = list
+            .iter()
+            .filter_map(|(uid, _, _)| map.name_of(*uid).map(str::to_owned))
+            .collect();
+        let live_set: std::collections::HashSet<&str> = live.iter().map(String::as_str).collect();
+        let dead: Vec<String> = map
+            .lines
+            .iter()
+            .map(|(_, unique)| unique.clone())
+            .filter(|unique| !live_set.contains(unique.as_str()))
+            .collect();
+        super::modseq::scan_sync(dir, &live, &dead)?;
         Ok(list)
     }
 
@@ -103,12 +123,21 @@ impl ImapSession<'_> {
             draft: flags.contains(&Flag::Draft),
         };
         // RFC 3501 §6.3.11 lets APPEND carry a message with no header at all,
-        // so the bytes are stored as they arrived.
-        let Some(uid) = self
+        // so the bytes are stored as they arrived. The census that follows is
+        // what gives the message both its UID and — through the mod-sequence
+        // assignment that scan performs — its CONDSTORE value.
+        let Some((validity, uid)) = self
             .reader
             .append(&self.mailbox, &folder, bytes, wanted)
             .ok()
-            .and_then(|name| self.census(&folder).ok()?.map.uid_of(&name))
+            .and_then(|name| {
+                self.census(&folder).ok().and_then(|census| {
+                    census
+                        .map
+                        .uid_of(&name)
+                        .map(|uid| (census.map.validity, uid))
+                })
+            })
         else {
             return self.no(tag, "cannot append");
         };
@@ -131,12 +160,13 @@ impl ImapSession<'_> {
             });
             out.extend(self.untagged(&Data::Exists(messages.len() as u32)));
         }
-        out.extend(line(
+        // RFC 4315 §3: advertising UIDPLUS obliges the code — the plain
+        // `(UID n)` text it replaces was advisory only.
+        out.extend(super::uidplus::append_ok(
             tag,
-            Kind::Ok,
-            None,
-            &format!("APPEND completed (UID {uid})"),
-            true,
+            non_zero(validity).get(),
+            uid,
+            "APPEND completed",
         ));
         Outcome {
             out,

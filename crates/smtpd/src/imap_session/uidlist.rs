@@ -23,6 +23,8 @@ use super::{Row, UIDLIST};
 /// watermark the next UID comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UidMap {
+    /// The folder's `UIDVALIDITY`, minted once and persisted with the table.
+    pub validity: u32,
     /// The next UID to hand out. Never decreases.
     pub next: u32,
     /// `(uid, unique name)`, ascending by UID.
@@ -30,9 +32,12 @@ pub struct UidMap {
 }
 
 impl Default for UidMap {
-    /// An empty table: the first UID is `1`.
+    /// An empty table for a folder that has none yet: the first UID is `1`
+    /// and the validity is the degenerate `1` — callers that hold a directory
+    /// mint the real one through [`UidMap::for_dir`].
     fn default() -> Self {
         Self {
+            validity: 1,
             next: 1,
             lines: Vec::new(),
         }
@@ -46,29 +51,47 @@ impl UidMap {
         dir.join(UIDLIST)
     }
 
-    /// Read the table, or an empty one when the folder has never had a
-    /// session (a folder only SMTP has written to, or a fresh one). A line
-    /// that does not parse is skipped, not fatal.
+    /// Read the table (minting the validity from the directory when the file
+    /// carries no persisted one yet), or an empty one when the folder has
+    /// never had a session. A line that does not parse is skipped, not
+    /// fatal — including a `v` line whose value is not a number.
     ///
     /// # Errors
     ///
     /// Returns [`io::Error`] when the file exists and cannot be read.
     pub fn load(dir: &Path) -> io::Result<Self> {
         let raw = match fs::read_to_string(Self::path(dir)) {
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    validity: uid_validity(dir),
+                    ..Self::default()
+                })
+            }
             other => other?,
         };
-        let mut map = Self::default();
+        let mut map = Self {
+            validity: uid_validity(dir),
+            ..Self::default()
+        };
         for line in raw.lines() {
-            let Some((Ok(uid), Some(name))) = line
-                .split_once(' ')
-                .map(|(uid, name)| (uid.parse::<u32>(), Some(name)))
-            else {
-                continue;
-            };
-            if uid > 0 && MessageId::parse(name).is_ok() {
-                map.next = map.next.max(uid.saturating_add(1));
-                map.lines.push((uid, unique_of(name)));
+            match line.split_once(' ') {
+                // The persisted `UIDVALIDITY`, if this file carries one.
+                Some(("v", value)) => {
+                    if let Ok(validity) = value.trim().parse::<u32>() {
+                        map.validity = validity.max(1);
+                    }
+                }
+                Some((uid, name)) => {
+                    if let (Ok(uid), Ok(())) =
+                        (uid.parse::<u32>(), MessageId::parse(name).map(|_| ()))
+                    {
+                        if uid > 0 {
+                            map.next = map.next.max(uid.saturating_add(1));
+                            map.lines.push((uid, unique_of(name)));
+                        }
+                    }
+                }
+                None => {}
             }
         }
         map.lines.sort_unstable();
@@ -137,11 +160,10 @@ impl UidMap {
     /// something it did not record.
     pub fn store(&self, dir: &Path) -> io::Result<()> {
         fs::create_dir_all(dir)?;
-        let text: String = self
-            .lines
-            .iter()
-            .map(|(uid, name)| format!("{uid} {name}\n"))
-            .collect();
+        let mut text = format!("v {}\n", self.validity.max(1));
+        for (uid, name) in &self.lines {
+            text.push_str(&format!("{uid} {name}\n"));
+        }
         let tmp = dir.join(format!("{UIDLIST}.tmp"));
         let mut file = fs::File::create(&tmp)?;
         io::Write::write_all(&mut file, text.as_bytes())?;
@@ -157,9 +179,10 @@ fn unique_of(name: &str) -> String {
     MessageId::parse(name).map_or_else(|_| name.to_owned(), |id| id.unique().to_owned())
 }
 
-/// The folder's `UIDVALIDITY`: a digest of the directory's identity and
-/// creation stamp — stable for the life of the maildir, different for a new
-/// one at the same path, and `1` for a folder that does not exist yet.
+/// The folder's `UIDVALIDITY` as minted for a directory that carries no
+/// persisted one yet: a digest of the directory's identity and creation
+/// stamp, `1` for a folder that does not exist yet. See the module
+/// documentation for why the value is persisted once minted.
 #[must_use]
 pub fn uid_validity(dir: &Path) -> u32 {
     let Ok(meta) = fs::metadata(dir) else {

@@ -15,14 +15,28 @@
 //! | `imap_session.rs` | the shared vocabulary: constants, `Row`, `Kind` |
 //! | [`session`] | §3's states, the selection, and [`ImapSession`] |
 //! | `heading` | the greeting and the connection half of §3 |
-//! | `lifecycle` | `LIST`, `STATUS`, `SELECT`, `EXPUNGE`, the re-scan |
+//! | `lifecycle` | `LIST`, `STATUS`, `SELECT`, and the re-scan |
+//! | `expunge` | `EXPUNGE`, `UID EXPUNGE`, the `CLOSE` sweep, and how a
+//!   removal is reported (`* n EXPUNGE` or `* VANISHED`) |
 //! | `commands` | the dispatcher: one command in, one answer out |
+//! | `store` | `STORE`, and the `UNCHANGEDSINCE` conditions on it |
+//! | `store` | `STORE`, and the `UNCHANGEDSINCE` conditions on it |
 //! | `maildir_ops` | the maildir side: the UID table in step, `APPEND` |
 //! | `query` | `FETCH`, `STORE`, `SEARCH`, `COPY`/`MOVE` |
 //! | `render` | one message's data items, and the `SEARCH` keys |
 //! | [`framing`] | the literal reader a client's command arrives through |
 //! | `wire` | reply lines, capabilities, and the octet helpers |
 //! | `uidlist` | a folder's UID table and its `UIDVALIDITY` |
+//! | `qresync` | the RFC 7162 §3.2 SELECT parameter and the initial sync |
+//! | `ext_scan` | the byte-level scanner the parameter parsers run on |
+//! | `ext_lines` | the extension lines the codec cannot encode |
+//! | `qresync` | the RFC 7162 §3.2 SELECT parameter and the initial sync |
+//! | `ext_scan` | the byte-level scanner the parameter parsers run on |
+//! | `ext_lines` | the extension lines the codec cannot encode |
+//! | [`modseq`] | a folder's mod-sequence sidecar (`ayane-modseq`) |
+//! | `ext_wire` | the extension parameters the codec cannot parse, and the
+//!   extension lines it cannot encode (see its module documentation) |
+//! | `uidplus` | the UIDPLUS answers: `APPENDUID`, `COPYUID`, `UID EXPUNGE` |
 //!
 //! # The state machine
 //!
@@ -56,23 +70,35 @@
 //!
 //! # Not here
 //!
-//! `CONDSTORE`/`QRESYNC`, ACLs, quotas, `IMAP4rev2`, `UIDPLUS` and binary
-//! literals are not advertised and not implemented (a client asking is answered
-//! `NO`/`BAD`, never mis-served). `LITERAL+` and `MOVE` are advertised: a client
-//! only uses a non-sync literal when offered it, and moving is what a mail
-//! client does to every message it files.
+//! ACLs, quotas, `IMAP4rev2` and binary literals are not advertised and not
+//! implemented (a client asking is answered `NO`/`BAD`, never mis-served).
+//! `LITERAL+` and `MOVE` are advertised: a client only uses a non-sync
+//! literal when offered it, and moving is what a mail client does to every
+//! message it files. `UIDPLUS`, `CONDSTORE` and `QRESYNC` are advertised
+//! and implemented — CONDSTORE/QRESYNC by the enabling commands of RFC
+//! 7162 §3.1.2/§3.2.2, UIDPLUS unconditionally (`APPENDUID`, `COPYUID`,
+//! `UID EXPUNGE`); `IMAP4REV2` is deliberately not declared: RFC 9051
+//! Appendix E's mandatory items are a project of their own.
 
 use ayane_proto::Address;
 
 mod commands;
+pub(crate) mod expunge;
+pub(crate) mod ext_lines;
+pub(crate) mod ext_scan;
+pub(crate) mod ext_wire;
 pub mod framing;
 mod heading;
 mod lifecycle;
 mod maildir_ops;
+pub(crate) mod modseq;
+mod qresync;
 mod query;
 mod render;
 pub mod session;
+mod store;
 mod uidlist;
+pub(crate) mod uidplus;
 mod wire;
 
 pub use framing::{announcement_of, read_command, Framed};
