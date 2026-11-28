@@ -423,7 +423,98 @@ fn an_assigned_uid_is_never_reassigned() {
     );
     map.store(dir.path()).expect("the table is written");
     let reloaded = UidMap::load(dir.path()).expect("the table is read back");
-    assert_eq!(reloaded, map, "the table round-trips");
+    assert_eq!(reloaded.lines, map.lines, "the table round-trips");
+    assert_eq!(reloaded.next, map.next, "the watermark round-trips");
+    assert_eq!(reloaded.validity, map.validity, "the validity round-trips");
+    assert!(
+        reloaded.validity_persisted,
+        "the stored file carries the validity line"
+    );
+}
+
+/// The one path where a rotation could be undone by the scan's own store: the
+/// sidecar is lost *and* new mail arrives before the next scan, so the table
+/// grows in the very pass that must rotate it. The table is read before the
+/// rotation, so the store that follows would put the stale validity back —
+/// a QRESYNC client would then keep mod-sequence state this server rebuilt.
+#[tokio::test]
+async fn a_lost_sidecar_rotates_even_when_the_same_scan_takes_new_mail() {
+    let fixture = Fixture::new();
+    let passwords = passwords();
+    let session = fixture.session(Transport::Tls, &passwords);
+    let dir = fixture
+        .reader
+        .folder_dir(&fixture.mailbox, INBOX, true)
+        .expect("the maildir exists");
+    // The CONDSTORE era: one scan persisted the table *and* the sidecar.
+    fixture.deliver("a.msg", "first");
+    let mut map = UidMap::load(&dir).expect("load");
+    session.scan(&dir, &mut map).expect("the first scan");
+    let persisted = UidMap::load(&dir).expect("reload");
+    assert!(
+        persisted.validity_persisted,
+        "the first scan froze the minted validity"
+    );
+    // A crash loses the sidecar only, and a message lands before the next
+    // scan sees the folder.
+    std::fs::remove_file(modseq::ModSeqTable::path(&dir)).expect("sidecar removed");
+    fixture.deliver("b.msg", "second");
+    let mut map = UidMap::load(&dir).expect("load");
+    session
+        .scan(&dir, &mut map)
+        .expect("the scan after the loss");
+    let rotated = persisted.validity.wrapping_add(1).max(2);
+    assert_eq!(
+        map.validity, rotated,
+        "the scan answers the rotated validity (§5.3)"
+    );
+    let stored = UidMap::load(&dir).expect("reload");
+    assert_eq!(
+        stored.validity, rotated,
+        "and the scan's own store does not put the stale value back"
+    );
+    assert_eq!(stored.lines.len(), 2, "the new message still got its UID");
+    assert_eq!(stored.lines[1].1, "b.msg", "in scan order");
+    // Once is enough: the rebuilt sidecar ends the fresh state.
+    let mut map = UidMap::load(&dir).expect("load");
+    session.scan(&dir, &mut map).expect("the third scan");
+    assert_eq!(map.validity, rotated, "a later scan rotates nothing");
+}
+
+/// The other half of that ordering: a table written before CONDSTORE existed
+/// (no `v` line) is an **upgrade**, not a loss, so the scan must not rotate
+/// it. The store has to come after the sync for that: a table stored first
+/// would already carry a persisted validity when the sync looks at it, and
+/// the upgrade would be mistaken for a lost sidecar.
+#[tokio::test]
+async fn an_upgrade_keeps_the_identity_through_the_scan() {
+    let fixture = Fixture::new();
+    let passwords = passwords();
+    let session = fixture.session(Transport::Tls, &passwords);
+    let dir = fixture
+        .reader
+        .folder_dir(&fixture.mailbox, INBOX, true)
+        .expect("the maildir exists");
+    fixture.deliver("a.msg", "first");
+    fixture.deliver("b.msg", "second");
+    // A pre-CONDSTORE table: message lines, no persisted validity, and `b`
+    // not yet mapped — so the scan that adopts the sidecar also grows the
+    // table, which is the store that would run first in the wrong order.
+    std::fs::write(UidMap::path(&dir), "1 a.msg\n").expect("write");
+    let minted = UidMap::load(&dir).expect("load").validity;
+    let mut map = UidMap::load(&dir).expect("load");
+    session.scan(&dir, &mut map).expect("the adopting scan");
+    let stored = UidMap::load(&dir).expect("reload");
+    assert_eq!(
+        stored.validity, minted,
+        "an upgrade keeps the folder's identity"
+    );
+    assert!(
+        stored.validity_persisted,
+        "and the minted value is frozen into the file"
+    );
+    assert_eq!(map.validity, minted, "the answer agrees with the file");
+    assert_eq!(stored.lines.len(), 2, "the unmapped message got its UID");
 }
 
 #[test]
@@ -527,7 +618,7 @@ async fn sequence_numbers_are_uid_order_and_expunge_renumbers() {
 }
 
 #[tokio::test]
-async fn append_stores_the_literal_verbatim_and_returns_no_uidplus() {
+async fn append_stores_the_literal_verbatim_and_answers_appenduid() {
     let fixture = Fixture::new();
     let passwords = passwords();
     let mut session = fixture.session(Transport::Tls, &passwords);
@@ -548,8 +639,12 @@ async fn append_stores_the_literal_verbatim_and_returns_no_uidplus() {
         "the selected mailbox is told: {reply}"
     );
     assert!(
-        !reply.contains("COPYUID") && !reply.contains("APPENDUID"),
-        "UIDPLUS is not advertised: {reply}"
+        reply.contains("APPENDUID"),
+        "UIDPLUS is advertised, so the code is obligatory (RFC 4315 §3): {reply}"
+    );
+    assert!(
+        !reply.contains("COPYUID"),
+        "COPYUID belongs to COPY, not APPEND: {reply}"
     );
     let dir = fixture
         .reader

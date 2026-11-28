@@ -1,25 +1,28 @@
 //! The lifecycle commands that do not touch a message: `LIST`, `STATUS`,
-//! `SELECT`/`EXAMINE`, `UNSELECT`, `CLOSE`, `EXPUNGE` and the re-scan a
-//! `NOOP`/`CHECK` performs.
-
-use std::borrow::Cow;
+//! `SELECT`/`EXAMINE` — with the CONDSTORE/QRESYNC parameters RFC 7162 §3.1.8
+//! and §3.2.5 hang off them — `UNSELECT`, `ENABLE`, and the re-scan a
+//! `NOOP`/`CHECK` performs. `EXPUNGE`, `UID EXPUNGE` and the `CLOSE` sweep
+//! live in [`super::expunge`].
 
 use imap_codec::imap_types::{
+    extensions::enable::CapabilityEnable,
     flag::FlagPerm,
     mailbox::{ListMailbox, Mailbox},
     response::Code,
     response::{Data, Response, Status},
     status::StatusDataItemName,
 };
+use std::borrow::Cow;
 
-use crate::maildir_reader::{MessageId, INBOX};
+use crate::maildir_reader::INBOX;
 
+use super::ext_wire::{self, ExtParams};
+use super::modseq;
+use super::qresync::QresyncParam;
 use super::session::{Folder, ImapSession, Selected, State, Transport};
-use super::uidlist::{uid_validity, UidMap};
-use super::wire::{
-    bad, capabilities, encode, glob, is_deleted, line, non_zero, status_value, system_flags,
-};
-use super::{answer, Kind, Outcome, Row, BAD_MAILBOX, NO_MAILBOX, READ_ONLY, UIDLIST};
+use super::uidlist::UidMap;
+use super::wire::{bad, capabilities, encode, glob, line, non_zero, status_value, system_flags};
+use super::{answer, Kind, Outcome, BAD_MAILBOX, NO_MAILBOX, UIDLIST};
 
 impl ImapSession<'_> {
     pub(crate) fn untagged(&self, data: &Data<'_>) -> Vec<u8> {
@@ -182,9 +185,22 @@ impl ImapSession<'_> {
         items: &[StatusDataItemName],
     ) -> Outcome {
         let (folder, Folder { dir, map, messages }) = answer!(self.census_of(tag, mailbox));
+        // RFC 7162 §3.1.2: `STATUS … (HIGHESTMODSEQ)` is a CONDSTORE enabling
+        // command, so the one-time notice rides in front of the answer.
+        let want_highest = items
+            .iter()
+            .any(|item| matches!(item, StatusDataItemName::HighestModSeq));
+        let notice = if want_highest {
+            self.enable_condstore()
+        } else {
+            Vec::new()
+        };
         let Some(mapped) = items
             .iter()
-            .map(|item| status_value(item, &dir, &map, &messages))
+            // The codec 1.0 status item list has no HIGHESTMODSEQ member —
+            // the value is appended to the rendered line below.
+            .filter(|item| !matches!(item, StatusDataItemName::HighestModSeq))
+            .map(|item| status_value(item, &map, &messages))
             .collect::<Option<Vec<_>>>()
         else {
             return self.bad(tag, "that status item is not supported here");
@@ -192,17 +208,47 @@ impl ImapSession<'_> {
         let Ok(name) = Mailbox::try_from(folder) else {
             return self.bad(tag, BAD_MAILBOX);
         };
-        self.reply(
-            tag,
-            "STATUS",
-            Data::Status {
-                mailbox: name,
-                items: Cow::Owned(mapped),
-            },
-        )
+        let mut line = self.untagged(&Data::Status {
+            mailbox: name,
+            items: Cow::Owned(mapped),
+        });
+        if want_highest {
+            let highest = modseq::table(&dir).map_or(0, |table| table.highest());
+            // RFC 7162 §3.1.7: a mailbox with persistent mod-sequences
+            // answers its true value (never `0`, never `NOMODSEQ`).
+            ext_wire::insert_before_close(&mut line, &format!(" HIGHESTMODSEQ {highest}"));
+        }
+        let mut out = notice;
+        out.extend(line);
+        out.extend(self.ok(tag, "STATUS completed"));
+        Outcome {
+            out,
+            ..Outcome::default()
+        }
     }
 
-    pub(crate) fn select(&mut self, tag: &str, mailbox: &Mailbox<'_>, read_only: bool) -> Outcome {
+    /// `SELECT`/`EXAMINE`, with the RFC 7162 §3.1.8 / §3.2.5 parameters when
+    /// the client sent them.
+    ///
+    /// The order of what comes back is load-bearing: `[CLOSED]` first (RFC
+    /// 7162 §3.2.11 — once CONDSTORE or QRESYNC is advertised, a change of
+    /// mailbox announces the old one is closed), then RFC 3501 §6.3.2's own
+    /// untagged run, then `[HIGHESTMODSEQ]`, then — for a QRESYNC parameter
+    /// whose UIDVALIDITY matches — the `VANISHED (EARLIER)` line **before**
+    /// the changed-message FETCH lines it summarizes (RFC 7162 §3.2.5).
+    pub(crate) fn select(
+        &mut self,
+        tag: &str,
+        mailbox: &Mailbox<'_>,
+        read_only: bool,
+        ext: &ExtParams,
+    ) -> Outcome {
+        // RFC 7162 §3.2.2: the parameter is refused until `ENABLE QRESYNC`
+        // was answered positively — and refused *before* any mailbox is
+        // opened (§3.2.5.1: a syntax problem never selects).
+        if ext.select_qresync.is_some() && !self.qresync_enabled {
+            return self.bad(tag, "QRESYNC parameter is only valid after ENABLE QRESYNC");
+        }
         let (folder, Folder { dir, map, messages }) = answer!(self.census_of(tag, mailbox));
         let recent: Vec<u32> = messages
             .iter()
@@ -213,16 +259,26 @@ impl ImapSession<'_> {
             .iter()
             .position(|(_, _, in_cur)| !in_cur)
             .and_then(|i| u32::try_from(i + 1).ok());
-        let validity = non_zero(uid_validity(&dir));
-        self.selected = Some(Selected {
+        let selected = Selected {
             folder: folder.clone(),
-            dir,
+            dir: dir.clone(),
             read_only,
             messages: messages.clone(),
             recent: recent.clone(),
-        });
+            highest_modseq: modseq::table(&dir).map_or(1, |table| table.highest()),
+        };
+        let mut out = Vec::new();
+        if self.selected.is_some() {
+            out.extend(ext_wire::closed_line());
+        }
+        // `(CONDSTORE)` and `(QRESYNC …)` are enabling commands (§3.1.2,
+        // §3.2.2) — flipped before the responses that carry mod-sequences.
+        if ext.select_condstore || ext.select_qresync.is_some() {
+            self.condstore_enabled = true;
+        }
+        self.selected = Some(selected.clone());
         self.state = State::Selected;
-        let mut out = self.untagged(&Data::Flags(system_flags()));
+        out.extend(self.untagged(&Data::Flags(system_flags())));
         let mut permanent: Vec<FlagPerm<'static>> =
             system_flags().into_iter().map(FlagPerm::Flag).collect();
         permanent.push(FlagPerm::Asterisk);
@@ -232,8 +288,17 @@ impl ImapSession<'_> {
         if let Some(first) = first_unseen {
             out.extend(self.notice(Code::Unseen(non_zero(first)), "First unseen"));
         }
-        out.extend(self.notice(Code::UidValidity(validity), "UIDs valid"));
+        out.extend(self.notice(Code::UidValidity(non_zero(map.validity)), "UIDs valid"));
         out.extend(self.notice(Code::UidNext(non_zero(map.next)), "Predicted next UID"));
+        // RFC 7162 §3.1.2.1: the code rides every SELECT/EXAMINE once
+        // CONDSTORE is active on the connection — via the parameter here, or
+        // because an earlier enabling command already woke it.
+        if self.condstore_enabled {
+            out.extend(ext_wire::highestmodseq_line(selected.highest_modseq));
+        }
+        if let Some(qresync) = &ext.select_qresync {
+            out.extend(self.qresync_initial_sync(&selected, &map, qresync));
+        }
         out.extend(line(
             tag,
             Kind::Ok,
@@ -251,111 +316,105 @@ impl ImapSession<'_> {
         }
     }
 
-    pub(crate) fn close(&mut self, tag: &str) -> Outcome {
-        let mut out = Vec::new();
-        if let Some(selected) = self.selected.take().filter(|selected| !selected.read_only) {
-            out.extend(self.expunge_now(&selected));
-        }
-        self.state = State::Authenticated;
-        out.extend(self.ok(tag, "CLOSE completed"));
-        Outcome {
-            out,
-            ..Outcome::default()
-        }
-    }
-
-    pub(crate) fn expunge(&mut self, tag: &str) -> Outcome {
-        let Some(selected) = self.selected.clone() else {
-            return self.bad(tag, NO_MAILBOX);
-        };
-        if selected.read_only {
-            return self.no(tag, READ_ONLY);
-        }
-        let Ok(messages) = self.rescan(&selected) else {
-            return self.no(tag, "cannot rescan");
-        };
-        let selected = selected.with(messages);
-        let mut out = self.expunge_now(&selected);
-        let kept: Vec<Row> = selected
-            .messages
-            .iter()
-            .filter(|(_, name, _)| !is_deleted(name))
-            .cloned()
-            .collect();
-        let recent = selected
-            .recent
-            .iter()
-            .copied()
-            .filter(|uid| kept.iter().any(|(it, _, _)| it == uid))
-            .collect();
-        self.selected = Some(Selected {
-            messages: kept,
-            recent,
-            ..selected
-        });
-        out.extend(self.ok(tag, "EXPUNGE completed"));
-        Outcome {
-            out,
-            ..Outcome::default()
-        }
-    }
-
-    /// Remove every `\Deleted` message, lowest number first — the order that
-    /// makes each untagged `EXPUNGE` describe the list as the client now holds
-    /// it (a message's number when it goes is its original position minus the
-    /// ones already gone, counting itself).
-    fn expunge_now(&self, selected: &Selected) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut removed = 0u32;
-        for (index, (_, name, _)) in selected.messages.iter().enumerate() {
-            let Some(id) = MessageId::parse(name).ok().filter(|id| id.flags().trashed) else {
-                continue;
+    /// `ENABLE` (RFC 5161): acknowledges the extensions this server really
+    /// switched on, ignores the rest (RFC 5161 §3.1: unknown parameters are
+    /// answered, never refused).
+    ///
+    /// `QRESYNC` implies CONDSTORE (RFC 7162 §3.2.2); until the untagged
+    /// `ENABLED` below goes out, the `(QRESYNC …)` SELECT parameter and the
+    /// `VANISHED` fetch modifier must answer `BAD`.
+    pub(crate) fn enable(&mut self, tag: &str, requested: &[CapabilityEnable<'_>]) -> Outcome {
+        let mut enabled: Vec<CapabilityEnable<'static>> = Vec::new();
+        let mut notice = Vec::new();
+        for item in requested {
+            // The codec spells `QRESYNC` as an unknown-capability atom at
+            // 1.0 (it has no QRESYNC variant); its `Display` is the text the
+            // client sent, so the name is read off that.
+            let name = match item {
+                CapabilityEnable::CondStore => "CONDSTORE".to_owned(),
+                CapabilityEnable::Other(_) => item.to_string(),
+                CapabilityEnable::Utf8(_) => continue,
+                // `#[non_exhaustive]` upstream: a future variant is ignored,
+                // exactly as RFC 5161 §3.1 asks of unknown parameters.
+                _ => continue,
             };
-            if self
-                .reader
-                .purge(&self.mailbox, &selected.folder, &id.file_name())
-                .is_err()
-            {
-                continue;
-            }
-            removed += 1;
-            if let Ok(original) = u32::try_from(index + 1) {
-                out.extend(self.untagged(&Data::Expunge(non_zero(
-                    original.saturating_sub(removed - 1),
-                ))));
-            }
-        }
-        out
-    }
-
-    /// Rescan the selection, announce mail another process wrote, and answer.
-    pub(crate) fn refresh(&mut self, tag: &str) -> Outcome {
-        let mut out = Vec::new();
-        if let Some(selected) = self.selected.clone() {
-            if let Ok(messages) = self.rescan(&selected) {
-                let grew = messages.len() > selected.messages.len();
-                let mut recent = selected.recent.clone();
-                recent.extend(
-                    messages
-                        .iter()
-                        .map(|(uid, _, _)| *uid)
-                        .filter(|uid| !selected.is_recent(*uid)),
-                );
-                self.selected = Some(Selected {
-                    messages: messages.clone(),
-                    recent: recent.clone(),
-                    ..selected
-                });
-                if grew {
-                    out.extend(self.untagged(&Data::Exists(messages.len() as u32)));
-                    out.extend(self.untagged(&Data::Recent(recent.len() as u32)));
+            match name.to_ascii_uppercase().as_str() {
+                "CONDSTORE" => {
+                    if !self.condstore_enabled {
+                        notice = self.enable_condstore();
+                    }
+                    enabled.push(CapabilityEnable::CondStore);
                 }
+                "QRESYNC" => {
+                    // RFC 7162 §3.2.2: QRESYNC turns CONDSTORE on with it.
+                    self.qresync_enabled = true;
+                    notice = self.enable_condstore();
+                    enabled.push(CapabilityEnable::try_from("QRESYNC").expect("an atom"));
+                }
+                // RFC 5161 §3.1: an unknown parameter is ignored, and the
+                // `ENABLED` answer lists only what was really enabled.
+                _ => {}
             }
         }
-        out.extend(self.ok(tag, "NOOP completed"));
+        let mut out = self.untagged(&Data::Enabled {
+            capabilities: enabled,
+        });
+        out.extend(notice);
+        out.extend(self.ok(tag, "ENABLE completed"));
         Outcome {
             out,
             ..Outcome::default()
         }
+    }
+
+    /// Marks CONDSTORE active and answers RFC 7162 §3.1.2.1's one-time
+    /// notice — an untagged `* OK [HIGHESTMODSEQ n]` for the client that
+    /// enabled late and was not there for its `SELECT`'s own code. Empty
+    /// bytes when the connection is already enabled or has no mailbox open.
+    pub(crate) fn enable_condstore(&mut self) -> Vec<u8> {
+        if self.condstore_enabled {
+            return Vec::new();
+        }
+        self.condstore_enabled = true;
+        match &self.selected {
+            Some(selected) => match modseq::table(&selected.dir) {
+                Ok(table) => ext_wire::highestmodseq_line(table.highest()),
+                Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        }
+    }
+
+    /// RFC 7162 §3.2.5's initial synchronization for a matching QRESYNC
+    /// parameter: the `VANISHED (EARLIER)` line first, then one FETCH line
+    /// per message that changed since the client's mod-sequence. A
+    /// UIDVALIDITY mismatch ignores the parameters whole (§3.2.5.1) — the
+    /// client is answered by the plain SELECT run above.
+    fn qresync_initial_sync(
+        &self,
+        selected: &Selected,
+        map: &UidMap,
+        qresync: &QresyncParam,
+    ) -> Vec<u8> {
+        if map.validity != qresync.uidvalidity {
+            return Vec::new();
+        }
+        let known = qresync
+            .known_uids
+            .clone()
+            .unwrap_or_else(|| vec![(1, map.next.saturating_sub(1).max(1))]);
+        let mut out = Vec::new();
+        let vanished = self.vanished_earlier_uids(
+            selected,
+            map,
+            qresync.modseq,
+            Some(&known),
+            qresync.seq_match.as_ref(),
+        );
+        if !vanished.is_empty() {
+            out.extend(ext_wire::vanished_line(&vanished, true));
+        }
+        out.extend(self.changed_fetch_lines(selected, qresync.modseq, Some(&known)));
+        out
     }
 }

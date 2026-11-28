@@ -81,6 +81,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use crate::authn::PasswordVerifier;
+use crate::imap_session::ext_wire::{self, ExtParams};
 use crate::imap_session::{ImapSession, Outcome, Transport, MAX_COMMAND_BYTES, MAX_LINE_BYTES};
 use crate::maildir_reader::MaildirReader;
 use crate::server::{PerIpLimiter, ServerError};
@@ -342,14 +343,37 @@ impl Connection {
     /// Asks the session about one command, writes its answer, and says whether
     /// the connection ends here.
     ///
-    /// Every command that reaches this point has been framed and decoded —
+    /// Every command that reaches this point has been framed — and decoded:
     /// `Connection::read_command` answers a line the codec refuses itself,
     /// because that is the only place the tag and the stream are both in
-    /// hand — so the decode here cannot fail. If it ever did, closing the
+    /// hand. The one exception is the extension-parameter grammar codec 1.0
+    /// cannot frame (`SELECT … (CONDSTORE)`, `FETCH … (CHANGEDSINCE …)`,
+    /// `UID EXPUNGE …`): [`ext_wire::extract`] lifted those off the raw bytes
+    /// during framing and read_command accepted the stripped remainder, so
+    /// the lift runs again here — the bytes this function receives are the
+    /// client's, and the parameters are parsed from exactly what it sent. A
+    /// line the sidecar recognises but cannot parse is refused whole: a
+    /// `UID EXPUNGE` whose set did not parse must not quietly become an
+    /// `EXPUNGE`. If the decode ever failed regardless, closing the
     /// connection is the honest answer: a session handed a command nobody
     /// parsed would be answered from state that does not describe it.
     async fn answer(&mut self, bytes: &[u8]) -> Result<bool, ServerError> {
-        let Ok((_, command)) = CommandCodec::default().decode(bytes) else {
+        let (decoded, ext) = match ext_wire::extract(bytes) {
+            ext_wire::Extraction::None => (std::borrow::Cow::Borrowed(bytes), ExtParams::default()),
+            ext_wire::Extraction::Parsed(params, stripped) => {
+                (std::borrow::Cow::Owned(stripped), params)
+            }
+            ext_wire::Extraction::Malformed => {
+                let line = format!(
+                    "{} BAD extension parameters could not be parsed\r\n",
+                    tag_of(bytes)
+                );
+                self.stream.write_all(line.as_bytes()).await?;
+                self.stream.flush().await?;
+                return Ok(false);
+            }
+        };
+        let Ok((_, command)) = CommandCodec::default().decode(&decoded) else {
             return Err(ServerError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "a framed command did not decode",
@@ -358,7 +382,7 @@ impl Connection {
         // A `STARTTLS` is the one answer this layer acts on rather than writes
         // through: the line goes out, and then the socket becomes TLS.
         let outcome = match &mut self.session {
-            Some(session) => session.handle(&command).await,
+            Some(session) => session.handle_ext(&command, &ext).await,
             None => self.before_login(&command).await,
         };
         self.stream.write_all(&outcome.out).await?;
@@ -626,7 +650,23 @@ impl Connection {
                 // refusal: it is answered when the CRLF says the client meant
                 // it. Answering earlier would tear the line the client is still
                 // writing out from under it.
+                // One refusal has a second chance: the extension-parameter
+                // grammar codec 1.0 cannot frame (`SELECT … (CONDSTORE)`,
+                // `FETCH … (CHANGEDSINCE …)`, `UID EXPUNGE …`). The sidecar
+                // parser strips those parameters, and a line that decodes
+                // stripped **is** a command — the original bytes are handed
+                // on untouched, and `Connection::answer` lifts the parameters
+                // from them again.
                 Err(CommandDecodeError::Failed) if self.command.ends_with(b"\r\n") => {
+                    if let ext_wire::Extraction::Parsed(_, stripped) =
+                        ext_wire::extract(&self.command)
+                    {
+                        if CommandCodec::default().decode(&stripped).is_ok() {
+                            return Ok(Pasted::Complete {
+                                bytes: std::mem::take(&mut self.command),
+                            });
+                        }
+                    }
                     // RFC 3501 §7.1: the tag is the client's, and this is the
                     // one path that answers before the session is asked.
                     let mut out = format!(

@@ -32,6 +32,8 @@ impl<'a> ImapSession<'a> {
             selected: None,
             passwords,
             starttls: true,
+            condstore_enabled: false,
+            qresync_enabled: false,
         }
     }
 
@@ -64,9 +66,15 @@ impl<'a> ImapSession<'a> {
     #[must_use]
     pub fn capabilities(&self) -> &'static str {
         match (self.transport, self.starttls) {
-            (Transport::Clear, true) => "IMAP4rev1 STARTTLS LOGINDISABLED MOVE LITERAL+",
-            (Transport::Clear, false) => "IMAP4rev1 LOGINDISABLED MOVE LITERAL+",
-            (Transport::Tls, _) => "IMAP4rev1 AUTH=PLAIN MOVE LITERAL+",
+            (Transport::Clear, true) => {
+                "IMAP4rev1 STARTTLS LOGINDISABLED MOVE LITERAL+ ENABLE UIDPLUS CONDSTORE QRESYNC"
+            }
+            (Transport::Clear, false) => {
+                "IMAP4rev1 LOGINDISABLED MOVE LITERAL+ ENABLE UIDPLUS CONDSTORE QRESYNC"
+            }
+            (Transport::Tls, _) => {
+                "IMAP4rev1 AUTH=PLAIN MOVE LITERAL+ ENABLE UIDPLUS CONDSTORE QRESYNC"
+            }
         }
     }
 

@@ -20,7 +20,12 @@ memchr = { workspace = true }
 # IMAP command/response codec (the IMAP4rev1 grammar). 1.0 is the release
 # line the workspace's registry cache already holds; it is not published as
 # `^1` from the older names, so the major is pinned where it resolved.
-imap-codec = { version = "^1", features = ["starttls"] }
+# `ext_condstore_qresync` is the codec's own gate for the ENABLE/CONDSTORE
+# command tokens and the `HIGHESTMODSEQ` status item; everything the codec
+# still cannot parse at 1.0 (SELECT/FETCH/STORE extension parameters,
+# `UID EXPUNGE`) is handled by the hand-written sidecar parser in
+# `imap_session/ext_wire` — no dependency version moves.
+imap-codec = { version = "^1", features = ["starttls", "ext_condstore_qresync"] }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

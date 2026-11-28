@@ -1,7 +1,7 @@
 //! The wire: reply lines, capabilities, status values and the octet helpers
 //! the rest of the module shares.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ayane_proto::Address;
 
@@ -21,7 +21,7 @@ use imap_codec::{
 use crate::maildir_reader::{Flags, MaildirReader, MessageId};
 
 use super::session::{State, Transport};
-use super::uidlist::{uid_validity, UidMap};
+use super::uidlist::UidMap;
 use super::{Kind, Outcome};
 
 /// One tagged reply line. `terminated` appends the CRLF that ends a command;
@@ -75,6 +75,13 @@ pub(crate) fn state_refusal(state: State, body: &CommandBody<'_>) -> Option<&'st
 }
 
 /// This connection's capabilities.
+///
+/// The extension list is advertised permanently (RFC 7162 §3.1 allows the
+/// CONDSTORE capability without activation) and behaves by enabling command:
+/// CONDSTORE wakes on the six commands RFC 7162 §3.1.2 names, QRESYNC on
+/// `ENABLE QRESYNC`. Advertising either one makes the `[CLOSED]` response
+/// code an unconditional duty on a change of mailbox — which is why the
+/// capability list here is read by more than the CAPABILITY command.
 pub(crate) fn capabilities(
     transport: Transport,
     starttls: bool,
@@ -85,7 +92,14 @@ pub(crate) fn capabilities(
         (Transport::Clear, false) => vec![Capability::LoginDisabled],
         (Transport::Tls, _) => vec![Capability::Auth(AuthMechanism::Plain)],
     });
-    caps.extend([Capability::Move, Capability::LiteralPlus]);
+    caps.extend([
+        Capability::Move,
+        Capability::LiteralPlus,
+        Capability::Enable,
+    ]);
+    for name in ["UIDPLUS", "CONDSTORE", "QRESYNC"] {
+        caps.push(Capability::try_from(name).expect("an atom capability"));
+    }
     NonEmptyVec::try_from(caps).expect("capabilities are never empty")
 }
 
@@ -112,7 +126,6 @@ pub(crate) fn trim_crlf(bytes: &mut Vec<u8>) {
 /// not answer it.
 pub(crate) fn status_value(
     item: &StatusDataItemName,
-    dir: &Path,
     map: &UidMap,
     messages: &[(u32, String, bool)],
 ) -> Option<StatusDataItem> {
@@ -122,7 +135,7 @@ pub(crate) fn status_value(
             StatusDataItem::Recent(messages.iter().filter(|(_, _, in_cur)| !in_cur).count() as u32)
         }
         StatusDataItemName::UidNext => StatusDataItem::UidNext(non_zero(map.next)),
-        StatusDataItemName::UidValidity => StatusDataItem::UidValidity(non_zero(uid_validity(dir))),
+        StatusDataItemName::UidValidity => StatusDataItem::UidValidity(non_zero(map.validity)),
         StatusDataItemName::Unseen => StatusDataItem::Unseen(
             messages.iter().filter(|(_, n, _)| !flag_of(n, 'S')).count() as u32,
         ),
@@ -152,6 +165,36 @@ pub(crate) fn flags_of(name: &str) -> Vec<FlagFetch<'static>> {
     .filter(|(suffix, _)| flag_of(name, *suffix))
     .map(|(_, flag)| FlagFetch::Flag(flag))
     .collect()
+}
+
+/// The flags a maildir name carries, as untagged `FETCH` lines spell them —
+/// the system flags this layout can hold plus `\Recent` when the session
+/// considers the message recent (RFC 3501 §2.3.2 / §7.4.2). The lines the
+/// extension paths hand-write (`VANISHED` companions, QRESYNC initial
+/// synchronization, the NOOP refresh) render their flags from here, so they
+/// carry the same set the codec-rendered `flags_of` reports — a flag set,
+/// where order carries no meaning (RFC 3501 §2.3.2 spells no order for the
+/// response).
+pub(crate) fn flags_text(name: &str, recent: bool) -> String {
+    let id = MessageId::parse(name);
+    let flags = id.map(|id| id.flags()).unwrap_or_default();
+    let mut out: Vec<&'static str> = Vec::new();
+    if flags.flagged {
+        out.push("\\Flagged");
+    }
+    if flags.seen {
+        out.push("\\Seen");
+    }
+    if flags.trashed {
+        out.push("\\Deleted");
+    }
+    if flags.draft {
+        out.push("\\Draft");
+    }
+    if recent {
+        out.push("\\Recent");
+    }
+    out.join(" ")
 }
 
 /// `LIST` wildcards (RFC 3501 §6.3.8). The layout is flat, so `%` and `*`
