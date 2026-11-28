@@ -172,8 +172,7 @@ count = 2;
 **Step 2 — 验证扫描面**（不经引擎；GTUBE X 串默认启用）：
 
 ```bash
-printf 'From: probe@example.com\r\nTo: inbox@example.com\r\nSubject: gtube\r\n\r\n\
-XJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X\r\n' > /tmp/gtube.eml
+printf 'From: probe@example.com\r\nTo: inbox@example.com\r\nSubject: gtube\r\n\r\nXJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X\r\n' > /tmp/gtube.eml
 curl -s --data-binary @/tmp/gtube.eml -H 'Pass: all' http://127.0.0.1:11333/scan \
   | jq '{action, score, required_score}'
 # 期待 {"action":"reject",...}

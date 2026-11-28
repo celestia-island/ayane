@@ -568,10 +568,11 @@ async fn a_configured_engine_scans_inbound_and_acts_on_the_answer() {
     );
 
     // 3. The scan's own counters, through the same entry point the traffic
-    //    page reads: one refused, one scanned-and-passed, none failed.
+    //    page reads: the refusal was scanned, the pass was scanned, and
+    //    nothing failed. Exact values: a wrong count is a wiring bug.
     let snapshot = driver.traffic_snapshot("24h").expect("counters");
     assert_eq!(snapshot.totals.spam_rejected, 1, "{snapshot:?}");
-    assert!(snapshot.totals.spam_scanned >= 1, "{snapshot:?}");
+    assert_eq!(snapshot.totals.spam_scanned, 2, "{snapshot:?}");
     assert_eq!(snapshot.totals.spam_scan_errors, 0, "{snapshot:?}");
 
     engine.shutdown();

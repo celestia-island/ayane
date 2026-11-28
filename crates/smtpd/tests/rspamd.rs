@@ -544,6 +544,17 @@ async fn an_unconfigured_listener_connects_nowhere_and_changes_nothing() {
     harness.stop();
 }
 
+/// Every value one request carried for a header name, in arrival order.
+fn header(request: &RecordedRequest, name: &str) -> Vec<String> {
+    request
+        .headers
+        .iter()
+        .filter_map(|line| line.split_once(": "))
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.to_owned())
+        .collect()
+}
+
 // ── 10: the request's own shape ─────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -560,45 +571,39 @@ async fn the_scan_request_carries_the_whole_envelope() {
     let queued = harness.queued();
     assert_eq!(queued.len(), 1);
     let request = fake.only();
-    let header = |name: &str| {
-        request
-            .headers
-            .iter()
-            .filter_map(|line| line.split_once(": "))
-            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.to_owned())
-            .collect::<Vec<_>>()
-    };
     assert_eq!(request.target, "/scan");
     assert_eq!(
-        header("From"),
+        header(&request, "From"),
         vec!["someone@remote.test"],
         "{:?}",
         request.headers
     );
     assert_eq!(
-        header("Rcpt"),
+        header(&request, "Rcpt"),
         vec!["inbox@example.com", "ops@example.com"],
         "one header per recipient: {:?}",
         request.headers
     );
-    assert_eq!(header("Ip"), vec!["127.0.0.1"]);
-    assert_eq!(header("Helo"), vec!["client.test"]);
-    assert_eq!(header("Hostname"), vec!["client.test"]);
+    assert_eq!(header(&request, "Ip"), vec!["127.0.0.1"]);
+    assert_eq!(header(&request, "Helo"), vec!["client.test"]);
+    assert_eq!(header(&request, "Hostname"), vec!["client.test"]);
     assert_eq!(
-        header("Queue-Id"),
+        header(&request, "Queue-Id"),
         vec![queued[0].id.as_str()],
         "the spool id"
     );
-    assert_eq!(header("Pass"), vec!["all"]);
+    assert_eq!(header(&request, "Pass"), vec!["all"]);
     assert!(
-        header("Password").is_empty(),
+        header(&request, "Password").is_empty(),
         "no password without one configured: {:?}",
         request.headers
     );
     // The message length is announced, not chunked: the scanner can read a
     // bounded body.
-    assert_eq!(header("Content-Length"), vec![MESSAGE.len().to_string()]);
+    assert_eq!(
+        header(&request, "Content-Length"),
+        vec![MESSAGE.len().to_string()]
+    );
     assert!(
         !request
             .headers
@@ -608,6 +613,31 @@ async fn the_scan_request_carries_the_whole_envelope() {
         request.headers
     );
     // The body is the message exactly as received — no engine prepend.
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_null_reverse_path_travels_as_an_empty_from() {
+    // `MAIL FROM:<>` is the bounce/DSN path: the envelope's reverse-path is
+    // the empty string, and that is exactly what the scanner must see — a
+    // fabricated `unknown` would be an envelope no peer ever sent, and
+    // sender-keyed scanner rules would share one bucket for all of them.
+    let (harness, fake, mut client) =
+        case("rspamd-null-sender", FakeAnswer::action("no action")).await;
+    client.ehlo("client.test");
+    client.expect("MAIL FROM:<>", 250);
+    client.expect("RCPT TO:<inbox@example.com>", 250);
+    client.expect("DATA", 354);
+    client.send_raw(format!("{MESSAGE}.\r\n").as_bytes());
+    assert_eq!(client.read_reply().code, 250);
+    let request = fake.only();
+    assert_eq!(
+        header(&request, "From"),
+        vec![""],
+        "the null reverse-path is an empty From: {:?}",
+        request.headers
+    );
+    assert_eq!(header(&request, "Rcpt"), vec!["inbox@example.com"]);
     harness.stop();
 }
 

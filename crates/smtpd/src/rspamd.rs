@@ -418,6 +418,11 @@ impl RspamdClient {
         }
         let body = match response.text().await {
             Ok(body) => body,
+            // The total timeout can fire while the answer is still arriving;
+            // the log should say that, not "unparseable".
+            Err(err) if err.is_timeout() => {
+                return ScanOutcome::Failed(ScanError::TimedOut);
+            }
             Err(err) => return ScanOutcome::Failed(ScanError::Response(err.to_string())),
         };
         classify(&body)
@@ -573,20 +578,15 @@ pub fn sanitize_smtp_message(raw: &str) -> Option<String> {
 }
 
 /// Reduces a header value to what an HTTP header may carry: printable ASCII
-/// only. Envelope text (paths, the HELO name) has already passed the SMTP
-/// parser, but a byte outside the printable range would make the request
-/// fail at the header layer — the scan degrades instead, which is the wrong
-/// failure for a value one sanitized copy would have carried fine.
+/// only, and possibly **empty** — the null reverse-path travels as an empty
+/// `From` (the envelope `MAIL FROM:<>` put on the wire), and an empty header
+/// value is legal HTTP. No value is ever invented here: a fabricated
+/// `unknown` would be an envelope no peer sent, and every sender-keyed
+/// scanner rule would share one bucket for all of them.
 fn header_value(raw: &str) -> String {
-    let sanitized: String = raw
-        .chars()
+    raw.chars()
         .filter(|character| character.is_ascii_graphic())
-        .collect();
-    if sanitized.is_empty() {
-        "unknown".to_owned()
-    } else {
-        sanitized
-    }
+        .collect()
 }
 
 #[cfg(test)]
@@ -836,9 +836,15 @@ mod tests {
     }
 
     #[test]
-    fn header_values_carry_printable_ascii_only() {
+    fn header_values_carry_printable_ascii_only_and_stay_honest_when_empty() {
         assert_eq!(header_value("a@b.example"), "a@b.example");
         assert_eq!(header_value("a@b\r\nX-Injected: 1"), "a@bX-Injected:1");
-        assert_eq!(header_value(""), "unknown");
+        // The null reverse-path (`MAIL FROM:<>`) is the empty string, never
+        // an invented placeholder.
+        assert_eq!(header_value(""), "");
+        // An SMTPUTF8 local part has no header-safe spelling: what survives
+        // the alphabet is the ASCII domain, which is what scanner rules key
+        // on (the deviation is recorded in the PR).
+        assert_eq!(header_value("用户@example.com"), "@example.com");
     }
 }
