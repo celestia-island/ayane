@@ -297,7 +297,8 @@ async fn enable_qresync_is_acknowledged_and_gates_the_parameters() {
     let mut client = listener.connect();
     client.login();
     // Before ENABLE: the QRESYNC parameter and the VANISHED modifier are BAD
-    // (RFC 7162 §3.2.2), and a BAD never selects the mailbox.
+    // (RFC 7162 §3.2.2), and a BAD never selects the mailbox — MUT:M10 (let
+    // the un-enabled path through) reds this case.
     let lines = client.say("s SELECT INBOX (QRESYNC (1 1))");
     assert!(lines.last().expect("reply").contains("BAD"), "{lines:?}");
     client.send("f UID FETCH 1:* (FLAGS) (CHANGEDSINCE 1 VANISHED)");
@@ -457,7 +458,8 @@ async fn a_flag_change_is_visible_above_the_cached_watermark() {
     let cached = highest_of(&lines);
     // Another session flips a flag; the change must land ABOVE the value the
     // watcher cached, or the watcher's CHANGEDSINCE filter would never hear
-    // about it (the bump is what makes the change visible).
+    // about it (the bump is what makes the change visible) — MUT:M1 (skip
+    // the bump) reds this case.
     let mut actor = listener.connect();
     actor.login();
     actor.say("s2 SELECT INBOX (CONDSTORE)");
