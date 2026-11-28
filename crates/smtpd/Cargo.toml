@@ -38,7 +38,7 @@ rustls-pemfile = "^2"
 # roots; the workspace already trusts the same store through reqwest's
 # rustls-tls and mail-auth's `webpki-roots` feature.
 webpki-roots = "^1"
-# The content scanner is an HTTP peer: one `POST /scan` per inbound message
+# The content scanner is an HTTP peer: one `POST /checkv2` per inbound message
 # against the workspace's reqwest (rustls-tls, no new version). The `stream`
 # feature is what lets the staged message file be forwarded as the request
 # body without ever being buffered whole.

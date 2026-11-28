@@ -32,7 +32,8 @@ fn action_body(action: &str) -> String {
 /// A request the fake scanner received.
 #[derive(Debug, Clone)]
 struct RecordedRequest {
-    /// The request line's target (`/checkv2`).
+    /// The target the driver must send its scan request to (`/checkv2` unless
+    /// the configured URL names another path).
     target: String,
     /// The header lines, as sent, in arrival order.
     headers: Vec<String>,
