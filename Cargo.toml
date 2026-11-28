@@ -33,6 +33,9 @@ rmp-serde = "^1"
 
 # async / http
 tokio = { version = "^1", features = ["macros", "net", "rt-multi-thread", "signal", "process", "fs"] }
+# The staged-message reader rspamd.rs streams with (the `io` half reqwest's
+# `stream` feature already resolves); declared here so smtpd can name it.
+tokio-util = { version = "^0.7", default-features = false, features = ["io"] }
 axum = { version = "^0.8", features = ["ws"] }
 tower = { version = "^0.5", features = ["util"] }
 tracing = "^0.1"

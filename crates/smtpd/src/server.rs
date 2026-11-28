@@ -218,6 +218,50 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// The RFC 5321 §4.5.3.2 mail transaction timeout.
 pub const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// What the content scan decided for one transaction.
+enum SpamDecision {
+    /// Continue to the queue. The bytes are the `X-Spam-Status` field the
+    /// queue prepends behind the trace field — empty when no scanner is
+    /// configured or the scan failed (fail-open leaves no header).
+    Continue(Vec<u8>),
+    /// Refuse the transaction at the end of the transfer with the policy's
+    /// own reply line; the staged file is abandoned with it.
+    Refuse {
+        /// The reply code (`554` for a refusal, `451` for a temporary one).
+        code: u16,
+        /// The enhanced status class.
+        enhanced: &'static str,
+        /// The one-line reply text.
+        text: String,
+    },
+}
+
+/// The reply line a refusing scan maps to.
+///
+/// `soft reject` and `greylist` answer `451 4.3.2` — the temporary codes
+/// are reserved for the scanner's *own* explicit actions, never for its
+/// failures. `reject`, and `discard` (which the engine will not answer with
+/// "accepted, then thrown away"), answer `554 5.7.1`; the scanner's own
+/// suggested text is used only if it survives the one-line, 200-byte
+/// sanitization, and the fixed wording stands otherwise.
+fn spam_refusal(verdict: &crate::rspamd::SpamVerdict) -> (u16, &'static str, String) {
+    match verdict.action {
+        crate::rspamd::RspamdAction::SoftReject => {
+            (451, "4.3.2", "Try again later (content filter)".to_owned())
+        }
+        crate::rspamd::RspamdAction::Greylist => {
+            (451, "4.3.2", "Greylisted, try again later".to_owned())
+        }
+        _ => {
+            let text = crate::rspamd::sanitize_smtp_message(
+                verdict.smtp_message.as_deref().unwrap_or_default(),
+            )
+            .unwrap_or_else(|| "Message rejected by spam filter".to_owned());
+            (554, "5.7.1", text)
+        }
+    }
+}
+
 /// Everything a listener needs to run.
 pub struct ServerConfig {
     /// The name in the greeting, `Received:` and the DMARC `authserv-id`.
@@ -245,6 +289,10 @@ pub struct ServerConfig {
     pub passwords: Arc<dyn PasswordVerifier>,
     /// The SPF/DKIM/DMARC verifier; `None` disables verification (tests only).
     pub verifier: Option<Verifier>,
+    /// The content scanner (`POST /scan` against a normal worker); `None`
+    /// disables the scan. Attached to inbound listeners only by the
+    /// assembly: submission is the authenticated user's own mail.
+    pub rspamd: Option<crate::rspamd::RspamdClient>,
     /// The TLS acceptor; `None` unless the listener offers TLS.
     pub tls: Option<TlsAcceptor>,
     /// Refuse a message whose head already carries more `Received:` fields
@@ -287,6 +335,7 @@ impl fmt::Debug for ServerConfig {
             .field("per_ip_limit", &self.per_ip_limit)
             .field("tls", &self.tls.is_some())
             .field("verifier", &self.verifier.is_some())
+            .field("rspamd", &self.rspamd.is_some())
             .field("max_received_headers", &self.max_received_headers)
             .field("max_header_bytes", &self.max_header_bytes)
             .field("auth_guard", &self.auth_guard.is_some())
@@ -1457,6 +1506,31 @@ impl Connection {
         }
     }
 
+    /// Counts one scan that came back with a verdict (`rejected` names
+    /// whether this transaction is being refused for it), and the nanos it
+    /// spent waiting. The scanner's latency is the mean of `SpamScanNanos`
+    /// over `SpamScanned`, which is why failed scans add neither.
+    fn count_spam(&self, rejected: bool, nanos: u64) {
+        let Some(metrics) = &self.config.metrics else {
+            return;
+        };
+        let peer = self.peer.ip().to_string();
+        let now = received_now_epoch();
+        metrics.record_peer(&peer, crate::metrics::Counter::SpamScanned, 1, now);
+        if rejected {
+            metrics.record_peer(&peer, crate::metrics::Counter::SpamRejected, 1, now);
+        }
+        metrics.add(crate::metrics::Counter::SpamScanNanos, nanos);
+    }
+
+    /// Counts one scan that produced no verdict — the fail-open event, and
+    /// the one number that says "the filter is down" to the traffic page.
+    fn count_spam_error(&self) {
+        if let Some(metrics) = &self.config.metrics {
+            metrics.bump(crate::metrics::Counter::SpamScanErrors);
+        }
+    }
+
     /// Adds this reply's endpoint to the traffic counters, if it has one.
     ///
     /// `RCPT` is counted per recipient (accepted or refused); the transaction's
@@ -1995,7 +2069,7 @@ impl Connection {
             }
         }
         let envelope = self.finish_envelope(&sender, &recipients, declared_size, smtputf8);
-        self.complete(staged, hasher, &head, envelope).await
+        self.complete(staged, hasher, &head, envelope, &id).await
     }
 
     /// Reads one BDAT chunk and answers it.
@@ -2247,7 +2321,7 @@ impl Connection {
         // past [`MAX_HEADER_BUFFER`].
         let head = &record[..record.len().min(MAX_HEADER_BUFFER)];
         let envelope = self.finish_envelope(&sender, &recipients, declared_size, smtputf8);
-        self.complete(staged, hasher, head, envelope).await
+        self.complete(staged, hasher, head, envelope, &id).await
     }
 
     /// The reply to a chunk that did not end the message.
@@ -2365,13 +2439,19 @@ impl Connection {
         Ok(read)
     }
 
-    /// Runs verification and the queue commit, then answers the transaction.
+    /// Runs verification, the content scan and the queue commit, then
+    /// answers the transaction.
+    ///
+    /// `id` is the spool id the message will carry: the scan reports it as
+    /// its `Queue-Id`, and the envelope's own id is not backfilled until
+    /// [`StagedMessage::set_envelope`] runs below.
     async fn complete(
         &mut self,
         mut staged: StagedMessage,
         hasher: crate::verify::BodyHasher,
         head: &[u8],
         envelope: Envelope,
+        id: &str,
     ) -> Result<(), ServerError> {
         if received_count(head) > self.config.max_received_headers {
             staged.abandon();
@@ -2419,11 +2499,42 @@ impl Connection {
             self.session.fail_data();
             return self.reply_end(false).await;
         }
+        // The content scan runs after the mail-auth verdicts (a DMARC
+        // refusal does not need a content score) and before the commit (a
+        // refusal must leave no spool file behind). Both transport paths
+        // converge here, so the scan sees one message shape.
+        let mut prepend = verdict.prepend;
+        match self.rspamd_decision(&staged, &envelope, id).await {
+            SpamDecision::Refuse {
+                code,
+                enhanced,
+                text,
+            } => {
+                tracing::info!(
+                    id,
+                    action_code = code,
+                    "message refused by the content filter"
+                );
+                staged.abandon();
+                self.session.fail_data();
+                let reply = self.session.end_of_message_refused(code, enhanced, text);
+                let close = reply.action == Action::Close;
+                self.write(&reply).await?;
+                if close {
+                    self.shutdown().await;
+                }
+                return Ok(());
+            }
+            SpamDecision::Continue(status) => {
+                // The trace field stays first; the status rides behind it.
+                prepend.extend_from_slice(&status);
+            }
+        }
         let mut stored = envelope;
         stored.received = received;
         stored.auth_summary = verdict.summary;
         staged.set_envelope(stored);
-        match staged.commit_with_prepend(&verdict.prepend) {
+        match staged.commit_with_prepend(&prepend) {
             Ok(queued) => {
                 tracing::info!(
                     id = %queued.id,
@@ -2443,6 +2554,82 @@ impl Connection {
                 tracing::error!(%err, "spool commit failed");
                 self.session.fail_data();
                 self.reply_end(false).await
+            }
+        }
+    }
+
+    /// Runs the configured content scan and maps its outcome onto this
+    /// transaction: a refusal with the policy's own reply line, or the
+    /// `X-Spam-Status` field the queue prepends — empty when the scan
+    /// failed, because fail-open leaves no header a Sieve rule could read
+    /// as a verdict the scanner never made.
+    async fn rspamd_decision(
+        &self,
+        staged: &StagedMessage,
+        envelope: &Envelope,
+        id: &str,
+    ) -> SpamDecision {
+        let Some(client) = &self.config.rspamd else {
+            return SpamDecision::Continue(Vec::new());
+        };
+        let helo = self
+            .session
+            .hello()
+            .map_or_else(|| "unknown".to_owned(), |(_, name)| name.to_owned());
+        let started = std::time::Instant::now();
+        let outcome = client
+            .scan(
+                staged.tmp_path(),
+                staged.size(),
+                crate::rspamd::ScanRequest {
+                    queue_id: id,
+                    from: &envelope.mail_from,
+                    recipients: &envelope.recipients,
+                    ip: self.peer.ip(),
+                    helo: &helo,
+                },
+            )
+            .await;
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        match outcome {
+            crate::rspamd::ScanOutcome::Action(verdict) => {
+                if verdict.action.continues() {
+                    self.count_spam(false, nanos);
+                    SpamDecision::Continue(crate::rspamd::spam_status_header(&verdict))
+                } else {
+                    self.count_spam(true, nanos);
+                    let (code, enhanced, text) = spam_refusal(&verdict);
+                    SpamDecision::Refuse {
+                        code,
+                        enhanced,
+                        text,
+                    }
+                }
+            }
+            crate::rspamd::ScanOutcome::UnknownAction(verdict, raw) => {
+                // The conservative mapping plus the error count: a scanner
+                // that grew an action this engine does not know stays
+                // visible instead of silently opening the gate.
+                tracing::warn!(
+                    action = %raw,
+                    "rspamd named an unknown action; treating it as `add header`"
+                );
+                self.count_spam_error();
+                self.count_spam(false, nanos);
+                SpamDecision::Continue(crate::rspamd::spam_status_header(&verdict))
+            }
+            crate::rspamd::ScanOutcome::Failed(err) => {
+                // Fail-open, on purpose: the mail-auth verdicts ran in this
+                // process and do not depend on the scanner, so a dead one
+                // costs only the content score. The `451`s stay reserved
+                // for the scanner's own explicit actions, or every scanner
+                // restart would roll into a site-wide retry storm.
+                tracing::warn!(
+                    error = %err,
+                    "rspamd scan failed; the message continues unscanned"
+                );
+                self.count_spam_error();
+                SpamDecision::Continue(Vec::new())
             }
         }
     }

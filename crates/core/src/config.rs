@@ -118,6 +118,17 @@ pub struct MailConfig {
     /// The environment variable template each domain's DKIM key is read from
     /// (`{domain}`, dots spelled `_`).
     pub dkim_key_env: Option<String>,
+    /// The rspamd scan endpoint (`AYANE_MAIL_RSPAMD_URL`, e.g.
+    /// `http://127.0.0.1:11333/scan`); unset or empty disables the content
+    /// scan entirely — no client, no connection, no behaviour change.
+    pub rspamd_url: Option<String>,
+    /// The scan's total timeout in milliseconds
+    /// (`AYANE_MAIL_RSPAMD_TIMEOUT_MS`, default 5000: the sender is waiting
+    /// at the `DATA`-end, and the scanner's own task timeout is 8s).
+    pub rspamd_timeout_ms: u64,
+    /// The rspamd `Password:` header (`AYANE_MAIL_RSPAMD_PASSWORD`) for a
+    /// controller worker; a normal worker needs none.
+    pub rspamd_password: Option<String>,
     /// Whether a mail service that cannot start stops the *process*.
     ///
     /// Off by default: the control plane keeps serving and
@@ -150,6 +161,9 @@ impl Default for MailConfig {
             outbound: false,
             smtp_port: ayane_smtpd::outbound::SMTP_PORT,
             dkim_key_env: None,
+            rspamd_url: None,
+            rspamd_timeout_ms: 5_000,
+            rspamd_password: None,
             require_start: false,
         }
     }
@@ -190,6 +204,16 @@ pub enum ConfigError {
     /// `AYANE_MAIL_ENABLED` is not a boolean.
     #[error("AYANE_MAIL_ENABLED `{value}` is not `1`/`0`/`true`/`false`")]
     MailEnabled {
+        /// The raw value.
+        value: String,
+    },
+    /// `AYANE_MAIL_RSPAMD_URL` is set but is not a plain
+    /// `http://host[:port][/path]` endpoint. Refused at start, like a
+    /// malformed listener line: a misparsed filter endpoint that silently
+    /// disabled itself would be a filter scanning nothing, with no log line
+    /// to say so.
+    #[error("AYANE_MAIL_RSPAMD_URL `{value}` is not a plain `http://host[:port][/path]` URL")]
+    MailRspamd {
         /// The raw value.
         value: String,
     },
@@ -316,6 +340,23 @@ fn mail_from_env(state_dir: &Path) -> Result<MailConfig, ConfigError> {
         );
     }
     mail.dkim_key_env = std::env::var("AYANE_MAIL_DKIM_KEY_ENV").ok();
+    mail.rspamd_timeout_ms = number("RSPAMD_TIMEOUT_MS", mail.rspamd_timeout_ms)?;
+    mail.rspamd_url = std::env::var("AYANE_MAIL_RSPAMD_URL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    mail.rspamd_password = std::env::var("AYANE_MAIL_RSPAMD_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if let Some(url) = &mail.rspamd_url {
+        // The syntax is refused here (start-up failure, not degraded:
+        // this is a configuration error, the same class as `MailListen`),
+        // while an unreachable scanner at *runtime* is the scan's own
+        // fail-open + counter. The client itself is built per listener
+        // by the engine.
+        ayane_smtpd::rspamd::parse_endpoint(url)
+            .map_err(|_| ConfigError::MailRspamd { value: url.clone() })?;
+    }
     if let Ok(raw) = std::env::var("AYANE_MAIL_REQUIRE_START") {
         mail.require_start = matches!(
             raw.trim().to_ascii_lowercase().as_str(),
@@ -417,4 +458,44 @@ fn parse_listener(entry: &str) -> Result<MailListener, ConfigError> {
         tls_key,
         imap_tls,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scan endpoint's parse is a startup decision, not a runtime one:
+    /// malformed is refused with [`ConfigError::MailRspamd`], blank and
+    /// unset are the feature being off. The variables set here are this
+    /// test's alone; the one other `AYANE_MAIL_*` variable any core test
+    /// touches is the DKIM template, which this test never asserts on.
+    #[test]
+    fn a_malformed_scan_url_refuses_to_start_rather_than_scanning_nothing() {
+        std::env::set_var("AYANE_MAIL_RSPAMD_URL", "https://127.0.0.1:11333");
+        let err = mail_from_env(Path::new("state")).expect_err("https is refused");
+        assert!(matches!(err, ConfigError::MailRspamd { .. }), "{err:?}");
+        assert!(err.to_string().contains("AYANE_MAIL_RSPAMD_URL"), "{err}");
+
+        std::env::set_var("AYANE_MAIL_RSPAMD_URL", "http://127.0.0.1:11333/scan");
+        let mail = mail_from_env(Path::new("state")).expect("a plain http URL parses");
+        assert_eq!(
+            mail.rspamd_url.as_deref(),
+            Some("http://127.0.0.1:11333/scan")
+        );
+        assert_eq!(mail.rspamd_timeout_ms, 5_000, "the default total timeout");
+
+        std::env::set_var("AYANE_MAIL_RSPAMD_URL", "   ");
+        let mail = mail_from_env(Path::new("state")).expect("blank is a value, not an error");
+        assert_eq!(mail.rspamd_url, None, "blank means the scan is off");
+
+        std::env::set_var("AYANE_MAIL_RSPAMD_TIMEOUT_MS", "soon");
+        let err = mail_from_env(Path::new("state")).expect_err("a bad number is refused");
+        assert!(matches!(err, ConfigError::MailNumber { .. }), "{err:?}");
+
+        std::env::remove_var("AYANE_MAIL_RSPAMD_URL");
+        std::env::remove_var("AYANE_MAIL_RSPAMD_TIMEOUT_MS");
+        let mail = mail_from_env(Path::new("state")).expect("unset is the off state");
+        assert_eq!(mail.rspamd_url, None);
+        assert_eq!(mail.rspamd_password, None);
+    }
 }

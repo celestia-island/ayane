@@ -680,6 +680,7 @@ fn config_for(
         state,
         passwords,
         verifier: None,
+        rspamd: None,
         tls: None,
         max_received_headers: 25,
         max_header_bytes: mail.max_header_bytes,
@@ -719,15 +720,47 @@ fn listener_config(
         )));
     }
     // An inbound listener verifies with the system resolver; a submission
-    // listener does not (the client is already the authenticated identity, and
-    // the outbound path signs).
+    // listener does not (the client is already the authenticated identity,
+    // and the outbound path signs).
     if listener.role == ListenerRole::Inbound {
         config.verifier = Some(
             Verifier::with_system_resolver(&mail.hostname)
                 .map_err(|err| MailError::Tls(err.to_string()))?,
         );
+        // The content scan rides the same role split, for the same reason:
+        // it is an inbound-posture enhancement, and the scan endpoint was
+        // syntax-checked at `from_env`, so a failure here is the process's
+        // "configuration says one thing, the world says another" error.
+        config.rspamd = rspamd_client(mail)?;
     }
     Ok(config)
+}
+
+/// The content scanner a listener runs with, when it runs one.
+///
+/// `None` when `AYANE_MAIL_RSPAMD_URL` is unset: no client, no connection,
+/// no behaviour change — the switch the deployment rollback leans on.
+///
+/// # Errors
+///
+/// The URL's syntax was already refused in `from_env`
+/// ([`crate::config::ConfigError::MailRspamd`]), so the only failure left is
+/// the HTTP client's own construction, which does not fail on the rustls
+/// stack; it is mapped onto the required-setting error so the impossible
+/// stays an `Err` rather than a panic.
+fn rspamd_client(
+    mail: &MailConfig,
+) -> Result<Option<ayane_smtpd::rspamd::RspamdClient>, MailError> {
+    let Some(url) = mail.rspamd_url.as_deref() else {
+        return Ok(None);
+    };
+    ayane_smtpd::rspamd::RspamdClient::parse(
+        url,
+        std::time::Duration::from_millis(mail.rspamd_timeout_ms),
+        mail.rspamd_password.clone(),
+    )
+    .map(Some)
+    .map_err(|_| MailError::Missing("rspamd_url"))
 }
 
 /// One IMAP listener's own configuration.
@@ -1305,5 +1338,87 @@ mod tests {
             mail.spool_root,
             mail.mail_root
         );
+        // The content scan is off with it: no client, no endpoint, nothing.
+        assert_eq!(mail.rspamd_url, None);
+        assert_eq!(mail.rspamd_timeout_ms, 5_000);
+        assert_eq!(mail.rspamd_password, None);
+    }
+
+    #[test]
+    fn only_an_inbound_listener_is_given_the_content_scanner() {
+        // The role split the verifier set: an inbound listener verifies and
+        // scans, a submission listener does neither — the client is already
+        // the authenticated identity, and the outbound path signs its own.
+        // The certificate is the tests' own fixture pair; it authenticates
+        // nothing here, it only has to load.
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .canonicalize()
+            .expect("fixture directory");
+        let mail = MailConfig {
+            hostname: "mx.test".to_owned(),
+            listeners: vec![
+                crate::config::MailListener {
+                    role: ListenerRole::Inbound,
+                    listen: "127.0.0.1:0".parse().expect("listen"),
+                    role_name: "inbound".to_owned(),
+                    tls_cert: None,
+                    tls_key: None,
+                    imap_tls: None,
+                },
+                crate::config::MailListener {
+                    role: ListenerRole::SubmissionsTls,
+                    listen: "127.0.0.1:0".parse().expect("listen"),
+                    role_name: "submissions-tls".to_owned(),
+                    tls_cert: Some(fixtures.join("mx-test-cert.pem")),
+                    tls_key: Some(fixtures.join("mx-test-key.pem")),
+                    imap_tls: None,
+                },
+            ],
+            rspamd_url: Some("http://127.0.0.1:11333/scan".to_owned()),
+            ..MailConfig::default()
+        };
+        let root = std::env::temp_dir().join(format!("ayane-rspamd-{}", uuid::Uuid::new_v4()));
+        let spool = Spool::open(root.join("spool")).expect("spool");
+        let mut desired = ayane_proto::DesiredState::default();
+        desired.domains.push(ayane_proto::MailDomain {
+            name: "example.test".to_owned(),
+            catch_all: None,
+            enabled: true,
+            dkim: None,
+        });
+        let passwords: Arc<dyn PasswordVerifier> = Arc::new(ayane_smtpd::authn::DenyAll);
+        let configs = per_listener(&mail, &spool, &desired, &passwords).expect("configs");
+        assert_eq!(configs.len(), 2);
+        assert!(
+            configs[0].rspamd.is_some() && configs[0].verifier.is_some(),
+            "inbound verifies and scans: rspamd={:?} verifier={:?}",
+            configs[0].rspamd.is_some(),
+            configs[0].verifier.is_some()
+        );
+        assert!(
+            configs[1].rspamd.is_none() && configs[1].verifier.is_none(),
+            "submission neither verifies nor scans"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unset_scan_url_gives_no_client_to_any_listener() {
+        // The rollback switch: unset the URL, and the assembly builds the
+        // exact listener set it built before the feature existed.
+        let mail = MailConfig {
+            hostname: "mx.test".to_owned(),
+            listeners: vec![crate::config::MailListener {
+                role: ListenerRole::Inbound,
+                listen: "127.0.0.1:0".parse().expect("listen"),
+                role_name: "inbound".to_owned(),
+                tls_cert: None,
+                tls_key: None,
+                imap_tls: None,
+            }],
+            ..MailConfig::default()
+        };
+        assert!(rspamd_client(&mail).expect("no client").is_none());
     }
 }

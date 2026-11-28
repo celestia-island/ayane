@@ -207,6 +207,7 @@ async fn tb14_the_message_is_on_disk_while_data_is_still_running() {
         state,
         passwords: std::sync::Arc::new(ayane_smtpd::authn::DenyAll),
         verifier: None,
+        rspamd: None,
         tls: None,
         max_received_headers: 25,
         max_header_bytes: ayane_smtpd::server::DEFAULT_MAX_HEADER_BYTES,

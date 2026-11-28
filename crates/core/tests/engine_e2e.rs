@@ -428,6 +428,155 @@ async fn an_enabled_engine_delivers_mail_and_counts_it() {
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
 
+/// A fake rspamd normal worker at the e2e level: records nothing, decides by
+/// count — the first message it sees is rejected, every later one passes.
+/// Both decisions come back in the classic schema, so this exercises the
+/// engine's whole request/response path against a real socket.
+async fn fake_scanner() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake scanner");
+    let addr = listener.local_addr().expect("fake scanner addr");
+    let scanned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let scanned = scanned.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let Ok(read) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(at) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buffer[..header_end]).to_lowercase();
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|line| line.split_once(": ").map(|(n, v)| (n.trim(), v)))
+                    .filter(|(name, _)| *name == "content-length")
+                    .and_then(|(_, value)| value.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = buffer[header_end..].to_vec();
+                while body.len() < content_length {
+                    let Ok(read) = socket.read(&mut chunk).await else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..read]);
+                }
+                let _ = body;
+                let nth = scanned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply = if nth == 0 {
+                    r#"{"action":"reject","score":12.3,"required_score":6.0}"#
+                } else {
+                    r#"{"action":"no action","score":-0.5,"required_score":6.0}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_engine_scans_inbound_and_acts_on_the_answer() {
+    let fixture = Fixture::new("rspamd");
+    let scanner = fake_scanner().await;
+    let (mut mail, address) = fixture.mail_config().await;
+    mail.rspamd_url = Some(format!("http://{scanner}"));
+    let store: Arc<dyn StateStore> = fixture.store.clone();
+    let engine = ayane::engine::start(&fixture.config(mail.clone()), store)
+        .await
+        .expect("the engine starts");
+    assert!(
+        engine.degraded().is_none(),
+        "a scanner endpoint is not a degraded start: {:?}",
+        engine.degraded()
+    );
+    let driver = NativeDriver::new(engine.control().clone());
+
+    // 1. The scanner's first word is `reject`, so the transaction ends in
+    //    the filter's own `554 5.7.1` — not the generic transaction failure.
+    let mut client = Client::connect(address);
+    let answer = send_message(
+        &mut client,
+        "someone@remote.test",
+        "inbox@example.test",
+        "rejected",
+    );
+    assert!(answer.starts_with("554"), "the scan refuses: {answer}");
+    assert!(answer.contains("5.7.1"), "{answer}");
+    // And nothing was queued behind it.
+    let queued = std::fs::read_dir(fixture.spool.join("new"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(queued, 0, "a refused message leaves no spool file");
+
+    // 2. The second message passes (`no action`), is delivered, and carries
+    //    the `No` status the scan rendered.
+    let stored = fixture.store.load().expect("load");
+    let state_dir = fixture.root.join("state");
+    ayane::apply::apply(
+        fixture.store.as_ref(),
+        &state_dir,
+        &stored,
+        Arc::new(ayane::driver::RecordingDriver::new(
+            fixture.root.join("docker-compose.yml"),
+        )),
+    )
+    .await
+    .expect("the first apply writes the routing snapshot");
+    let answer = send_message(
+        &mut client,
+        "someone@remote.test",
+        "inbox@example.test",
+        "scanned",
+    );
+    assert!(answer.starts_with("250"), "the scan passes: {answer}");
+    drop(client);
+    eventually(
+        "the scanned message to land in a maildir",
+        Duration::from_secs(20),
+        || !maildir_deliveries(&fixture.mail).is_empty(),
+    )
+    .await;
+    let delivered = maildir_deliveries(&fixture.mail);
+    let stored = std::fs::read(&delivered[0]).expect("read");
+    let body = String::from_utf8_lossy(&stored);
+    assert!(
+        body.contains("X-Spam-Status: No, score=-0.5, required=6.0, tests=, action=no action"),
+        "{body}"
+    );
+
+    // 3. The scan's own counters, through the same entry point the traffic
+    //    page reads: one refused, one scanned-and-passed, none failed.
+    let snapshot = driver.traffic_snapshot("24h").expect("counters");
+    assert_eq!(snapshot.totals.spam_rejected, 1, "{snapshot:?}");
+    assert!(snapshot.totals.spam_scanned >= 1, "{snapshot:?}");
+    assert_eq!(snapshot.totals.spam_scan_errors, 0, "{snapshot:?}");
+
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
 /// One JSON-RPC request straight into the transport, bypassing the socket.
 async fn call_rpc(
     surface: &ayane::transport::RpcSurface,

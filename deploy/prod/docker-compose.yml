@@ -16,6 +16,10 @@ services:
   rspamd:
     image: ${RSPAMD_IMAGE:-rspamd/rspamd:latest}
     restart: unless-stopped
+    # Only the normal worker (the scanner) reaches the host loopback, for the
+    # engine's POST /scan; the controller stays inside the compose network.
+    ports:
+      - "127.0.0.1:11333:11333"
     volumes:
       - ../../state/rspamd:/var/lib/rspamd
       - ./rspamd/local.d:/etc/rspamd/local.d:ro
