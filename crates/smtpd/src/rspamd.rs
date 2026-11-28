@@ -348,8 +348,18 @@ impl RspamdClient {
         password: Option<String>,
     ) -> Result<Self, RspamdUrlError> {
         let endpoint = parse_endpoint(raw)?;
+        // This client talks to exactly one host — the configured scanner, by
+        // design a plain `http://` on the loopback. It must not consult the
+        // environment's proxy settings: with `HTTP(S)_PROXY` set and no
+        // `NO_PROXY`, reqwest routes even `127.0.0.1:11333` through the proxy,
+        // the scan fails, and the engine fails open — every message is
+        // accepted unscored and only `spam_scan_errors` moves (measured 3/3
+        // on the e2e suite, 2026-11-28). A proxy can never be the right path
+        // to a loopback scanner, so it is off unconditionally rather than
+        // left to the deployer's environment.
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .no_proxy()
             .build()
             .map_err(|err| {
                 tracing::warn!(%err, "the HTTP client for rspamd could not be built");
