@@ -14,6 +14,16 @@
 //! check is `--version` plus the process actually binding its listeners.
 
 fn main() {
+    // The webmail dist tree is a build-time input of `#[derive(RustEmbed)]` in
+    // `src/webui.rs`, and the derive hard-fails when the folder is absent — a
+    // `cargo publish` (or a docs.rs build) of the packaged crate runs against a
+    // tarball that contains only `crates/core`, so the folder never exists
+    // there. Materializing it empty keeps that build green, and an empty
+    // embedded set is exactly the "front end was never built" state the serving
+    // layer already handles (`index_shell()` returns `None`, the error landing
+    // disables itself). A real local `packages/webui/dist` is left untouched.
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/webui/dist");
+    let _ = std::fs::create_dir_all(dist);
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_owned());
     println!("cargo:rustc-env=AYANE_BUILD_TARGET={target}");
     println!("cargo:rerun-if-changed=build.rs");

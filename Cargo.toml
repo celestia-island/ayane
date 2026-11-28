@@ -78,9 +78,10 @@ anyhow = "^1"
 
 # error landing: the family's server half — turn a failed browser
 # navigation into the service's own SPA document carrying the
-# hk-server-error island, instead of a tab of raw JSON. Not published on
-# crates.io yet, so it rides plana's master branch.
-plana-error-landing = { git = "https://github.com/celestia-island/plana", branch = "master", version = "^0.8" }
+# hk-server-error island, instead of a tab of raw JSON. On crates.io since
+# plana put it on the release line; a git edge cannot be published, so the
+# registry edge is what lets this workspace's crates go out at all.
+plana-error-landing = "^0.8"
 
 # a lock-free single-writer slot: the listener's configuration is swapped
 # under running connections (a reload is one store, a connection is one load)
