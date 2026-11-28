@@ -163,6 +163,9 @@ pub struct HarnessOptions {
     /// a shared, order-dependent number in every test that starts a listener,
     /// and only a test that asks for one should see it.
     pub metrics: bool,
+    /// The content scanner this listener runs with (`None` = unconfigured,
+    /// which is the default and the zero-behaviour-change case).
+    pub rspamd: Option<ayane_smtpd::rspamd::RspamdClient>,
 }
 
 impl Default for HarnessOptions {
@@ -180,6 +183,7 @@ impl Default for HarnessOptions {
             auth_guard: None,
             max_header_bytes: ayane_smtpd::server::DEFAULT_MAX_HEADER_BYTES,
             metrics: false,
+            rspamd: None,
         }
     }
 }
@@ -277,6 +281,7 @@ impl Harness {
             state: state.clone(),
             passwords,
             verifier,
+            rspamd: options.rspamd.clone(),
             tls,
             max_received_headers: 25,
             max_header_bytes: options.max_header_bytes,

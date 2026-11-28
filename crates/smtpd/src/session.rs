@@ -1032,6 +1032,27 @@ impl Session {
         Reply::new(250, Some("2.0.0"), "OK: queued")
     }
 
+    /// The reply that refuses a completed transfer with the refusing
+    /// policy's own line.
+    ///
+    /// [`Session::end_of_message`] answers a failed transaction with the
+    /// generic `554 5.6.0 Transaction failed`, which is the right answer for
+    /// "the disk gave up" but tells a sender nothing about *why* a content
+    /// policy refused it. A policy refusal (the spam filter, today) hands
+    /// its own code, class and text here; the transaction is abandoned with
+    /// the same reset [`Session::end_of_message`] performs, and the message
+    /// count stays untouched — nothing was accepted.
+    pub fn end_of_message_refused(
+        &mut self,
+        code: u16,
+        enhanced: &'static str,
+        text: impl Into<String>,
+    ) -> Reply {
+        self.abandon_transaction();
+        self.phase = self.phase_after_reset();
+        Reply::new(code, Some(enhanced), text)
+    }
+
     fn sequence_error(&self) -> Reply {
         Reply::new(503, Some("5.5.1"), "Bad sequence of commands")
     }

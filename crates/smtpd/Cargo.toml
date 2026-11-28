@@ -30,6 +30,7 @@ tracing = { workspace = true }
 # The binary installs a subscriber; the library only emits events.
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 rustls = { version = "^0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "^0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "^2"
@@ -37,6 +38,11 @@ rustls-pemfile = "^2"
 # roots; the workspace already trusts the same store through reqwest's
 # rustls-tls and mail-auth's `webpki-roots` feature.
 webpki-roots = "^1"
+# The content scanner is an HTTP peer: one `POST /scan` per inbound message
+# against the workspace's reqwest (rustls-tls, no new version). The `stream`
+# feature is what lets the staged message file be forwarded as the request
+# body without ever being buffered whole.
+reqwest = { workspace = true, features = ["stream"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

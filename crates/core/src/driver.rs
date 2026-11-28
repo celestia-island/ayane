@@ -244,6 +244,7 @@ fn unstarted_config() -> ServerConfig {
         command_timeout: ayane_smtpd::server::COMMAND_TIMEOUT,
         transaction_timeout: ayane_smtpd::server::TRANSACTION_TIMEOUT,
         verifier: None,
+        rspamd: None,
         tls: None,
         max_received_headers: 25,
         max_header_bytes: ayane_smtpd::server::DEFAULT_MAX_HEADER_BYTES,

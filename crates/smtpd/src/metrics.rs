@@ -86,11 +86,23 @@ pub enum Counter {
     /// A recipient that ended in a bounce (permanent failure, or the retry
     /// horizon).
     OutboundBounced = 7,
+    /// A message the content scanner answered for (any action, including
+    /// `no action`; failed scans are [`Counter::SpamScanErrors`]).
+    SpamScanned = 8,
+    /// A message the content scan refused at the end of the transfer — the
+    /// `reject` / `discard` / `soft reject` / `greylist` mappings.
+    SpamRejected = 9,
+    /// A scan that produced no verdict (unreachable, timed out, non-200,
+    /// unparseable answer, unknown action): the fail-open events.
+    SpamScanErrors = 10,
+    /// Nanoseconds the successful scans spent waiting for the scanner; the
+    /// mean over [`Counter::SpamScanned`] is the scanner's latency.
+    SpamScanNanos = 11,
 }
 
 impl Counter {
     /// Every counter, in the order a snapshot reports them.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 12] = [
         Self::Connects,
         Self::MessagesIn,
         Self::RecipientsIn,
@@ -99,6 +111,10 @@ impl Counter {
         Self::OutboundSent,
         Self::OutboundDeferred,
         Self::OutboundBounced,
+        Self::SpamScanned,
+        Self::SpamRejected,
+        Self::SpamScanErrors,
+        Self::SpamScanNanos,
     ];
 
     /// The field name this counter is reported under.
@@ -113,6 +129,10 @@ impl Counter {
             Self::OutboundSent => "outbound_sent",
             Self::OutboundDeferred => "outbound_deferred",
             Self::OutboundBounced => "outbound_bounced",
+            Self::SpamScanned => "spam_scanned",
+            Self::SpamRejected => "spam_rejected",
+            Self::SpamScanErrors => "spam_scan_errors",
+            Self::SpamScanNanos => "spam_scan_nanos",
         }
     }
 }
@@ -168,6 +188,15 @@ pub struct TrafficTotals {
     pub outbound_deferred: u64,
     /// Recipients bounced.
     pub outbound_bounced: u64,
+    /// Messages the content scanner answered for.
+    pub spam_scanned: u64,
+    /// Messages the content scan refused.
+    pub spam_rejected: u64,
+    /// Scans that produced no verdict (the fail-open events).
+    pub spam_scan_errors: u64,
+    /// Nanoseconds the successful scans spent waiting (`spam_scan_nanos /
+    /// spam_scanned` is the scanner's mean latency).
+    pub spam_scan_nanos: u64,
 }
 
 /// The whole traffic report for one window.
@@ -370,6 +399,13 @@ impl Metrics {
         // Local deliveries have no series (a mailbox is not a peer), so their
         // total is the counter's period total, which is what the page shows.
         totals.delivered_local = self.total(Counter::DeliveredLocal);
+        // The scan counters are kept like `delivered_local`: `SpamScanned`
+        // and `SpamRejected` do have per-peer series, but the inbound rows
+        // do not render them — the totals row is where the page reads them.
+        totals.spam_scanned = self.total(Counter::SpamScanned);
+        totals.spam_rejected = self.total(Counter::SpamRejected);
+        totals.spam_scan_errors = self.total(Counter::SpamScanErrors);
+        totals.spam_scan_nanos = self.total(Counter::SpamScanNanos);
         TrafficSnapshot {
             requested_seconds,
             window_seconds,

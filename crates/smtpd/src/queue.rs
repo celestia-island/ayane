@@ -824,6 +824,15 @@ impl StagedMessage {
         self.file.as_mut()
     }
 
+    /// The staged file's path — a `tmp/` entry until [`StagedMessage::commit`]
+    /// renames it. Read-only access for a caller that re-reads the received
+    /// octets from the disk (the content scanner): the same
+    /// give-the-driver-what-it-needs shape as [`StagedMessage::file_mut`].
+    #[must_use]
+    pub fn tmp_path(&self) -> &Path {
+        &self.message_tmp
+    }
+
     /// Replaces the envelope recorded in the metadata that will be written by
     /// [`StagedMessage::commit`]. `sha256` and `size` are filled in there.
     pub fn set_envelope(&mut self, envelope: Envelope) {

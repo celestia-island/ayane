@@ -613,6 +613,10 @@ async fn serve_listener(options: ServeOptions) -> Result<(), Box<dyn std::error:
         )),
         state,
         verifier,
+        // The split-process form never scans: the endpoint is not part of its
+        // option surface, and a filter that silently scanned nothing would be
+        // worse than one that is not offered at all.
+        rspamd: None,
         tls: match &options.tls {
             Some((cert, key)) => Some(load_tls(cert, key)?),
             None => None,

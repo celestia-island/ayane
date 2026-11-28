@@ -146,6 +146,7 @@ fn child(point: FailPoint) {
         state,
         passwords: Arc::new(DenyAll),
         verifier: None,
+        rspamd: None,
         tls: None,
         max_received_headers: 25,
         max_header_bytes: ayane_smtpd::server::DEFAULT_MAX_HEADER_BYTES,

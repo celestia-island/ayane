@@ -78,6 +78,9 @@ python3 deploy/build-musl.py --install-to /opt/ayane/ayane-bin
 | `AYANE_MAIL_OUTBOUND` | `0` | `1` = 域外收件人经 MX 直投（需 25 出站与 PTR） |
 | `AYANE_MAIL_SMTP_PORT` | `25` | 出站连接端口 |
 | `AYANE_MAIL_DKIM_KEY_ENV` | 空 | 每个域的签名私钥所在环境变量模板，如 `AYANE_DKIM_KEY_{domain}`（域名的点写成 `_`） |
+| `AYANE_MAIL_RSPAMD_URL` | 空 | 内容扫描端点，如 `http://127.0.0.1:11333/scan`（明文 http，normal worker）。**空 = 功能完全关闭**：不装配客户端、零行为变化。写错（非 `http://host[:port][/path]`）= 进程拒绝启动 |
+| `AYANE_MAIL_RSPAMD_TIMEOUT_MS` | `5000` | 扫描总超时（毫秒）。扫描器自己的任务超时是 8s，这里要比它先放弃 |
+| `AYANE_MAIL_RSPAMD_PASSWORD` | 空 | 仅打 controller（11334）时需要（`Password:` 头）；normal worker 默认无鉴权，不设 |
 | `AYANE_MAIL_REQUIRE_START` | `0` | `1` = 邮件面起不来就让进程退出（否则 degraded + 控制面继续服务） |
 
 启动顺序因此是：起控制面（邮件段同时绑定）→ 建域/建账号 → `admin.apply`（写 `desired-state.json`
@@ -133,6 +136,69 @@ apply 之后要**重启一次**才会开始签名（日志里那条 warn 就是�
 `proxy_set_header Host $host;`）——否则 `/api/ws` 的同源校验（比对 `Origin` 与 `Host`）会以 403
 拒绝浏览器的每一次 WebSocket 升级；不带 `Origin` 头的非浏览器客户端不受影响。
 
+### 1.5 内容扫描（rspamd）：接线、验证与回滚
+
+引擎经 HTTP `POST /scan` 打 **normal worker（11333）**，仅 `inbound` 角色装配（submission 永不扫描）。
+判定语义：`reject`/`discard` → `554 5.7.1`；`soft reject`/`greylist` → `451 4.3.2`；
+`add header`/`rewrite subject`/`quarantine`/`no action` → 加 `X-Spam-Status` 照收。
+**扫描器不可达/超时/5xx/坏响应 = fail-open**（照收 + `spam_scan_errors` 计数 + warn 日志），
+`451` 只留给扫描器自己的显式动作——扫描器重启不滚成全站重试风暴。
+
+**Step 0 — 摸清 rspamd 现场绑定**（只读；镜像 tag 浮动，且仓内 compose 仍是含退役服务的旧貌，
+以现场为准）：
+
+```bash
+docker compose -f deploy/prod/docker-compose.yml exec rspamd \
+  rspamadm configdump worker | grep -E 'bind_socket|type'
+ss -tlnp | grep -E ':1133[234]'
+```
+
+normal worker 若绑 unix socket 或容器内不可达，加 `deploy/prod/rspamd/local.d/worker-normal.inc`：
+
+```ini
+bind_socket = "0.0.0.0:11333";
+count = 2;
+```
+
+**Step 1 — 把扫描面发布到宿主回环**（compose 的 rspamd 服务加 ports，本仓已带这两行）：
+
+```yaml
+    ports:
+      - "127.0.0.1:11333:11333"   # normal worker：扫描专用、默认无鉴权；controller 不发布
+```
+
+`docker compose up -d rspamd`。
+
+**Step 2 — 验证扫描面**（不经引擎；GTUBE X 串默认启用）：
+
+```bash
+printf 'From: probe@example.com\r\nTo: inbox@example.com\r\nSubject: gtube\r\n\r\nXJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X\r\n' > /tmp/gtube.eml
+curl -s --data-binary @/tmp/gtube.eml -H 'Pass: all' http://127.0.0.1:11333/scan \
+  | jq '{action, score, required_score}'
+# 期待 {"action":"reject",...}
+```
+
+**Step 3 — 引擎侧接线**：`/opt/ayane/ayane.env`（0600）追加：
+
+```ini
+AYANE_MAIL_RSPAMD_URL=http://127.0.0.1:11333/scan
+# 可选：AYANE_MAIL_RSPAMD_TIMEOUT_MS=5000
+# 可选：AYANE_MAIL_RSPAMD_PASSWORD=<only-if-controller>
+```
+
+**Step 4 — 重启与验证**：`systemctl restart ayane`；`/api/health` 仍 `status=ok`
+（扫描器不在 degraded 面——它是运行期单一增强，故障走 warn + `spam_scan_errors`）。
+然后跑 §4 清单第 9 行：GTUBE 信 `nc` 打 25 → 期待 `554 5.7.1`；正常信 → `250` 且 maildir 落盘
+带 `X-Spam-Status: No`。
+
+**Step 5 — 回滚锚**（无数据迁移、无状态文件）：
+
+- 引擎侧：删 `AYANE_MAIL_RSPAMD_URL` → `systemctl restart ayane` = 功能关闭，行为回到集成前
+  （测试保证零行为变化）；
+- 容器侧：撤 compose 的 ports 条目 → `docker compose up -d rspamd`。
+
+顺序自由：先 compose 后 env（推荐，扫描面先活）；env 先行也只是让引擎全部扫描 fail-open 计数。
+
 ## 2. 安装顺序
 
 1. 解析域名：`AYANE_HOSTNAME` 的 A/AAAA 与邮件域的 MX 指向本实例入口。
@@ -170,6 +236,7 @@ apply 之后要**重启一次**才会开始签名（日志里那条 warn 就是�
 | 6 | 自动转发 / Sieve | 转发规则生效；保留副本开关按预期 |
 | 7 | 病毒扫描 | EICAR 测试件被 ClamAV 拦下并进隔离 |
 | 8 | 证书 | `volume` / `upload` / `acme` 三模式各验一次链与到期时间 |
+| 9 | 内容扫描（设了 `AYANE_MAIL_RSPAMD_URL` 才验） | GTUBE 测试件被 `554 5.7.1` 拒；停 rspamd 容器后同信 `250` 且 `admin.net.traffic` 的 `spam_scan_errors` 上涨（§1.5） |
 
 第 1 项是**立项出口闸**：入口若拿不到公网 25，必须改走「中继收 + 中继发」或「CF Email
 Routing 收 + 中继发」，并回写本表。

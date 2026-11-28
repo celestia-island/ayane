@@ -182,6 +182,7 @@ pub mod outbound;
 pub mod policy;
 pub mod queue;
 pub mod retry;
+pub mod rspamd;
 pub mod server;
 pub mod session;
 pub mod verify;
@@ -214,6 +215,10 @@ pub use queue::{
     StagedMessage, SyncHook,
 };
 pub use retry::{RecipientState, RetryClass, RetryDecision, RetryPolicy};
+pub use rspamd::{
+    classify, parse_endpoint, sanitize_smtp_message, spam_status_header, RspamdAction,
+    RspamdClient, RspamdUrlError, ScanError, ScanOutcome, ScanRequest, SpamVerdict,
+};
 pub use server::{serve, AuthGate, AuthGuard, ServerConfig, ServerError};
 pub use session::{Action, Extensions, Limits, Outcome, Phase, Reply, Session};
 pub use verify::{
