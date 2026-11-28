@@ -434,7 +434,13 @@ pub fn classify(body: &str) -> ScanOutcome {
     };
     let mut tests = answer
         .symbols
-        .map(|symbols| symbols.keys().cloned().collect::<Vec<_>>())
+        .map(|symbols| {
+            symbols
+                .keys()
+                .filter(|name| is_symbol_name(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     // Sorted, so the rendered header is a function of the *set* of symbols
     // and not of the order the scanner happened to serialize them in.
@@ -491,6 +497,19 @@ struct Answer {
 #[derive(Debug, serde::Deserialize)]
 struct Messages {
     smtp_message: Option<String>,
+}
+
+/// Whether a string is a symbol name as the word-list defines it: `A`–`Z`,
+/// digits and `_`, non-empty. This is the header's injection boundary: the
+/// scanner is trusted for its numbers and its enum phrases, but the
+/// `tests=` list is built from this fixed alphabet only, so a name carrying
+/// a CR/LF (or anything else off the word-list) is dropped whole rather
+/// than folded into the `X-Spam-Status` field.
+fn is_symbol_name(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 /// Renders the `X-Spam-Status` field the queue prepends for a scanned,
@@ -712,6 +731,24 @@ mod tests {
         };
         assert_eq!(verdict.action, RspamdAction::AddHeader, "conservative");
         assert_eq!(raw, "new thing");
+    }
+
+    #[test]
+    fn a_symbol_name_outside_the_word_list_never_reaches_the_header() {
+        // A symbol name is `[A-Z0-9_]`; anything else is not a name this
+        // renderer may quote — a CR/LF in a "name" would fold a header line,
+        // and a scanner answer is trusted for numbers and enum phrases, not
+        // for header field content.
+        let body = r#"{"action":"add header","score":1.0,"required_score":1.0,"symbols":{"GTUBE":{"score":10.0},"EVIL\r\nX-Injected: 1":{"score":1.0},"lowercase_name":{"score":1.0},"DASH-NAME":{"score":1.0}}}"#;
+        let ScanOutcome::Action(verdict) = classify(body) else {
+            panic!("an answer with symbols classifies: {body}");
+        };
+        assert_eq!(verdict.tests, vec!["GTUBE"], "only word-list names survive");
+        let header = String::from_utf8(spam_status_header(&verdict)).expect("header");
+        assert!(header.contains("tests=GTUBE,"), "{header}");
+        assert!(!header.contains("Injected"), "{header}");
+        assert!(!header.contains("lowercase"), "{header}");
+        assert!(!header.contains("DASH"), "{header}");
     }
 
     #[test]
