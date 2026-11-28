@@ -349,7 +349,7 @@ impl RspamdClient {
     ) -> Result<Self, RspamdUrlError> {
         let endpoint = parse_endpoint(raw)?;
         // This client talks to exactly one host — the configured scanner, by
-        // design a plain `http://` on the loopback. It must not consult the
+        // design a plain `http://` on the loopback or a local bridge. It must not consult the
         // environment's proxy settings: with `HTTP(S)_PROXY` set and no
         // `NO_PROXY`, reqwest routes even `127.0.0.1:11333` through the proxy,
         // the scan fails, and the engine fails open — every message is

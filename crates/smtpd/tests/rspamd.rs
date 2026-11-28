@@ -87,7 +87,8 @@ impl FakeRspamd {
         // test. A proxy in the environment — with no `NO_PROXY` — is the one
         // setting that can sit between them: reqwest honours it by default,
         // routes `127.0.0.1:<port>` to the proxy, the scan dies there, and
-        // the engine fails open (measured 3/3 on this suite, 2026-11-28).
+        // the engine fails open (measured: 12 of this suite's 16 cases go red
+        // without the client's `.no_proxy()`; the core crate's e2e 3 of 3).
         // The client turns proxies off; the suite runs with a dead one set
         // so that stays load-bearing — drop `.no_proxy()` and every case
         // that expects the fake to be reached goes red. Set once: the
