@@ -655,9 +655,12 @@ async fn the_body_is_the_message_exactly_as_received() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_message_is_streamed_through_the_scan() {
-    // ~24 MiB, just under the SIZE ceiling: the point is not the number but
-    // that the scan's copy of the message never lives in memory — which the
-    // fake measures as "the body arrived announced and in many chunks".
+    // ~24 MiB, just under the SIZE ceiling. What this test asserts,
+    // mechanically: the fake records every `read` it serves; the body is
+    // then expected to arrive with an exact `Content-Length` and in many
+    // separate reads (>`100` for this size), i.e. forwarded incrementally
+    // rather than as one write. It does not measure the scanner's memory —
+    // socket reads would look chunked even if the client buffered first.
     let line = "a".repeat(900);
     let lines = 28_000;
     let message = format!(
