@@ -32,7 +32,7 @@ fn action_body(action: &str) -> String {
 /// A request the fake scanner received.
 #[derive(Debug, Clone)]
 struct RecordedRequest {
-    /// The request line's target (`/scan`).
+    /// The request line's target (`/checkv2`).
     target: String,
     /// The header lines, as sent, in arrival order.
     headers: Vec<String>,
@@ -285,7 +285,7 @@ async fn reject_refuses_the_message_and_leaves_no_file() {
         assert_eq!(metrics.total(ayane_smtpd::Counter::SpamRejected), 1);
         assert_eq!(metrics.total(ayane_smtpd::Counter::SpamScanned), 1);
         assert_eq!(metrics.total(ayane_smtpd::Counter::MessagesIn), 0);
-        assert_eq!(fake.only().target, "/scan");
+        assert_eq!(fake.only().target, "/checkv2");
         harness.stop();
     }
 }
@@ -578,7 +578,7 @@ async fn the_scan_request_carries_the_whole_envelope() {
     let queued = harness.queued();
     assert_eq!(queued.len(), 1);
     let request = fake.only();
-    assert_eq!(request.target, "/scan");
+    assert_eq!(request.target, "/checkv2");
     assert_eq!(
         header(&request, "From"),
         vec!["someone@remote.test"],

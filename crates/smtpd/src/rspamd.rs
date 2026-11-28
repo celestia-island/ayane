@@ -3,7 +3,7 @@
 //!
 //! The integration shape comes from the repository's own rule that a third
 //! party is a network peer — never a linked library. rspamd's normal worker
-//! speaks HTTP, so the whole conversation is one `POST /scan` whose body is
+//! speaks HTTP, so the whole conversation is one `POST /checkv2` whose body is
 //! the message exactly as received (streamed out of the staged spool file,
 //! never held in memory), plus one JSON answer whose `action` decides what
 //! the transaction's final reply is.
@@ -42,7 +42,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_PORT: u16 = 11333;
 
 /// The path scanned when the URL names none.
-const DEFAULT_PATH: &str = "/scan";
+const DEFAULT_PATH: &str = "/checkv2";
 
 /// How many symbol names at most go into the rendered `tests=` list.
 const MAX_TESTS: usize = 20;
@@ -223,7 +223,9 @@ pub struct Endpoint {
     /// The authority exactly as configured (`127.0.0.1:11333`), minus any
     /// credentials (rejected) — re-rendered into the request URL.
     authority: String,
-    /// The request path (`/scan` by default).
+    /// The request path (`/checkv2` by default — the endpoint that answers the
+    /// flat schema on rspamd 4.x; the parser also reads the keyed shape `/scan`
+    /// sends there, and an explicit path in the URL always wins).
     path: String,
 }
 
@@ -431,22 +433,55 @@ impl RspamdClient {
 
 /// Turns a scan answer's text into an outcome. Sync and pure, so the JSON
 /// shapes a scanner can send are testable without a socket.
+///
+/// Two shapes reach this in the wild (both measured live against a 4.3
+/// scanner, 2026-11-28): the flat classic schema (`action`, `score`,
+/// `symbols`, `messages` at the top level — what `/checkv2` answers and what
+/// older `/scan` answered), and rspamd 4's `/scan` keyed form, where the
+/// whole answer hides under a per-message key (`"default"` when the request
+/// names no key). This reads either: if the top level carries no `action`
+/// but exactly one nested object does, that object is the answer.
 #[must_use]
 pub fn classify(body: &str) -> ScanOutcome {
-    let answer: Answer = match serde_json::from_str(body) {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(err) => return ScanOutcome::Failed(ScanError::Response(err.to_string())),
+    };
+    // `/scan` on rspamd 4 nests the answer under a message key; unwrap when
+    // exactly one nested object carries an `action` (ambiguous shapes stay
+    // flat and fail the action parse visibly).
+    let value = if value.get("action").is_none() {
+        match unwrapped_answer(&value) {
+            Some(inner) => inner,
+            None => value,
+        }
+    } else {
+        value
+    };
+    let answer: Answer = match serde_json::from_value(value.clone()) {
         Ok(answer) => answer,
         Err(err) => return ScanOutcome::Failed(ScanError::Response(err.to_string())),
     };
-    let mut tests = answer
-        .symbols
-        .map(|symbols| {
-            symbols
-                .keys()
-                .filter(|name| is_symbol_name(name))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    // The keyed `/scan` form has no `symbols` wrapper: word-list keys whose
+    // value is an object are the symbols (this is exactly how `GTUBE` rides
+    // in the live answer). `thresholds` and friends survive the filter only
+    // by not being word-list names or not being objects.
+    let symbols = answer.symbols.clone().unwrap_or_else(|| {
+        let mut harvested = serde_json::Map::new();
+        if let Some(object) = value.as_object() {
+            for (name, entry) in object {
+                if entry.is_object() && is_symbol_name(name) {
+                    harvested.insert(name.clone(), entry.clone());
+                }
+            }
+        }
+        harvested
+    });
+    let mut tests = symbols
+        .keys()
+        .filter(|name| is_symbol_name(name))
+        .cloned()
+        .collect::<Vec<_>>();
     // Sorted, so the rendered header is a function of the *set* of symbols
     // and not of the order the scanner happened to serialize them in.
     tests.sort();
@@ -479,6 +514,36 @@ pub fn classify(body: &str) -> ScanOutcome {
             raw.to_owned(),
         ),
     }
+}
+
+/// The answer under a keyed `/scan` envelope: when the top level carries no
+/// `action` of its own but exactly one nested object does, that object is
+/// the real answer (rspamd 4 keys `/scan` replies per message and names the
+/// unnamed one `default`). Anything ambiguous returns `None` and the caller
+/// reads the shape flat, where the action parse fails loudly.
+fn unwrapped_answer(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let object = value.as_object()?;
+    let mut found: Option<&serde_json::Value> = None;
+    for entry in object.values() {
+        if entry.get("action").is_some() {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(entry);
+        }
+    }
+    let mut merged = found.cloned()?;
+    // The keyed envelope keeps its own fields (`messages`, `message-id`,
+    // `time_real`) at the top level; the flat schema the parser reads expects
+    // them beside the answer, so fold what the inner object lacks.
+    if let Some(top) = object.get("messages") {
+        merged
+            .as_object_mut()
+            .expect("the answer carried an action, so it is an object")
+            .entry("messages")
+            .or_insert(top.clone());
+    }
+    Some(merged)
 }
 
 /// The classic scan-answer schema, tolerant of everything it may omit.
@@ -606,7 +671,37 @@ mod tests {
         let endpoint = parse_endpoint("http://rspamd").expect("parses");
         assert_eq!(endpoint.authority, "rspamd:11333");
         assert_eq!(endpoint.path, DEFAULT_PATH);
-        assert_eq!(endpoint.url(), "http://rspamd:11333/scan");
+        assert_eq!(endpoint.url(), "http://rspamd:11333/checkv2");
+    }
+
+    #[test]
+    fn the_keyed_scan_answer_from_rspamd_4_unwraps_and_harvests() {
+        // Byte-for-byte the reply the live 4.3 scanner sent to POST /scan for
+        // the GTUBE probe, 2026-11-28: the answer hides under "default" and
+        // the symbols ride as word-list keys next to the scalars, with no
+        // "symbols" wrapper at all.
+        let body = r#"{"default":{"is_spam":true,"passthrough_module":"GTUBE","is_skipped":true,"score":15.0,"required_score":15.0,"action":"reject","GTUBE":{"name":"GTUBE","score":0.0}},"messages":{"smtp_message":"Gtube pattern"},"message-id":"undef","time_real":0.001540}"#;
+        let ScanOutcome::Action(verdict) = classify(body) else {
+            panic!("the keyed answer must classify as an action");
+        };
+        assert_eq!(verdict.action, RspamdAction::Reject);
+        assert_eq!(verdict.score, 15.0);
+        assert_eq!(verdict.required_score, 15.0);
+        assert_eq!(verdict.smtp_message.as_deref(), Some("Gtube pattern"));
+        assert_eq!(verdict.tests, vec!["GTUBE"]);
+    }
+
+    #[test]
+    fn an_ambiguous_keyed_shape_stays_flat_and_fails_loudly() {
+        // Two nested objects carry actions: unwrapping would be a guess, so
+        // the shape is read flat, where the missing top-level action lands in
+        // UnknownAction — visible in the metrics, never silently accepted.
+        let body = r#"{"a":{"action":"reject"},"b":{"action":"no action"}}"#;
+        let ScanOutcome::UnknownAction(verdict, name) = classify(body) else {
+            panic!("an ambiguous keyed shape must not classify as one action");
+        };
+        assert_eq!(name, "missing");
+        assert_eq!(verdict.action, RspamdAction::AddHeader);
     }
 
     #[test]

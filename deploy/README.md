@@ -78,7 +78,7 @@ python3 deploy/build-musl.py --install-to /opt/ayane/ayane-bin
 | `AYANE_MAIL_OUTBOUND` | `0` | `1` = 域外收件人经 MX 直投（需 25 出站与 PTR） |
 | `AYANE_MAIL_SMTP_PORT` | `25` | 出站连接端口 |
 | `AYANE_MAIL_DKIM_KEY_ENV` | 空 | 每个域的签名私钥所在环境变量模板，如 `AYANE_DKIM_KEY_{domain}`（域名的点写成 `_`） |
-| `AYANE_MAIL_RSPAMD_URL` | 空 | 内容扫描端点，如 `http://127.0.0.1:11333/scan`（明文 http，normal worker）。**空 = 功能完全关闭**：不装配客户端、零行为变化。写错（非 `http://host[:port][/path]`）= 进程拒绝启动 |
+| `AYANE_MAIL_RSPAMD_URL` | 空 | 内容扫描端点，如 `http://127.0.0.1:11333/checkv2`（明文 http，normal worker；rspamd 4.x 的扁平 schema 端点——`/scan` 在 4.x 回按消息键嵌套的形态，解析器两种都读，但默认端点取扁平）。**空 = 功能完全关闭**：不装配客户端、零行为变化。写错（非 `http://host[:port][/path]`）= 进程拒绝启动 |
 | `AYANE_MAIL_RSPAMD_TIMEOUT_MS` | `5000` | 扫描总超时（毫秒）。扫描器自己的任务超时是 8s，这里要比它先放弃 |
 | `AYANE_MAIL_RSPAMD_PASSWORD` | 空 | 仅打 controller（11334）时需要（`Password:` 头）；normal worker 默认无鉴权，不设 |
 | `AYANE_MAIL_REQUIRE_START` | `0` | `1` = 邮件面起不来就让进程退出（否则 degraded + 控制面继续服务） |
@@ -138,7 +138,7 @@ apply 之后要**重启一次**才会开始签名（日志里那条 warn 就是�
 
 ### 1.5 内容扫描（rspamd）：接线、验证与回滚
 
-引擎经 HTTP `POST /scan` 打 **normal worker（11333）**，仅 `inbound` 角色装配（submission 永不扫描）。
+引擎经 HTTP `POST /checkv2` 打 **normal worker（11333）**，仅 `inbound` 角色装配（submission 永不扫描）。
 判定语义：`reject`/`discard` → `554 5.7.1`；`soft reject`/`greylist` → `451 4.3.2`；
 `add header`/`rewrite subject`/`quarantine`/`no action` → 加 `X-Spam-Status` 照收。
 **扫描器不可达/超时/5xx/坏响应 = fail-open**（照收 + `spam_scan_errors` 计数 + warn 日志），
@@ -173,7 +173,7 @@ count = 2;
 
 ```bash
 printf 'From: probe@example.com\r\nTo: inbox@example.com\r\nSubject: gtube\r\n\r\nXJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X\r\n' > /tmp/gtube.eml
-curl -s --data-binary @/tmp/gtube.eml -H 'Pass: all' http://127.0.0.1:11333/scan \
+curl -s --data-binary @/tmp/gtube.eml -H 'Pass: all' http://127.0.0.1:11333/checkv2 \
   | jq '{action, score, required_score}'
 # 期待 {"action":"reject",...}
 ```
@@ -181,7 +181,7 @@ curl -s --data-binary @/tmp/gtube.eml -H 'Pass: all' http://127.0.0.1:11333/scan
 **Step 3 — 引擎侧接线**：`/opt/ayane/ayane.env`（0600）追加：
 
 ```ini
-AYANE_MAIL_RSPAMD_URL=http://127.0.0.1:11333/scan
+AYANE_MAIL_RSPAMD_URL=http://127.0.0.1:11333/checkv2
 # 可选：AYANE_MAIL_RSPAMD_TIMEOUT_MS=5000
 # 可选：AYANE_MAIL_RSPAMD_PASSWORD=<only-if-controller>
 ```
