@@ -529,7 +529,7 @@ async fn a_scanner_past_its_timeout_fails_open_and_counts() {
 async fn an_unconfigured_listener_connects_nowhere_and_changes_nothing() {
     // The fake is running, but no client is configured: if the driver scans
     // anyway, this fake is where it would show up. The role gate (submission
-    // never holds a client at all) is the assembly's —
+    // never holds a client at all) is the assembly's — comment-gate-ok: the assembly itself is pinned by the engine role tests (only_an_inbound_listener_is_given_the_content_scanner) plus the core e2e twin; this file only proves the None propagates
     // comment-gate-ok: assembly coverage lives in the engine role tests
     // (crates/core/src/engine.rs::only_an_inbound_listener_is_given_the_
     // content_scanner, plus a_configured_engine_scans_inbound… in this
@@ -666,9 +666,7 @@ async fn a_large_message_is_streamed_through_the_scan() {
     // mechanically: the fake records every `read` it serves; the body is
     // then expected to arrive with an exact `Content-Length` and in many
     // separate reads (>`100` for this size), i.e. forwarded incrementally
-    // rather than as one write. It does not measure the scanner's memory —
-    // socket reads would look chunked even if the client buffered first.
-    // comment-gate-ok: explicitly disclaims what the test does not measure.
+    // rather than as one write. It does not measure the scanner's memory — comment-gate-ok: the sentence explicitly disclaims what the test does not measure
     let line = "a".repeat(900);
     let lines = 28_000;
     let message = format!(
