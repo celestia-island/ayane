@@ -289,7 +289,7 @@ pub struct ServerConfig {
     pub passwords: Arc<dyn PasswordVerifier>,
     /// The SPF/DKIM/DMARC verifier; `None` disables verification (tests only).
     pub verifier: Option<Verifier>,
-    /// The content scanner (`POST /scan` against a normal worker); `None`
+    /// The content scanner (`POST /checkv2` against a normal worker); `None`
     /// disables the scan. Attached to inbound listeners only by the
     /// assembly: submission is the authenticated user's own mail.
     pub rspamd: Option<crate::rspamd::RspamdClient>,
