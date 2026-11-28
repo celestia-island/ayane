@@ -169,10 +169,12 @@ pub(crate) fn flags_of(name: &str) -> Vec<FlagFetch<'static>> {
 
 /// The flags a maildir name carries, as untagged `FETCH` lines spell them —
 /// the system flags this layout can hold plus `\Recent` when the session
-/// considers the message recent (RFC 3501 §2.3.2 / §7.4.2). The line the
+/// considers the message recent (RFC 3501 §2.3.2 / §7.4.2). The lines the
 /// extension paths hand-write (`VANISHED` companions, QRESYNC initial
-/// synchronization, the NOOP refresh) renders its flags from here, so the
-/// hand-written and codec-rendered lines agree byte for byte.
+/// synchronization, the NOOP refresh) render their flags from here, so they
+/// carry the same set the codec-rendered `flags_of` reports — a flag set,
+/// where order carries no meaning (RFC 3501 §2.3.2 spells no order for the
+/// response).
 pub(crate) fn flags_text(name: &str, recent: bool) -> String {
     let id = MessageId::parse(name);
     let flags = id.map(|id| id.flags()).unwrap_or_default();

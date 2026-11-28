@@ -20,16 +20,12 @@
 //!   removal is reported (`* n EXPUNGE` or `* VANISHED`) |
 //! | `commands` | the dispatcher: one command in, one answer out |
 //! | `store` | `STORE`, and the `UNCHANGEDSINCE` conditions on it |
-//! | `store` | `STORE`, and the `UNCHANGEDSINCE` conditions on it |
 //! | `maildir_ops` | the maildir side: the UID table in step, `APPEND` |
 //! | `query` | `FETCH`, `STORE`, `SEARCH`, `COPY`/`MOVE` |
 //! | `render` | one message's data items, and the `SEARCH` keys |
 //! | [`framing`] | the literal reader a client's command arrives through |
 //! | `wire` | reply lines, capabilities, and the octet helpers |
 //! | `uidlist` | a folder's UID table and its `UIDVALIDITY` |
-//! | `qresync` | the RFC 7162 §3.2 SELECT parameter and the initial sync |
-//! | `ext_scan` | the byte-level scanner the parameter parsers run on |
-//! | `ext_lines` | the extension lines the codec cannot encode |
 //! | `qresync` | the RFC 7162 §3.2 SELECT parameter and the initial sync |
 //! | `ext_scan` | the byte-level scanner the parameter parsers run on |
 //! | `ext_lines` | the extension lines the codec cannot encode |

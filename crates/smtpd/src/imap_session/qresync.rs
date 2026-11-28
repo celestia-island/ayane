@@ -53,7 +53,9 @@ pub(crate) fn parse_qresync(inner: &[u8]) -> Option<QresyncParam> {
         Some((_, set)) => param.known_uids = Some(parse_ranges(set, true)?),
     }
     // The seq-match pair is optional; known-uids without it is the shape a
-    // resyncing client sends most.
+    // resyncing client sends most. Either way the parameter list must be
+    // accounted for to its closing parenthesis — trailing junk is RFC
+    // 7162 §3.2.5.1's syntax error, never a half-parsed command.
     if let Some((_, _, pair)) = words.group() {
         let mut sets = Scan::new(pair);
         let seq = parse_ranges(sets.word()?.1, true)?;
@@ -62,9 +64,9 @@ pub(crate) fn parse_qresync(inner: &[u8]) -> Option<QresyncParam> {
             return None;
         }
         param.seq_match = Some((seq, uids));
-        if !words.done() {
-            return None;
-        }
+    }
+    if !words.done() {
+        return None;
     }
     Some(param)
 }

@@ -25,6 +25,12 @@ use super::{Row, UIDLIST};
 pub struct UidMap {
     /// The folder's `UIDVALIDITY`, minted once and persisted with the table.
     pub validity: u32,
+    /// Whether `validity` was read out of the table's file rather than
+    /// minted from the directory. A file that carries the value is proof a
+    /// CONDSTORE session ran here before — which is what separates "the
+    /// mod-sequence sidecar was lost" (rotate the validity, RFC 7162 §5.3)
+    /// from "the folder predates CONDSTORE" (mint, and keep, the identity).
+    pub validity_persisted: bool,
     /// The next UID to hand out. Never decreases.
     pub next: u32,
     /// `(uid, unique name)`, ascending by UID.
@@ -38,6 +44,7 @@ impl Default for UidMap {
     fn default() -> Self {
         Self {
             validity: 1,
+            validity_persisted: false,
             next: 1,
             lines: Vec::new(),
         }
@@ -65,7 +72,7 @@ impl UidMap {
                 return Ok(Self {
                     validity: uid_validity(dir),
                     ..Self::default()
-                })
+                });
             }
             other => other?,
         };
@@ -79,6 +86,7 @@ impl UidMap {
                 Some(("v", value)) => {
                     if let Ok(validity) = value.trim().parse::<u32>() {
                         map.validity = validity.max(1);
+                        map.validity_persisted = true;
                     }
                 }
                 Some((uid, name)) => {

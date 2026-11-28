@@ -4,13 +4,9 @@
 
 use super::*;
 
-use super::*;
-
 fn parsed(line: &str) -> (ExtParams, String) {
     match extract(line.as_bytes()) {
-        Extraction::Parsed(params, bytes) => {
-            (params, String::from_utf8_lossy(&bytes).into_owned())
-        }
+        Extraction::Parsed(params, bytes) => (params, String::from_utf8_lossy(&bytes).into_owned()),
         other => panic!("expected Parsed, got {other:?}"),
     }
 }
@@ -68,6 +64,14 @@ fn known_uids_without_seq_match_parses() {
 }
 
 #[test]
+fn trailing_junk_after_known_uids_is_a_syntax_error() {
+    // RFC 7162 §3.2.5.1: anything the parameter list cannot account for is a
+    // syntax error — the mailbox is not selected, never half-parsed.
+    malformed("a1 SELECT INBOX (QRESYNC (123 45 1:10 junk))\r\n");
+    malformed("a1 SELECT INBOX (QRESYNC (123 45 1:10 (1,2) extra))\r\n");
+}
+
+#[test]
 fn a_star_in_known_uids_is_a_syntax_error() {
     malformed("a1 SELECT INBOX (QRESYNC (123 45 1:10,*))\r\n");
     malformed("a1 SELECT INBOX (QRESYNC (123 45 5,1:3))\r\n");
@@ -99,6 +103,25 @@ fn a_fetch_modifier_is_parsed_and_stripped() {
     assert!(params.fetch_vanished);
     assert!(!params.fetch_modseq);
     assert_eq!(stripped, "a1 FETCH 1:* (FLAGS)\r\n");
+}
+
+#[test]
+fn a_fetch_with_a_modseq_item_and_a_modifier_group_parses_together() {
+    // RFC 7162 §3.1.4.1's own shape: the item list carries a MODSEQ item
+    // AND the command carries a CHANGEDSINCE/VANISHED group. Two edits land
+    // in one line — the item rebuild (early) and the group removal (late) —
+    // and both must apply.
+    let (params, stripped) =
+        parsed("a1 UID FETCH 1:* (FLAGS MODSEQ) (CHANGEDSINCE 12 VANISHED)\r\n");
+    assert!(params.fetch_modseq, "{params:?}");
+    assert_eq!(params.fetch_changedsince, Some(12));
+    assert!(params.fetch_vanished);
+    assert_eq!(stripped, "a1 UID FETCH 1:* (FLAGS)\r\n");
+    // The reverse order of the two extensions on the wire is the same
+    // command to the grammar.
+    let (params, stripped) = parsed("a2 FETCH 1 (MODSEQ FLAGS) (CHANGEDSINCE 3)\r\n");
+    assert!(params.fetch_modseq && params.fetch_changedsince == Some(3));
+    assert_eq!(stripped, "a2 FETCH 1 (FLAGS)\r\n");
 }
 
 #[test]
@@ -134,8 +157,7 @@ fn a_store_modifier_is_parsed_and_stripped() {
     let (params, stripped) = parsed("a1 STORE 1:2 (UNCHANGEDSINCE 7) +FLAGS (\\Seen)\r\n");
     assert_eq!(params.store_unchangedsince, Some(7));
     assert_eq!(stripped, "a1 STORE 1:2 +FLAGS (\\Seen)\r\n");
-    let (params, stripped) =
-        parsed("a1 UID STORE 1 (UNCHANGEDSINCE 0) +FLAGS.SILENT (\\Seen)\r\n");
+    let (params, stripped) = parsed("a1 UID STORE 1 (UNCHANGEDSINCE 0) +FLAGS.SILENT (\\Seen)\r\n");
     assert_eq!(params.store_unchangedsince, Some(0));
     assert_eq!(stripped, "a1 UID STORE 1 +FLAGS.SILENT (\\Seen)\r\n");
     none("a1 STORE 1 +FLAGS (\\Seen)\r\n");
@@ -173,7 +195,9 @@ fn a_plain_expunge_passes_through() {
 fn a_search_modseq_key_is_parsed_and_stripped() {
     let (params, stripped) = parsed("a1 SEARCH MODSEQ 12345\r\n");
     assert_eq!(params.search_modseq, Some(12345));
-    assert_eq!(stripped, "a1 SEARCH\r\n");
+    // A bare MODSEQ key strips the criteria empty; `ALL` is the placeholder
+    // the session's own mod-sequence filter then filters.
+    assert_eq!(stripped, "a1 SEARCH ALL\r\n");
     let (params, stripped) = parsed("a1 SEARCH FLAGGED MODSEQ 9 MODSEQ 5\r\n");
     assert_eq!(params.search_modseq, Some(9), "the strictest bound wins");
     assert_eq!(stripped, "a1 SEARCH FLAGGED\r\n");

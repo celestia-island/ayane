@@ -512,6 +512,23 @@ async fn a_modseq_item_and_search_key_answer_on_the_wire() {
         search.contains("1 2"),
         "both messages are above 1: {search}"
     );
+    // "equal to or greater than" (RFC 7162 §3.1.5): the message sitting
+    // exactly at the asked value is in the result — dropping it would lose
+    // the last change a watermark-resyncing client knows about, while the
+    // one below it stays out.
+    let lines = client.say("st STORE 1 +FLAGS (\\Flagged)");
+    let at = modseq_of(lines.iter().find(|l| is_untagged_fetch(l)).expect("fetch"));
+    let lines = client.say(&format!("sm2 SEARCH MODSEQ {at}"));
+    let search = lines
+        .iter()
+        .find(|l| l.starts_with("* SEARCH"))
+        .expect("search");
+    let hits = search
+        .trim_start_matches("* SEARCH ")
+        .split(" (MODSEQ ")
+        .next()
+        .expect("the set");
+    assert_eq!(hits, "1", "exactly-at answers, below stays out: {search}");
 }
 
 #[tokio::test]

@@ -118,6 +118,54 @@ fn a_fresh_sidecar_synthesises_expunge_history_for_dead_lines() {
 }
 
 #[test]
+fn a_lost_sidecar_rotates_the_persisted_validity() {
+    let dir = Dir::new("lost");
+    // A CONDSTORE-era uidlist: the `v` line survived, the sidecar did not.
+    std::fs::write(UidMap::path(&dir.0), "v 555\n1 old.msg:2,S\n2 live.msg\n").expect("write");
+    scan_sync(&dir.0, &uniques(&["live.msg"]), &uniques(&["old.msg"])).expect("scan");
+    let map = UidMap::load(&dir.0).expect("reload");
+    assert_eq!(
+        map.validity, 556,
+        "the validity rotated past the persisted value (RFC 7162 §5.3)"
+    );
+    assert!(map.validity_persisted);
+    let table = ModSeqTable::load(&dir.0).expect("sidecar rebuilt");
+    assert_eq!(
+        table.expunged_since(0).len(),
+        1,
+        "the dead line is recorded"
+    );
+    // The rotation is once: the rebuilt sidecar ends the fresh state.
+    scan_sync(&dir.0, &uniques(&["live.msg"]), &uniques(&["old.msg"])).expect("scan");
+    let map = UidMap::load(&dir.0).expect("reload");
+    assert_eq!(map.validity, 556, "a second scan rotates nothing");
+}
+
+#[test]
+fn an_upgrade_synthesises_history_and_keeps_the_identity() {
+    let dir = Dir::new("upgrade");
+    // A pre-CONDSTORE uidlist: message lines, no persisted validity.
+    std::fs::write(UidMap::path(&dir.0), "1 old.msg:2,S\n2 live.msg\n").expect("write");
+    let minted = UidMap::load(&dir.0).expect("load").validity;
+    scan_sync(&dir.0, &uniques(&["live.msg"]), &uniques(&["old.msg"])).expect("scan");
+    let map = UidMap::load(&dir.0).expect("reload");
+    assert_eq!(
+        map.validity, minted,
+        "an upgrade keeps the folder's identity"
+    );
+    assert!(
+        map.validity_persisted,
+        "and the minted value is frozen into the file at the upgrade"
+    );
+    let table = ModSeqTable::load(&dir.0).expect("sidecar");
+    assert_eq!(
+        table.expunged_since(0).len(),
+        1,
+        "the dead line still joins the queue as synthesized history"
+    );
+}
+
+#[test]
 fn record_expunge_trims_to_the_cap_and_merges_into_the_watermark() {
     let dir = Dir::new("trim");
     // Raise the watermark so the trimmed values are distinctive.

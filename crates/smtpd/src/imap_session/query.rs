@@ -226,8 +226,11 @@ impl ImapSession<'_> {
                 size,
             };
             // RFC 7162 §3.1.5: the MODSEQ key survived the sidecar parser as
-            // `search_modseq`; it is one more conjunct — strictly above, like
-            // CHANGEDSINCE.
+            // `search_modseq`; it is one more conjunct, matching messages
+            // whose mod-sequence is **equal to or greater than** the value —
+            // unlike CHANGEDSINCE (§3.1.4.1), which is strictly above. A
+            // change sitting exactly at the client's watermark is the last
+            // thing it heard about, and the search must not drop it.
             if !matches_key(criteria, &ctx, &raw) {
                 continue;
             }
@@ -236,7 +239,7 @@ impl ImapSession<'_> {
                     .as_ref()
                     .and_then(|table| table.of(id.unique()))
                     .unwrap_or(0);
-                if value <= since {
+                if value < since {
                     continue;
                 }
                 highest_hit = highest_hit.max(value);

@@ -226,6 +226,12 @@ fn fetch(line: &[u8], scan: &mut Scan<'_>) -> Extraction {
     if params == ExtParams::default() {
         return Extraction::None;
     }
+    // The two edits are discovered modifier-group first, item-list second —
+    // the reverse of their order on the line — and `apply` walks them left
+    // to right. A MODSEQ item with a CHANGEDSINCE group (RFC 7162 §3.1.4.1's
+    // own shape) has both, and an out-of-order edit would slice the line
+    // backwards.
+    edits.sort_by_key(|(start, _, _)| *start);
     Extraction::Parsed(params, apply(line, &edits))
 }
 
@@ -370,3 +376,6 @@ pub(crate) use super::ext_lines::{
     highestmodseq_ok, insert_before_close, insert_modseq, modified_ok, ranges_contain,
     resolve_star, search_modseq_suffix, vanished_line,
 };
+
+#[cfg(test)]
+mod tests;

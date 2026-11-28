@@ -58,6 +58,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::maildir_reader::MessageId;
 
+use super::uidlist::UidMap;
+
 /// The sidecar's name, inside the folder it describes (`ayane-modseq`).
 pub(crate) const MODSEQ: &str = "ayane-modseq";
 
@@ -307,6 +309,28 @@ pub(crate) fn scan_sync(
     let _guard = lock()?;
     let fresh = !ModSeqTable::path(dir).exists();
     let mut table = ModSeqTable::load(dir)?;
+    if fresh {
+        // A folder whose uidlist already carries a persisted validity had a
+        // sidecar once and lost it (a crash past the order contract, a lost
+        // file): every client still holds mod-sequence state this server can
+        // no longer answer for exactly. RFC 7162 §5.3 permits dropping that
+        // state only when the UIDVALIDITY changes — so it changes, by one,
+        // and the next QRESYNC SELECT mismatches into a full resync. A
+        // folder whose uidlist predates this sidecar (the upgrade) freezes
+        // the freshly minted validity into its file now — the sidecar write
+        // below is itself a directory event, and an unpersisted mint would
+        // drift under it. A folder with no uidlist at all gets its validity
+        // frozen by the caller's own store a moment later.
+        let map = UidMap::load(dir)?;
+        if map.validity_persisted {
+            let mut rotated = map.clone();
+            rotated.validity = map.validity.wrapping_add(1).max(2);
+            rotated.store(dir)?;
+        } else if UidMap::path(dir).exists() {
+            let frozen = map.clone();
+            frozen.store(dir)?;
+        }
+    }
     let mut assigned = Vec::new();
     let mut changed = false;
     let mut advance = |table: &mut ModSeqTable, unique: &str| -> io::Result<u64> {

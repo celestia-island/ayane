@@ -58,9 +58,6 @@ impl ImapSession<'_> {
     pub(crate) fn scan(&self, dir: &Path, map: &mut UidMap) -> io::Result<Vec<Row>> {
         let before = map.clone();
         let list = map.sync(&Self::live(dir)?);
-        if *map != before {
-            map.store(dir)?;
-        }
         let live: Vec<String> = list
             .iter()
             .filter_map(|(uid, _, _)| map.name_of(*uid).map(str::to_owned))
@@ -72,7 +69,29 @@ impl ImapSession<'_> {
             .map(|(_, unique)| unique.clone())
             .filter(|unique| !live_set.contains(unique.as_str()))
             .collect();
+        // The mod-sequence sync runs **before** the uidlist store: it reads
+        // whether the uidlist already carries a persisted validity to tell a
+        // lost sidecar from a first scan, and storing the table first would
+        // make every first scan look like a loss.
+        let sidecar_missing = !super::modseq::ModSeqTable::path(dir).exists();
+        let uidlist_existed = UidMap::path(dir).exists();
         super::modseq::scan_sync(dir, &live, &dead)?;
+        if sidecar_missing && uidlist_existed {
+            // That sync wrote the table's persisted validity on its own: it
+            // rotated a lost sidecar's identity (§5.3), or froze the value a
+            // first CONDSTORE scan minted into a table that predates the
+            // sidecar. Either way the file no longer says what the table in
+            // hand was read from, and the store below would write the stale
+            // value back — a QRESYNC client would keep mod-sequence state
+            // this server can no longer answer for, which is exactly what the
+            // rotation exists to prevent.
+            let synced = UidMap::load(dir)?;
+            map.validity = synced.validity;
+            map.validity_persisted = synced.validity_persisted;
+        }
+        if *map != before {
+            map.store(dir)?;
+        }
         Ok(list)
     }
 
