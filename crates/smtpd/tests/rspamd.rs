@@ -116,7 +116,8 @@ impl FakeRspamd {
 }
 
 /// Serves one connection: reads the request to its `Content-Length`, records
-/// it, then answers (or does not).
+/// it, then writes the scripted answer to the socket — or, for
+/// [`FakeAnswer::Silence`], writes nothing and drops the connection.
 async fn answer_one(
     mut socket: tokio::net::TcpStream,
     answer: FakeAnswer,
@@ -355,7 +356,8 @@ async fn add_header_flags_the_message_on_both_transports() {
         let received = stored.find("Received: ").expect("trace field");
         let status = stored.find("X-Spam-Status: ").expect("status field");
         assert!(received < status, "{mode:?}: {stored:?}");
-        // The scanner's free text never reaches the message.
+        // MUT:M5 — the scanner's free text (a symbol's options) reaching the
+        // spooled message is exactly the mutant this assertion killed.
         assert!(
             !stored.contains("scanner option text"),
             "{mode:?}: {stored:?}"
@@ -492,8 +494,9 @@ async fn a_scanner_past_its_timeout_fails_open_and_counts() {
         let harness = Harness::start(
             tag,
             HarnessOptions {
-                // The total timeout is the knob under test: shorter than the
-                // fake's stall, so the answer can never arrive in time.
+                // MUT:M2 — the timeout is the knob under test: shorter than
+                // the fake's stall, so the answer can never arrive in time;
+                // inverting fail-open for scan failures kills this test.
                 rspamd: Some(scanner(&fake, 200)),
                 metrics: true,
                 ..HarnessOptions::inbound()
@@ -526,8 +529,12 @@ async fn a_scanner_past_its_timeout_fails_open_and_counts() {
 async fn an_unconfigured_listener_connects_nowhere_and_changes_nothing() {
     // The fake is running, but no client is configured: if the driver scans
     // anyway, this fake is where it would show up. The role gate (submission
-    // never holds a client at all) is the assembly's, and is asserted at the
-    // engine level; at this layer the same None means the same nothing.
+    // never holds a client at all) is the assembly's —
+    // comment-gate-ok: assembly coverage lives in the engine role tests
+    // (crates/core/src/engine.rs::only_an_inbound_listener_is_given_the_
+    // content_scanner, plus a_configured_engine_scans_inbound… in this
+    // workspace's core e2e); at this layer the same None means the same
+    // nothing.
     let fake = FakeRspamd::start(FakeAnswer::action("no action")).await;
     let harness = Harness::start("rspamd-unset", HarnessOptions::inbound()).await;
     let mut client = harness.client();
@@ -661,6 +668,7 @@ async fn a_large_message_is_streamed_through_the_scan() {
     // separate reads (>`100` for this size), i.e. forwarded incrementally
     // rather than as one write. It does not measure the scanner's memory —
     // socket reads would look chunked even if the client buffered first.
+    // comment-gate-ok: explicitly disclaims what the test does not measure.
     let line = "a".repeat(900);
     let lines = 28_000;
     let message = format!(
