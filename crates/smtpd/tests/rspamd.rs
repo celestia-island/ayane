@@ -87,12 +87,14 @@ impl FakeRspamd {
         // test. A proxy in the environment — with no `NO_PROXY` — is the one
         // setting that can sit between them: reqwest honours it by default,
         // routes `127.0.0.1:<port>` to the proxy, the scan dies there, and
-        // the engine fails open (measured: 12 of this suite's 16 cases go red
-        // without the client's `.no_proxy()`; the core crate's e2e 3 of 3).
+        // the engine fails open (measured: without the client's `.no_proxy()`
+        // 12 of this suite's 16 cases go red, and the core crate's one e2e
+        // scanner case is red in 3 of 3 runs).
         // The client turns proxies off; the suite runs with a dead one set
-        // so that stays load-bearing — drop `.no_proxy()` and every case
-        // that expects the fake to be reached goes red. Set once: the
-        // variable is process-wide, and this is the suite's one entry point.
+        // so that stays load-bearing — MUT:no-proxy: drop `.no_proxy()` and
+        // every case that expects the fake to be reached goes red. Set once:
+        // the variable is process-wide, and this is the suite's one entry
+        // point.
         static POISON: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         POISON.get_or_init(|| {
             std::env::set_var("HTTP_PROXY", "http://127.0.0.1:9");

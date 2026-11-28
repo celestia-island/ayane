@@ -355,7 +355,7 @@ impl RspamdClient {
         // the scan fails, and the engine fails open — every message is
         // accepted unscored and only `spam_scan_errors` moves (measured 3/3
         // on the e2e suite, 2026-11-28). A proxy can never be the right path
-        // to a loopback scanner, so it is off unconditionally rather than
+        // to a local scanner, so it is off unconditionally rather than
         // left to the deployer's environment.
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
