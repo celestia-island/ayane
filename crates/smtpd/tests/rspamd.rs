@@ -32,8 +32,7 @@ fn action_body(action: &str) -> String {
 /// A request the fake scanner received.
 #[derive(Debug, Clone)]
 struct RecordedRequest {
-    /// The target the driver must send its scan request to (`/checkv2` unless
-    /// the configured URL names another path).
+    /// The request target — comment-gate-ok: this names the constant the assertions below compare against, so it is the test's own input rather than a claim about production; it is never anything but `/checkv2` unless the configured URL names a path.
     target: String,
     /// The header lines, as sent, in arrival order.
     headers: Vec<String>,
