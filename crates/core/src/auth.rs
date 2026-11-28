@@ -339,14 +339,24 @@ impl ProviderCatalog {
             providers.push(Provider {
                 id: built_in.id,
                 client,
-                metadata: ProviderMetadata {
-                    provider: built_in.id.to_owned(),
-                    issuer: built_in.issuer.map(str::to_owned),
-                    authorize_url: endpoint(built_in.authorize_url),
-                    token_url: endpoint(built_in.token_url),
-                    userinfo_url: Some(endpoint(built_in.userinfo_url)),
-                    token_body: built_in.token_body,
-                    scopes: built_in.scopes.iter().map(|s| (*s).to_owned()).collect(),
+                // Built through kirino's constructor, not a struct literal:
+                // a literal breaks the moment the upstream struct gains a
+                // public field (0.9.7 added `token_response_envelope` and
+                // broke every external literal at once), and the lock only
+                // postpones that for a build that resolves fresh.
+                metadata: {
+                    let metadata = ProviderMetadata::new(
+                        built_in.id,
+                        endpoint(built_in.authorize_url),
+                        endpoint(built_in.token_url),
+                    )
+                    .with_userinfo_url(endpoint(built_in.userinfo_url))
+                    .with_token_body(built_in.token_body)
+                    .with_scopes(built_in.scopes.iter().copied());
+                    match built_in.issuer {
+                        Some(issuer) => metadata.with_issuer(issuer),
+                        None => metadata,
+                    }
                 },
             });
         }
